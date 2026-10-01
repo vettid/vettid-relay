@@ -54,6 +54,7 @@ type serverMetrics struct {
 	revocations   metrics.Counter
 	rotations     metrics.Counter
 	parked        metrics.Gauge
+	wsSessions    metrics.Gauge
 }
 
 func newServerMetrics(reg *metrics.Registry) *serverMetrics {
@@ -70,6 +71,7 @@ func newServerMetrics(reg *metrics.Registry) *serverMetrics {
 		revocations:   reg.Counter("relay_denylist_entries_total", "Denylist entries added."),
 		rotations:     reg.Counter("relay_rotations_total", "Mailbox key rotations."),
 		parked:        reg.Gauge("relay_parked_collectors", "Long-poll requests currently parked waiting for a deposit."),
+		wsSessions:    reg.Gauge("relay_ws_sessions", "Open WebSocket collect sessions."),
 	}
 	for _, c := range allCodes {
 		m.errors.With(c) // pre-create every series so rates start at 0
@@ -119,6 +121,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/register", s.handleRegister)
 	s.mux.HandleFunc("POST /v1/mailbox/{mailbox_id}", s.handleDeposit)
 	s.mux.HandleFunc("GET /v1/mailbox", s.handleCollect)
+	s.mux.HandleFunc("GET /v1/mailbox/ws", s.handleWS)
 	s.mux.HandleFunc("DELETE /v1/mailbox/{msg_id}", s.handleAck)
 	s.mux.HandleFunc("POST /v1/mailbox/denylist", s.handleDenylist)
 	s.mux.HandleFunc("POST /v1/mailbox/rotate", s.handleRotate)

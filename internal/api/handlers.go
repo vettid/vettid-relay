@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -354,7 +355,7 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msgID := r.PathValue("msg_id")
-	if e := s.ack(r, mb.ID, msgID); e != nil {
+	if e := s.ack(r.Context(), mb.ID, msgID); e != nil {
 		s.writeError(w, e)
 		return
 	}
@@ -363,11 +364,11 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 }
 
 // ack is shared by DELETE and WebSocket ack frames.
-func (s *Server) ack(r *http.Request, mailbox, msgID string) *apiError {
+func (s *Server) ack(ctx context.Context, mailbox, msgID string) *apiError {
 	if len(msgID) != 26 {
 		return nil // cannot exist: idempotent success
 	}
-	res, err := s.st.Ack(r.Context(), mailbox, msgID)
+	res, err := s.st.Ack(ctx, mailbox, msgID)
 	if err != nil {
 		s.log.Error("ack failed", "err", err)
 		return fail(CodeInternal)
