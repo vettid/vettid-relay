@@ -28,7 +28,8 @@ staticcheck:
 
 lint: vet staticcheck
 
-# Each fuzz target runs for FUZZTIME. Seed corpora live in testdata/fuzz.
+# Each fuzz target runs for FUZZTIME. Seed corpora are the f.Add seeds in the
+# tests (plus any regression inputs saved under testdata/fuzz).
 fuzz:
 	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzParseToken$$' -fuzztime $(FUZZTIME)
 	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzCanonical$$' -fuzztime $(FUZZTIME)
