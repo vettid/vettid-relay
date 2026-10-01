@@ -48,7 +48,9 @@ func main() {
 		os.Exit(2)
 	}
 	log := newLogger(cfg.LogLevel)
-	if err := run(cfg, log); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	if err := run(ctx, cfg, log, nil); err != nil {
 		log.Error("relay exited with error", "err", err)
 		os.Exit(1)
 	}
@@ -106,9 +108,10 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}))
 }
 
-func run(cfg config.Config, log *slog.Logger) error {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
+// run serves until ctx is cancelled (SIGTERM/SIGINT in production), then
+// drains and shuts down within cfg.ShutdownTimeout. ready, if non-nil, is
+// closed once both listeners are accepting.
+func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- struct{}) error {
 
 	// Opening creates the database file in WAL mode before we listen, so the
 	// file exists by the time /healthz first returns 200 (a Litestream
@@ -164,6 +167,9 @@ func run(cfg config.Config, log *slog.Logger) error {
 		}
 		go func() { errc <- msrv.Serve(mln) }()
 	}
+	if ready != nil {
+		close(ready)
+	}
 	log.Info("relay started", "listen", cfg.ListenAddr, "metrics", cfg.MetricsAddr,
 		"base_url", cfg.BaseURL, "trust_proxy", cfg.TrustProxy, "db", cfg.DBPath, "version", buildVersion())
 
@@ -176,7 +182,6 @@ func run(cfg config.Config, log *slog.Logger) error {
 			runErr = err
 		}
 	}
-	stop()
 
 	// Bounded drain: long-polls and WebSockets end first, then in-flight
 	// requests finish, then background work stops, then the DB closes
