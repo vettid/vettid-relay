@@ -1,0 +1,19 @@
+# gitleaks configuration for vettid-relay.
+# Extends the default ruleset. The only allowlisted values are the fixed,
+# test-only vectors published in docs/RELAY-PROTOCOL.md §9 (all-0x01 / all-0x02
+# seeds, their PUBLIC keys, and the signatures/token derived from them). They
+# are public by design and appear in the spec and in tests.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "RELAY-PROTOCOL.md §9 test vectors (test-only, public)"
+regexTarget = "match"
+regexes = [
+  '''AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=''',
+  '''AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=''',
+  '''iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=''',
+  '''gTl3Dqh9F19Wo1Rmw0x\+zMuNipG07jeiXfYPW4/Js5Q=''',
+  '''pOZT7Pb981\+3K4wWv6Zryb43miSLBfKdCZ4Wc/qNzQyxFtOPrsSSkK1Gj5mF\+Zb3z3yC4Bi7AyjIyVkeN\+nsDA==''',
+  '''l\+mc5XMNElCBLC49xJH4Lc8LHEAlAK1HunqaS\+LZ33k=''',
+]
