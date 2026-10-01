@@ -12,6 +12,7 @@ import (
 	"github.com/vettid/vettid-relay/internal/auth"
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/metrics"
+	"github.com/vettid/vettid-relay/internal/ratelimit"
 	"github.com/vettid/vettid-relay/internal/store"
 )
 
@@ -33,7 +34,9 @@ type Server struct {
 	bgCancel context.CancelFunc
 	bg       sync.WaitGroup
 
-	replay *auth.ReplayCache
+	replay   *auth.ReplayCache
+	ipLimit  *ratelimit.Limiter // per source IP (IPv4 / IPv6 /64), before any parsing
+	subLimit *ratelimit.Limiter // per sender key, after token parse
 
 	mux *http.ServeMux
 }
@@ -71,7 +74,9 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 		now:   time.Now,
 		mux:   http.NewServeMux(),
 
-		replay: auth.NewReplayCache(cfg.ReplayCacheMax),
+		replay:   auth.NewReplayCache(cfg.ReplayCacheMax),
+		ipLimit:  ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
+		subLimit: ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
 	}
 	s.drainCtx, s.drainCancel = context.WithCancel(context.Background())
 	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
@@ -79,7 +84,12 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 		o(s)
 	}
 	s.routes()
-	s.every(15*time.Second, func(time.Time) { s.replay.Sweep(s.now()) })
+	s.every(15*time.Second, func(time.Time) {
+		now := s.now()
+		s.replay.Sweep(now)
+		s.ipLimit.Prune(now)
+		s.subLimit.Prune(now)
+	})
 	return s
 }
 
@@ -90,10 +100,10 @@ func (s *Server) routes() {
 
 // Handler returns the public HTTP handler with the middleware chain.
 func (s *Server) Handler() http.Handler {
-	return withSecurityHeaders(s.withAccessLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return withSecurityHeaders(s.withAccessLog(s.withIPRateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.m.requests.Inc()
 		s.mux.ServeHTTP(w, r)
-	})))
+	}))))
 }
 
 // handleHealthz reports 200 when the database is reachable and the server is

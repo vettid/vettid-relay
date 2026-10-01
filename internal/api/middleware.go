@@ -9,6 +9,8 @@ import (
 	"net/netip"
 	"strings"
 	"time"
+
+	"github.com/vettid/vettid-relay/internal/ratelimit"
 )
 
 // recorder captures status, error code and bytes for the access log. It
@@ -148,4 +150,28 @@ func rateKey(a netip.Addr) string {
 	}
 	p, _ := a.Prefix(64)
 	return p.String()
+}
+
+// withIPRateLimit applies the per-source-IP token bucket to every /v1/
+// request before anything else (headers, tokens, bodies) is examined
+// (spec §8.5). /healthz is exempt so load-balancer probes never starve.
+func (s *Server) withIPRateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			if ok, wait := s.ipLimit.Allow(rateKey(clientIP(r, s.cfg.TrustProxy)), s.now()); !ok {
+				s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// allowSender applies the per-sender bucket once a deposit token has been
+// parsed (keyed by the token's sub).
+func (s *Server) allowSender(sub string) *apiError {
+	if ok, wait := s.subLimit.Allow(sub, s.now()); !ok {
+		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
+	}
+	return nil
 }
