@@ -28,10 +28,10 @@ type Config struct {
 	MessageTTL        time.Duration // RELAY_MESSAGE_TTL
 	VisibilityTimeout time.Duration // RELAY_VISIBILITY_TIMEOUT
 
-	BlobsEnabled          bool          // RELAY_BLOBS_ENABLED
-	MaxBlobBytes          int64         // RELAY_MAX_BLOB_BYTES
-	BlobTTL               time.Duration // RELAY_BLOB_TTL
-	MaxConcurrentBlobPuts int           // RELAY_MAX_CONCURRENT_BLOB_UPLOADS
+	BlobsEnabled               bool          // RELAY_BLOBS_ENABLED
+	MaxBlobBytes               int64         // RELAY_MAX_BLOB_BYTES
+	BlobTTL                    time.Duration // RELAY_BLOB_TTL
+	MaxConcurrentBlobTransfers int           // RELAY_MAX_CONCURRENT_BLOB_TRANSFERS
 
 	MailboxMaxMessages  int64 // RELAY_MAILBOX_MAX_MESSAGES
 	MailboxMaxBytes     int64 // RELAY_MAILBOX_MAX_BYTES
@@ -66,10 +66,10 @@ func Defaults() Config {
 		MessageTTL:        14 * 24 * time.Hour,
 		VisibilityTimeout: 60 * time.Second,
 
-		BlobsEnabled:          true,
-		MaxBlobBytes:          8388608,
-		BlobTTL:               7 * 24 * time.Hour,
-		MaxConcurrentBlobPuts: 8,
+		BlobsEnabled:               true,
+		MaxBlobBytes:               8388608,
+		BlobTTL:                    7 * 24 * time.Hour,
+		MaxConcurrentBlobTransfers: 8,
 
 		MailboxMaxMessages:  10000,
 		MailboxMaxBytes:     128 << 20,
@@ -171,7 +171,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	boolean("RELAY_BLOBS_ENABLED", &c.BlobsEnabled)
 	i64("RELAY_MAX_BLOB_BYTES", &c.MaxBlobBytes)
 	dur("RELAY_BLOB_TTL", &c.BlobTTL)
-	integer("RELAY_MAX_CONCURRENT_BLOB_UPLOADS", &c.MaxConcurrentBlobPuts)
+	integer("RELAY_MAX_CONCURRENT_BLOB_TRANSFERS", &c.MaxConcurrentBlobTransfers)
 
 	i64("RELAY_MAILBOX_MAX_MESSAGES", &c.MailboxMaxMessages)
 	i64("RELAY_MAILBOX_MAX_BYTES", &c.MailboxMaxBytes)
@@ -225,7 +225,7 @@ func (c Config) Validate() error {
 	if c.BlobsEnabled && c.MaxBlobBytes <= 0 {
 		errs = append(errs, errors.New("RELAY_MAX_BLOB_BYTES must be > 0 when blobs are enabled"))
 	}
-	if c.MaxConcurrentBlobPuts <= 0 || c.MaxCollectorsPerMailbox <= 0 || c.ReplayCacheMax <= 0 ||
+	if c.MaxConcurrentBlobTransfers <= 0 || c.MaxCollectorsPerMailbox <= 0 || c.ReplayCacheMax <= 0 ||
 		c.RateIPBurst <= 0 || c.RateSenderBurst <= 0 {
 		errs = append(errs, errors.New("concurrency, burst and cache limits must be > 0"))
 	}

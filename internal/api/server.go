@@ -38,8 +38,9 @@ type Server struct {
 	ipLimit  *ratelimit.Limiter // per source IP (IPv4 / IPv6 /64), before any parsing
 	subLimit *ratelimit.Limiter // per sender key, after token parse
 
-	hub *hub
-	mux *http.ServeMux
+	hub       *hub
+	blobSlots chan struct{} // bounds concurrent blob transfers
+	mux       *http.ServeMux
 }
 
 type serverMetrics struct {
@@ -55,6 +56,10 @@ type serverMetrics struct {
 	rotations     metrics.Counter
 	parked        metrics.Gauge
 	wsSessions    metrics.Gauge
+	blobPuts      metrics.Counter
+	blobBytes     metrics.Counter
+	blobGets      metrics.Counter
+	blobDeletes   metrics.Counter
 }
 
 func newServerMetrics(reg *metrics.Registry) *serverMetrics {
@@ -72,6 +77,10 @@ func newServerMetrics(reg *metrics.Registry) *serverMetrics {
 		rotations:     reg.Counter("relay_rotations_total", "Mailbox key rotations."),
 		parked:        reg.Gauge("relay_parked_collectors", "Long-poll requests currently parked waiting for a deposit."),
 		wsSessions:    reg.Gauge("relay_ws_sessions", "Open WebSocket collect sessions."),
+		blobPuts:      reg.Counter("relay_blob_puts_total", "Blobs uploaded."),
+		blobBytes:     reg.Counter("relay_blob_bytes_total", "Blob bytes uploaded."),
+		blobGets:      reg.Counter("relay_blob_gets_total", "Blobs fetched."),
+		blobDeletes:   reg.Counter("relay_blob_deletes_total", "Blob delete requests."),
 	}
 	for _, c := range allCodes {
 		m.errors.With(c) // pre-create every series so rates start at 0
@@ -96,6 +105,8 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 		now:   time.Now,
 		mux:   http.NewServeMux(),
 		hub:   newHub(),
+
+		blobSlots: make(chan struct{}, cfg.MaxConcurrentBlobTransfers),
 
 		replay:   auth.NewReplayCache(cfg.ReplayCacheMax),
 		ipLimit:  ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
@@ -125,6 +136,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/mailbox/{msg_id}", s.handleAck)
 	s.mux.HandleFunc("POST /v1/mailbox/denylist", s.handleDenylist)
 	s.mux.HandleFunc("POST /v1/mailbox/rotate", s.handleRotate)
+	if s.cfg.BlobsEnabled {
+		s.mux.HandleFunc("PUT /v1/blob/{mailbox_id}", s.handleBlobPut)
+		s.mux.HandleFunc("GET /v1/blob/{blob_id}", s.handleBlobGet)
+		s.mux.HandleFunc("DELETE /v1/blob/{blob_id}", s.handleBlobDelete)
+	}
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { s.writeError(w, fail(CodeNotFound)) })
 }
 
