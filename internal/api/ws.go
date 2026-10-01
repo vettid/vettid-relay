@@ -32,16 +32,15 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	if s.draining.Load() {
-		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
-		return
-	}
 	if !s.hub.acquire(mb.ID, s.cfg.MaxCollectorsPerMailbox) {
 		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
 		return
 	}
 	defer s.hub.release(mb.ID)
-	s.streams.Add(1)
+	if !s.beginStream() { // shutting down: tell the client to come back
+		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
+		return
+	}
 	defer s.streams.Done()
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{

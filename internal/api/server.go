@@ -28,6 +28,7 @@ type Server struct {
 	drainCtx    context.Context // cancelled when shutdown starts
 	drainCancel context.CancelFunc
 	draining    atomic.Bool
+	streamMu    sync.Mutex     // orders streams.Add against Drain's Wait
 	streams     sync.WaitGroup // hijacked WebSocket sessions
 
 	bgCtx    context.Context // background goroutines (cache janitors)
@@ -182,7 +183,9 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // waits (bounded by ctx) for WebSocket sessions to finish. Call before
 // http.Server.Shutdown, which does not track hijacked connections.
 func (s *Server) Drain(ctx context.Context) error {
+	s.streamMu.Lock()
 	s.draining.Store(true)
+	s.streamMu.Unlock()
 	s.drainCancel()
 	done := make(chan struct{})
 	go func() { s.streams.Wait(); close(done) }()
@@ -218,4 +221,15 @@ func (s *Server) every(interval time.Duration, fn func(now time.Time)) {
 			}
 		}
 	}()
+}
+
+// beginStream registers a WebSocket session unless draining has started.
+func (s *Server) beginStream() bool {
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+	if s.draining.Load() {
+		return false
+	}
+	s.streams.Add(1)
+	return true
 }
