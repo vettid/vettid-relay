@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,7 @@ func (c *testClock) now() time.Time      { c.mu.Lock(); defer c.mu.Unlock(); ret
 func (c *testClock) add(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.mu.Unlock() }
 
 type fixture struct {
+	seq atomic.Int64 // per-request signature timestamp offset (µs)
 	t   *testing.T
 	cfg config.Config
 	clk *testClock
@@ -108,7 +110,7 @@ func (f *fixture) build(r req) *http.Request {
 	if r.signer != nil {
 		at := r.at
 		if at.IsZero() {
-			at = f.clk.now()
+			at = f.sigTime()
 		}
 		auth.SetHeaders(hr.Header, r.signer.priv, r.method, hr.URL.EscapedPath(), at, auth.BodyHash(r.body))
 	}
@@ -119,6 +121,13 @@ func (f *fixture) build(r req) *http.Request {
 		hr.Header[k] = v
 	}
 	return hr
+}
+
+// sigTime returns the clock time plus a unique microsecond offset, so
+// otherwise identical requests carry distinct signatures (as real clients'
+// sub-second timestamps do).
+func (f *fixture) sigTime() time.Time {
+	return f.clk.now().Add(time.Duration(f.seq.Add(1)) * time.Microsecond)
 }
 
 func (f *fixture) send(hr *http.Request) (int, []byte, http.Header) {

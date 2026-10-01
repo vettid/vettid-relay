@@ -38,18 +38,38 @@ type Server struct {
 	ipLimit  *ratelimit.Limiter // per source IP (IPv4 / IPv6 /64), before any parsing
 	subLimit *ratelimit.Limiter // per sender key, after token parse
 
+	hub *hub
 	mux *http.ServeMux
 }
 
 type serverMetrics struct {
-	errors   metrics.CounterVec
-	requests metrics.Counter
+	errors        metrics.CounterVec
+	requests      metrics.Counter
+	registrations metrics.Counter
+	deposits      metrics.Counter
+	depositBytes  metrics.Counter
+	collects      metrics.Counter
+	collected     metrics.Counter
+	acks          metrics.Counter
+	revocations   metrics.Counter
+	rotations     metrics.Counter
+	parked        metrics.Gauge
 }
 
 func newServerMetrics(reg *metrics.Registry) *serverMetrics {
 	m := &serverMetrics{
 		errors:   reg.CounterVec("relay_errors_total", "Error responses by canonical code.", "code"),
 		requests: reg.Counter("relay_http_requests_total", "HTTP requests received on the public listener."),
+
+		registrations: reg.Counter("relay_registrations_total", "New mailboxes registered."),
+		deposits:      reg.Counter("relay_deposits_total", "Messages deposited."),
+		depositBytes:  reg.Counter("relay_deposit_bytes_total", "Decoded payload bytes deposited."),
+		collects:      reg.Counter("relay_collects_total", "Collect responses sent (long-poll)."),
+		collected:     reg.Counter("relay_collected_messages_total", "Messages delivered (long-poll and WebSocket)."),
+		acks:          reg.Counter("relay_acks_total", "Messages acknowledged and deleted."),
+		revocations:   reg.Counter("relay_denylist_entries_total", "Denylist entries added."),
+		rotations:     reg.Counter("relay_rotations_total", "Mailbox key rotations."),
+		parked:        reg.Gauge("relay_parked_collectors", "Long-poll requests currently parked waiting for a deposit."),
 	}
 	for _, c := range allCodes {
 		m.errors.With(c) // pre-create every series so rates start at 0
@@ -73,6 +93,7 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 		m:     newServerMetrics(reg),
 		now:   time.Now,
 		mux:   http.NewServeMux(),
+		hub:   newHub(),
 
 		replay:   auth.NewReplayCache(cfg.ReplayCacheMax),
 		ipLimit:  ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
@@ -95,6 +116,12 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("POST /v1/register", s.handleRegister)
+	s.mux.HandleFunc("POST /v1/mailbox/{mailbox_id}", s.handleDeposit)
+	s.mux.HandleFunc("GET /v1/mailbox", s.handleCollect)
+	s.mux.HandleFunc("DELETE /v1/mailbox/{msg_id}", s.handleAck)
+	s.mux.HandleFunc("POST /v1/mailbox/denylist", s.handleDenylist)
+	s.mux.HandleFunc("POST /v1/mailbox/rotate", s.handleRotate)
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { s.writeError(w, fail(CodeNotFound)) })
 }
 

@@ -110,8 +110,16 @@ func SignRequest(priv ed25519.PrivateKey, method, path, timestamp string, bodyHa
 }
 
 // SetHeaders sets the three signed-request headers on h (client side).
+//
+// The timestamp keeps sub-second precision (RFC 3339 fractional seconds,
+// trailing zeros trimmed, so whole seconds render exactly as in the spec
+// vectors). This matters: the canonical string omits the query string and
+// Ed25519 is deterministic, so two requests with the same method, path, body
+// and a second-precision timestamp would carry identical signatures and the
+// second would be rejected as a replay — e.g. a long-poll re-issued within
+// the same second.
 func SetHeaders(h http.Header, priv ed25519.PrivateKey, method, path string, t time.Time, bodyHash [32]byte) {
-	ts := t.UTC().Format(time.RFC3339)
+	ts := t.UTC().Format(time.RFC3339Nano)
 	h.Set(HeaderKey, EncodeKey(priv.Public().(ed25519.PublicKey)))
 	h.Set(HeaderTimestamp, ts)
 	h.Set(HeaderSig, b64.EncodeToString(SignRequest(priv, method, path, ts, bodyHash)))

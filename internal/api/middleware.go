@@ -21,6 +21,7 @@ type recorder struct {
 	bytes    int64
 	code     string
 	hijacked bool
+	attrs    []any // extra non-sensitive log fields (msg ids, sizes, counts)
 }
 
 func (r *recorder) WriteHeader(status int) {
@@ -93,6 +94,9 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			}
 			if rec.code != "" {
 				attrs = append(attrs, slog.String("code", rec.code))
+			}
+			if len(rec.attrs) > 0 {
+				attrs = append(attrs, slog.Group("", rec.attrs...))
 			}
 			level := slog.LevelInfo
 			if route == "GET /healthz" && status == http.StatusOK {

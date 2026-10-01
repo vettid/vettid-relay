@@ -246,3 +246,28 @@ func FuzzVerifyRequest(f *testing.F) {
 		}
 	})
 }
+
+// Sub-second timestamps keep back-to-back identical requests distinct (the
+// canonical string omits the query string and Ed25519 is deterministic).
+func TestSubSecondTimestamps(t *testing.T) {
+	sender := vecKey(t, vecSenderSeed)
+	now := vecTime(t, vecTimestamp)
+	h1 := signedHeaders(t, sender, "GET", "/v1/mailbox", now.Add(1*time.Millisecond), nil)
+	h2 := signedHeaders(t, sender, "GET", "/v1/mailbox", now.Add(2*time.Millisecond), nil)
+	if h1.Get(HeaderTimestamp) != "2026-06-10T12:00:00.001Z" || h1.Get(HeaderSig) == h2.Get(HeaderSig) {
+		t.Fatalf("timestamps %q / %q", h1.Get(HeaderTimestamp), h2.Get(HeaderTimestamp))
+	}
+	c := NewReplayCache(100)
+	for _, h := range []http.Header{h1, h2} {
+		sr, err := ParseHeaders(h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sr.Verify("GET", "/v1/mailbox", BodyHash(nil), now); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Check(sr, now); err != nil {
+			t.Fatalf("distinct requests flagged as replay: %v", err)
+		}
+	}
+}
