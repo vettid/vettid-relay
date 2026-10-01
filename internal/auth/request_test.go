@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"errors"
 	"net/http"
 	"strings"
@@ -202,11 +203,11 @@ func FuzzCanonical(f *testing.F) {
 			}
 		}
 		// Digest is deterministic and signatures round-trip.
-		if Digest(method, path, ts, bh) != Digest(method, path, ts, bh) {
-			t.Fatal("digest not deterministic")
+		d := Digest(method, path, ts, bh)
+		if d != sha256.Sum256(c) {
+			t.Fatal("digest is not SHA-256(canonical)")
 		}
 		sig := SignRequest(priv, method, path, ts, bh)
-		d := Digest(method, path, ts, bh)
 		if !ed25519.Verify(priv.Public().(ed25519.PublicKey), d[:], sig) {
 			t.Fatal("sign/verify round trip failed")
 		}

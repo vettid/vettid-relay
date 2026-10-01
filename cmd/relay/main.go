@@ -56,7 +56,14 @@ func main() {
 	}
 }
 
+// version is stamped at build time (-ldflags "-X main.version=..."); when
+// empty, VCS info embedded by the Go toolchain is used.
+var version string
+
 func buildVersion() string {
+	if version != "" {
+		return "vettid-relay " + version
+	}
 	if bi, ok := debug.ReadBuildInfo(); ok {
 		for _, s := range bi.Settings {
 			if s.Key == "vcs.revision" {
