@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/vettid/vettid-relay/internal/auth"
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/store"
@@ -31,6 +32,8 @@ type Server struct {
 	bgCtx    context.Context // background goroutines (cache janitors)
 	bgCancel context.CancelFunc
 	bg       sync.WaitGroup
+
+	replay *auth.ReplayCache
 
 	mux *http.ServeMux
 }
@@ -67,6 +70,8 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 		m:     newServerMetrics(reg),
 		now:   time.Now,
 		mux:   http.NewServeMux(),
+
+		replay: auth.NewReplayCache(cfg.ReplayCacheMax),
 	}
 	s.drainCtx, s.drainCancel = context.WithCancel(context.Background())
 	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
@@ -74,6 +79,7 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 		o(s)
 	}
 	s.routes()
+	s.every(15*time.Second, func(time.Time) { s.replay.Sweep(s.now()) })
 	return s
 }
 
