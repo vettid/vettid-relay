@@ -193,3 +193,20 @@ func FuzzParseClaims(f *testing.F) {
 		}
 	})
 }
+
+// Regression (found by FuzzParseToken): encoding/base64 skips CR/LF even in
+// strict mode, which let one token have many spellings.
+func TestTokenRejectsEmbeddedNewlines(t *testing.T) {
+	pub := vecKey(t, vecRecipientSeed).Public().(ed25519.PublicKey)
+	for _, ins := range []string{"\r", "\n", "\r\n", " ", "="} {
+		mod := vecToken[:100] + ins + vecToken[100:]
+		if _, err := ParseToken(mod, pub); !errors.Is(err, ErrTokenInvalid) {
+			t.Errorf("token with %q accepted", ins)
+		}
+	}
+	for _, s := range []string{vecSenderPub[:10] + "\n" + vecSenderPub[10:], vecSigB64[:20] + "\r" + vecSigB64[20:]} {
+		if _, err := DecodeStd(s); err == nil {
+			t.Errorf("DecodeStd accepted %q", s)
+		}
+	}
+}

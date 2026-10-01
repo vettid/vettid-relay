@@ -68,12 +68,22 @@ func ValidMailboxID(s string) bool {
 // EncodeKey returns the canonical (standard, padded) base64 of a public key.
 func EncodeKey(pub []byte) string { return b64.EncodeToString(pub) }
 
+// DecodeStd strictly decodes standard padded base64. Unlike
+// encoding/base64 alone it also rejects embedded '\r'/'\n' (which the
+// standard decoder skips), so every value has exactly one spelling.
+func DecodeStd(s string) ([]byte, error) {
+	if strings.ContainsAny(s, "\r\n") {
+		return nil, base64.CorruptInputError(strings.IndexAny(s, "\r\n"))
+	}
+	return b64.DecodeString(s)
+}
+
 // DecodeKey strictly decodes a base64 raw Ed25519 public key.
 func DecodeKey(s string) (ed25519.PublicKey, bool) {
 	if len(s) != 44 {
 		return nil, false
 	}
-	k, err := b64.DecodeString(s)
+	k, err := DecodeStd(s)
 	if err != nil || len(k) != ed25519.PublicKeySize {
 		return nil, false
 	}
@@ -148,7 +158,7 @@ func ParseHeaders(h http.Header) (SignedRequest, error) {
 	if len(sv[0]) != 88 {
 		return sr, ErrSignatureInvalid
 	}
-	sig, err := b64.DecodeString(sv[0])
+	sig, err := DecodeStd(sv[0])
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return sr, ErrSignatureInvalid
 	}

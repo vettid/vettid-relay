@@ -25,8 +25,6 @@ const (
 	timeFormat       = "2006-01-02T15:04:05Z" // RFC 3339 UTC, second precision (spec examples)
 )
 
-var b64std = base64.StdEncoding.Strict()
-
 // readBody reads the whole body, enforcing limit while reading (spec §8.5:
 // size limits precede signature verification).
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, *apiError) {
@@ -170,7 +168,7 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodePayloadTooLarge))
 		return
 	}
-	payload, err := b64std.DecodeString(*req.Payload)
+	payload, err := auth.DecodeStd(*req.Payload)
 	if err != nil {
 		s.writeError(w, fail(CodeBadRequest))
 		return
@@ -472,7 +470,7 @@ func (s *Server) handleRotate(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeBadRequest))
 		return
 	}
-	proof, err := b64std.DecodeString(req.NewKeyProof)
+	proof, err := auth.DecodeStd(req.NewKeyProof)
 	// The proof is an Ed25519 signature by the new key over the ASCII bytes
 	// of the current mailbox_id.
 	if err != nil || len(proof) != ed25519.SignatureSize || !ed25519.Verify(newPub, []byte(mb.ID), proof) {

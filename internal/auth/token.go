@@ -67,6 +67,11 @@ func VerifyToken(token string, pub ed25519.PublicKey) ([]byte, error) {
 	if strings.IndexByte(rest, '.') >= 0 {
 		return nil, ErrTokenInvalid // footer present (or garbage); v1 footers are empty
 	}
+	// encoding/base64 silently skips '\r' and '\n' even in strict mode;
+	// accept only the base64url alphabet so a token has one spelling.
+	if !isBase64URL(rest) {
+		return nil, ErrTokenInvalid
+	}
 	raw, err := b64url.DecodeString(rest)
 	if err != nil || len(raw) < ed25519.SignatureSize {
 		return nil, ErrTokenInvalid
@@ -205,4 +210,14 @@ func MintToken(priv ed25519.PrivateKey, c Claims) (string, error) {
 		return "", err
 	}
 	return SignToken(priv, bytes.TrimSuffix(buf.Bytes(), []byte("\n"))), nil
+}
+
+func isBase64URL(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
 }
