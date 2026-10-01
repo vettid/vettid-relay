@@ -118,6 +118,14 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 		o(s)
 	}
 	s.routes()
+	reg.GaugeFunc("relay_replay_cache_entries", "Entries in the signature replay cache.", func() int64 { return int64(s.replay.Len()) })
+	reg.GaugeFunc("relay_active_collectors", "Active collectors (parked long-polls and WebSocket sessions).", func() int64 { return int64(s.hub.collectors()) })
+	reg.GaugeFunc("relay_draining", "1 while the relay is draining for shutdown.", func() int64 {
+		if s.draining.Load() {
+			return 1
+		}
+		return 0
+	})
 	s.every(15*time.Second, func(time.Time) {
 		now := s.now()
 		s.replay.Sweep(now)

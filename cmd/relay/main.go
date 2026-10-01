@@ -27,6 +27,7 @@ import (
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/store"
+	"github.com/vettid/vettid-relay/internal/sweep"
 )
 
 func main() {
@@ -129,6 +130,11 @@ func run(cfg config.Config, log *slog.Logger) error {
 	reg := metrics.New()
 	srv := api.New(cfg, st, log, reg)
 	defer srv.Close()
+
+	sweepCtx, stopSweep := context.WithCancel(context.Background())
+	sweepDone := make(chan struct{})
+	go func() { sweep.New(st, cfg.SweepInterval, log, reg).Run(sweepCtx); close(sweepDone) }()
+	defer func() { stopSweep(); <-sweepDone }()
 
 	pub := &http.Server{
 		Handler:           srv.Handler(),

@@ -47,6 +47,12 @@ type fixture struct {
 // f.clk.now().
 func newFixture(t *testing.T, mut func(*config.Config)) *fixture {
 	t.Helper()
+	return newFixtureLog(t, mut, io.Discard)
+}
+
+// newFixtureLog is newFixture with the relay's JSON logs written to logw.
+func newFixtureLog(t *testing.T, mut func(*config.Config), logw io.Writer) *fixture {
+	t.Helper()
 	cfg := config.Defaults()
 	cfg.BaseURL = testAud
 	cfg.RateIPPerSec, cfg.RateIPBurst = 1000, 1000
@@ -60,7 +66,7 @@ func newFixture(t *testing.T, mut func(*config.Config)) *fixture {
 		t.Fatal(err)
 	}
 	reg := metrics.New()
-	s := New(cfg, st, slog.New(slog.NewTextHandler(io.Discard, nil)), reg, WithClock(clk.now))
+	s := New(cfg, st, slog.New(slog.NewJSONHandler(logw, &slog.HandlerOptions{Level: slog.LevelDebug})), reg, WithClock(clk.now))
 	ts := httptest.NewServer(s.Handler())
 	f := &fixture{t: t, cfg: cfg, clk: clk, st: st, s: s, ts: ts, reg: reg}
 	t.Cleanup(func() {
