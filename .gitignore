@@ -1,0 +1,22 @@
+# build output
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# local state
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+/data/
+
+# fuzz cache is kept out; seed corpora live under testdata/fuzz and ARE committed
+/.cache/
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
