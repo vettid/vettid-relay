@@ -15,30 +15,30 @@ import (
 // Claim ids are bearer secrets: they are never logged and never appear in
 // metrics (the access log records only the route pattern).
 
-// defaultClaimTTL applies when X-VettID-Claim-TTL is absent (spec §6.9),
-// capped by the relay's claim_ttl_seconds.
+// defaultClaimTTL applies to a bare PUT /v1/claim (spec §6.9), capped by the
+// relay's claim_ttl_seconds.
 const defaultClaimTTL = 900 * time.Second
 
-const headerClaimTTL = "X-VettID-Claim-TTL"
-
-// claimTTL parses X-VettID-Claim-TTL: integer seconds in [1, claim_ttl_seconds].
+// claimTTL reads the requested TTL from the path (PUT /v1/claim/ttl/{seconds}),
+// which the request signature covers (§4.1): integer seconds in
+// [1, claim_ttl_seconds]. The 0.3.0-draft X-VettID-Claim-TTL header was
+// unsigned and is refused rather than silently ignored.
 func (s *Server) claimTTL(r *http.Request) (time.Duration, bool) {
-	v := r.Header.Values(headerClaimTTL)
-	switch len(v) {
-	case 0:
-		return min(defaultClaimTTL, s.cfg.ClaimTTL), true
-	case 1:
-		n, err := strconv.ParseInt(v[0], 10, 64)
-		if err != nil || n < 1 || time.Duration(n)*time.Second > s.cfg.ClaimTTL {
-			return 0, false
-		}
-		return time.Duration(n) * time.Second, true
-	default:
+	if len(r.Header.Values("X-VettID-Claim-TTL")) > 0 {
 		return 0, false
 	}
+	v := r.PathValue("ttl_seconds")
+	if v == "" {
+		return min(defaultClaimTTL, s.cfg.ClaimTTL), true
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 1 || n > int64(s.cfg.ClaimTTL/time.Second) || strconv.FormatInt(n, 10) != v {
+		return 0, false
+	}
+	return time.Duration(n) * time.Second, true
 }
 
-// PUT /v1/claim — signed by a registered mailbox key.
+// PUT /v1/claim[/ttl/{seconds}] — signed by a registered mailbox key.
 func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 	body, e := s.readBody(w, r, s.cfg.MaxClaimBytes) // size first (§8.5)
 	if e != nil {

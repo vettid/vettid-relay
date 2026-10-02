@@ -156,6 +156,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/mailbox/denylist", s.handleDenylist)
 	s.mux.HandleFunc("POST /v1/mailbox/rotate", s.handleRotate)
 	s.mux.HandleFunc("PUT /v1/claim", s.handleClaimPut)
+	s.mux.HandleFunc("PUT /v1/claim/ttl/{ttl_seconds}", s.handleClaimPut)
 	s.mux.HandleFunc("GET /v1/claim/{claim_id}", s.handleClaimGet)
 	s.mux.HandleFunc("DELETE /v1/claim/{claim_id}", s.handleClaimDelete)
 	if s.cfg.BlobsEnabled {

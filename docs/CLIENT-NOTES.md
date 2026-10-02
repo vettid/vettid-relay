@@ -88,9 +88,10 @@ uses two 0.3 features.
 **Owner (vault)**
 
 1. Put the bootstrap bundle in a claim with `PUT /v1/claim`. The body is the
-   raw bytes (public key material only), at most `max_claim_bytes`. You may
-   send `X-VettID-Claim-TTL: <seconds>` up to `claim_ttl_seconds`; without
-   it the TTL is 900 s or that cap, whichever is lower. The response is
+   raw bytes (public key material only), at most `max_claim_bytes`. To choose a
+   TTL, use `PUT /v1/claim/ttl/<seconds>` (up to `claim_ttl_seconds`; the
+   path is signed, so the TTL can't be altered in transit); without it the
+   TTL is 900 s or that cap, whichever is lower. The response is
    `{claim_id, expires_at}`.
 2. Mint a **one-shot open token**: `scope: "deposit_open"`, `sub: "*"`, and
    `exp − iat` at most `open_token_max_lifetime_seconds` (default 600 s).

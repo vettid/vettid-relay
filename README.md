@@ -98,7 +98,7 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_MAX_TOKEN_LIFETIME` | `720h` (30 d) | `max_token_lifetime_seconds` (§5.2). Sender-bound tokens with `exp − iat` above this are `token_invalid`. It also bounds denylist retention (§5.5). Any positive duration is accepted, for example `9600h` (400 d) for long-lived, low-quota reconnect tokens. |
 | `RELAY_OPEN_TOKEN_MAX_LIFETIME` | `600s` | `open_token_max_lifetime_seconds` (§5.6). This is the cap on `exp − iat` for one-shot open tokens. Up to 7 days is recommended for remote invitations. |
 | `RELAY_MAX_CLAIM_BYTES` | `16384` | `max_claim_bytes` (§6.9). This is the maximum claim body. |
-| `RELAY_CLAIM_TTL` | `900s` | `claim_ttl_seconds` (§6.9). It's the longest TTL a creator may request with `X-VettID-Claim-TTL`. Up to 7 days is recommended. Without the header, the TTL is min(900 s, this). |
+| `RELAY_CLAIM_TTL` | `900s` | `claim_ttl_seconds` (§6.9). It's the longest TTL a creator may request with `PUT /v1/claim/ttl/<seconds>`. Up to 7 days is recommended. A bare `PUT /v1/claim` gets min(900 s, this). |
 | `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `20` / `40` | Per-source-IP token bucket on `/v1/*`, applied before any parsing. The key is the IPv4 address or the IPv6 /64. |
 | `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits and blob uploads. It's keyed by token `sub`, or by `jti` for open tokens. |
 | `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
@@ -246,10 +246,11 @@ implementation chooses as follows:
 - **Open tokens and rate limits.** For open tokens, the per-sender rate
   bucket is keyed by the token's `jti`, because the signer is known only
   after §5.3 step 7.
-- **Claim TTL header.** `X-VettID-Claim-TTL` must be an integer number of
-  seconds between 1 and `claim_ttl_seconds`. Anything else is
-  `bad_request`; it is not clamped. Like every header except the three
-  signature headers, it is not covered by the request signature.
+- **Claim TTL.** The TTL is part of the signed path
+  (`PUT /v1/claim/ttl/<seconds>`, canonical decimal between 1 and
+  `claim_ttl_seconds`). Anything else is `bad_request`; it is not clamped.
+  The unsigned `X-VettID-Claim-TTL` header from an early 0.3 draft is
+  refused with `bad_request`.
 - **Claim limits.** Empty claim bodies are `bad_request`. Claims count
   toward the creating mailbox's `RELAY_MAILBOX_MAX_BLOB_BYTES`, together
   with blobs deposited to it.

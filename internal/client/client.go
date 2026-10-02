@@ -367,15 +367,15 @@ func (c *Client) DeleteBlob(ctx context.Context, blobID string) error {
 // PutClaim leaves a single-fetch claim (spec §6.9) owned by this mailbox.
 // ttl 0 uses the relay default (900 s, capped by claim_ttl_seconds).
 func (c *Client) PutClaim(ctx context.Context, data []byte, ttl time.Duration) (claimID string, expires time.Time, err error) {
-	var h http.Header
+	path := "/v1/claim"
 	if ttl > 0 {
-		h = http.Header{"X-Vettid-Claim-Ttl": {strconv.Itoa(int(ttl / time.Second))}}
+		path += "/ttl/" + strconv.Itoa(int(ttl/time.Second)) // signed with the request (§4.1)
 	}
 	var out struct {
 		ClaimID   string `json:"claim_id"`
 		ExpiresAt string `json:"expires_at"`
 	}
-	_, err = c.doJSON(ctx, request{method: "PUT", path: "/v1/claim", body: data, header: h,
+	_, err = c.doJSON(ctx, request{method: "PUT", path: path, body: data,
 		contentType: "application/octet-stream"}, &out)
 	if err != nil {
 		return "", time.Time{}, err

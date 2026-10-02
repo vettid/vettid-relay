@@ -19,10 +19,11 @@ type claimResp struct {
 func (f *fixture) putClaim(owner principal, data []byte, ttl string) (int, claimResp, []byte) {
 	f.t.Helper()
 	h := http.Header{"Content-Type": {"application/octet-stream"}}
+	path := "/v1/claim"
 	if ttl != "" {
-		h.Set("X-VettID-Claim-TTL", ttl)
+		path += "/ttl/" + ttl
 	}
-	code, b := f.do(req{method: "PUT", path: "/v1/claim", body: data, signer: &owner, header: h})
+	code, b := f.do(req{method: "PUT", path: path, body: data, signer: &owner, header: h})
 	var cr claimResp
 	json.Unmarshal(b, &cr)
 	return code, cr, b
@@ -99,7 +100,7 @@ func TestClaimPutValidation(t *testing.T) {
 	if code, _, _ := f.putClaim(owner, make([]byte, 101), ""); code != 413 {
 		t.Fatalf("oversize: %d", code)
 	}
-	for _, ttl := range []string{"601", "0", "-5", "abc", "1.5"} {
+	for _, ttl := range []string{"601", "0", "-5", "abc", "1.5", "0060", "+60"} {
 		if code, _, b := f.putClaim(owner, []byte("x"), ttl); code != 400 {
 			t.Fatalf("ttl %q: %d %s", ttl, code, b)
 		}
@@ -173,5 +174,22 @@ func TestClaimGetRateLimit(t *testing.T) {
 	}
 	if code, _, _ := f.getClaim(cr.ClaimID, ip("198.51.100.2")); code != 200 {
 		t.Fatalf("other client: %d", code)
+	}
+}
+
+// The TTL travels in the signed path (§4.1, §6.9); the unsigned draft header
+// is refused, and re-pathing a signed request breaks its signature.
+func TestClaimTTLIsSigned(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) { c.ClaimTTL = 7 * 24 * time.Hour })
+	owner := newPrincipal(1)
+	f.register(owner)
+	h := http.Header{"Content-Type": {"application/octet-stream"}, "X-Vettid-Claim-Ttl": {"60"}}
+	if code, b := f.do(req{method: "PUT", path: "/v1/claim", body: []byte("x"), signer: &owner, header: h}); code != 400 {
+		t.Fatalf("header TTL: %d %s", code, b)
+	}
+	r := f.build(req{method: "PUT", path: "/v1/claim/ttl/60", body: []byte("x"), signer: &owner})
+	r.URL.Path = "/v1/claim/ttl/604800"
+	if code, b, _ := f.send(r); code != 401 {
+		t.Fatalf("re-pathed TTL: %d %s", code, b)
 	}
 }
