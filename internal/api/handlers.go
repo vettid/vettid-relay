@@ -214,11 +214,12 @@ func (s *Server) limitsFor(da *depositAuth, blob bool) store.Limits {
 type wireMessage struct {
 	MsgID       string `json:"msg_id"`
 	DepositedAt string `json:"deposited_at"`
+	Sender      string `json:"sender"`  // base64 key that signed the deposit (spec §6.3)
 	Payload     []byte `json:"payload"` // encoding/json: standard padded base64
 }
 
 func toWire(m store.Message) wireMessage {
-	return wireMessage{MsgID: m.ID, DepositedAt: m.DepositedAt.UTC().Format(timeFormat), Payload: m.Payload}
+	return wireMessage{MsgID: m.ID, DepositedAt: m.DepositedAt.UTC().Format(timeFormat), Sender: m.Sender, Payload: m.Payload}
 }
 
 func parseCollectParams(r *http.Request) (wait time.Duration, max int, ok bool) {

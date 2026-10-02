@@ -50,7 +50,7 @@ func TestWebSocketCollect(t *testing.T) {
 	}
 	defer c.CloseNow()
 
-	if m := readFrame(t, c, 2*time.Second); m.MsgID != early || string(m.Payload) != "before connect" {
+	if m := readFrame(t, c, 2*time.Second); m.MsgID != early || string(m.Payload) != "before connect" || m.Sender != sender.b64 {
 		t.Fatalf("backlog frame %+v", m)
 	}
 	// Live push: deposit → frame in well under a second.

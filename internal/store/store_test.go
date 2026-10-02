@@ -108,7 +108,7 @@ func TestDepositLeaseAck(t *testing.T) {
 		}
 	}
 	got, err := s.Lease(ctx, "a", 3, time.Minute)
-	if err != nil || len(got) != 3 || got[0].ID != ids[0] || got[2].ID != ids[2] || got[1].Payload[0] != 1 {
+	if err != nil || len(got) != 3 || got[0].ID != ids[0] || got[2].ID != ids[2] || got[1].Payload[0] != 1 || got[0].Sender != "sender" {
 		t.Fatalf("lease 1: %+v %v", got, err)
 	}
 	got, _ = s.Lease(ctx, "a", 10, time.Minute)

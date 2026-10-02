@@ -22,6 +22,7 @@ type collectResp struct {
 	Messages []struct {
 		MsgID       string `json:"msg_id"`
 		DepositedAt string `json:"deposited_at"`
+		Sender      string `json:"sender"`
 		Payload     []byte `json:"payload"`
 	} `json:"messages"`
 }
@@ -119,7 +120,8 @@ func TestDepositCollectAck(t *testing.T) {
 		ids = append(ids, f.mustDeposit(owner, sender, tok, []byte(fmt.Sprintf("ciphertext-%d", i))))
 	}
 	got := f.collect(owner, "?max=2")
-	if len(got.Messages) != 2 || got.Messages[0].MsgID != ids[0] || string(got.Messages[1].Payload) != "ciphertext-1" {
+	if len(got.Messages) != 2 || got.Messages[0].MsgID != ids[0] || string(got.Messages[1].Payload) != "ciphertext-1" ||
+		got.Messages[0].Sender != sender.b64 {
 		t.Fatalf("collect: %+v", got)
 	}
 	if _, err := time.Parse(time.RFC3339, got.Messages[0].DepositedAt); err != nil || !strings.HasSuffix(got.Messages[0].DepositedAt, "Z") {

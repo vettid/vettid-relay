@@ -107,7 +107,8 @@ func TestTwoPrincipals(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("long-poll not woken")
 	}
-	if r.err != nil || len(r.msgs) != 1 || r.msgs[0].MsgID != msgID || string(r.msgs[0].Payload) != "e2e-ciphertext-1" {
+	if r.err != nil || len(r.msgs) != 1 || r.msgs[0].MsgID != msgID || string(r.msgs[0].Payload) != "e2e-ciphertext-1" ||
+		r.msgs[0].Sender != app.PublicKeyB64() {
 		t.Fatalf("collect: %+v %v", r.msgs, r.err)
 	}
 	if lat := r.at.Sub(sentAt); lat >= time.Second {

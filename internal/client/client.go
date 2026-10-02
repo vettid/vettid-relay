@@ -247,6 +247,7 @@ func (c *Client) Deposit(ctx context.Context, mailboxID, token string, payload [
 type Message struct {
 	MsgID       string `json:"msg_id"`
 	DepositedAt string `json:"deposited_at"`
+	Sender      string `json:"sender"` // base64 relay key that signed the deposit
 	Payload     []byte `json:"payload"`
 }
 
