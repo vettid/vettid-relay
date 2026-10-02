@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	auth "github.com/vettid/vettid-relay/relayauth"
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/store"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 const testAud = "https://relay.test.vettid.org"

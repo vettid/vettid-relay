@@ -63,7 +63,7 @@ X-VettID-Sig = base64(Ed25519(key, SHA-256(canonical)))
   - Rarely used reconnect tokens: up to the relay's cap (about a year on
     vettid.org), with a small `quota`.
 - **Clock skew.** The relay checks `iat ≤ now < exp` strictly. Backdate
-  `iat` by up to 30 s so a minting clock that runs ahead doesn't make fresh
+  `iat` by up to 60 s so a minting clock that runs ahead doesn't make fresh
   tokens `token_expired`.
 - **`jti`** is unique per token. A ULID is recommended, and it's the
   revocation handle.

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	auth "github.com/vettid/vettid-relay/relayauth"
 	"github.com/vettid/vettid-relay/internal/config"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 type collectResp struct {
@@ -23,6 +23,7 @@ type collectResp struct {
 		MsgID       string `json:"msg_id"`
 		DepositedAt string `json:"deposited_at"`
 		Sender      string `json:"sender"`
+		JTI         string `json:"jti"`
 		Payload     []byte `json:"payload"`
 	} `json:"messages"`
 }

@@ -7,7 +7,7 @@ import (
 )
 
 // schemaVersion is bumped with every migration appended to migrations.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // migrations[i] upgrades the schema from version i to i+1.
 //
@@ -91,6 +91,11 @@ CREATE TABLE claims (
 );
 CREATE INDEX idx_claims_mailbox ON claims(mailbox_id);
 CREATE INDEX idx_claims_expiry  ON claims(expires_at);
+`,
+	// v3 (protocol 0.4.0): the jti of the token each message was deposited
+	// with, returned on collect (§6.3). Rows from earlier versions have ''.
+	`
+ALTER TABLE messages ADD COLUMN token_jti TEXT NOT NULL DEFAULT '';
 `,
 }
 

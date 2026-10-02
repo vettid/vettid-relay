@@ -18,10 +18,10 @@ import (
 	"time"
 
 	"github.com/vettid/vettid-relay/internal/api"
-	client "github.com/vettid/vettid-relay/relayclient"
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/store"
+	client "github.com/vettid/vettid-relay/relayclient"
 )
 
 func startRelay(t *testing.T) string {

@@ -320,6 +320,7 @@ type Message struct {
 	ID          string
 	Mailbox     string
 	Sender      string // canonical base64 pubkey that signed the deposit (spec §6.3)
+	TokenJTI    string // jti of the deposit token ('' for pre-0.4 rows)
 	Payload     []byte
 	DepositedAt time.Time
 }
@@ -362,11 +363,11 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 	if err := chargeToken(ctx, tx, mailbox, lim, 1, size); err != nil {
 		return Message{}, err
 	}
-	m := Message{ID: s.newID(now), Mailbox: mailbox, Sender: senderSub, Payload: payload, DepositedAt: now.UTC()}
+	m := Message{ID: s.newID(now), Mailbox: mailbox, Sender: senderSub, TokenJTI: lim.TokenJTI, Payload: payload, DepositedAt: now.UTC()}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO messages(msg_id, mailbox_id, size, deposited_at, expires_at, sender_sub, payload)
-		 VALUES(?,?,?,?,?,?,?)`,
-		m.ID, mailbox, size, ms(now), ms(now.Add(ttl)), senderSub, payload); err != nil {
+		`INSERT INTO messages(msg_id, mailbox_id, size, deposited_at, expires_at, sender_sub, token_jti, payload)
+		 VALUES(?,?,?,?,?,?,?,?)`,
+		m.ID, mailbox, size, ms(now), ms(now.Add(ttl)), senderSub, lim.TokenJTI, payload); err != nil {
 		return Message{}, err
 	}
 	return m, tx.Commit()
@@ -407,7 +408,7 @@ func (s *Store) Lease(ctx context.Context, mailbox string, max int, visibility t
 	defer tx.Rollback()
 	now := ms(s.now())
 	rows, err := tx.QueryContext(ctx,
-		`SELECT msg_id, deposited_at, sender_sub, payload FROM messages
+		`SELECT msg_id, deposited_at, sender_sub, token_jti, payload FROM messages
 		 WHERE mailbox_id=? AND expires_at>? AND (leased_until IS NULL OR leased_until<=?)
 		 ORDER BY msg_id LIMIT ?`, mailbox, now, now, max)
 	if err != nil {
@@ -417,7 +418,7 @@ func (s *Store) Lease(ctx context.Context, mailbox string, max int, visibility t
 	for rows.Next() {
 		var m Message
 		var dep int64
-		if err := rows.Scan(&m.ID, &dep, &m.Sender, &m.Payload); err != nil {
+		if err := rows.Scan(&m.ID, &dep, &m.Sender, &m.TokenJTI, &m.Payload); err != nil {
 			rows.Close()
 			return nil, err
 		}

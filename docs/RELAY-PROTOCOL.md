@@ -1,6 +1,6 @@
 # VettID Relay Protocol
 
-**Version:** 0.3.0 (draft)
+**Version:** 0.4.0 (draft)
 **Status:** Pre-implementation draft for review
 
 ## 1. Purpose & design principles
@@ -143,7 +143,9 @@ applications MAY mint rarely used, low-quota tokens with longer lifetimes
 allows it. Long-lived tokens SHOULD carry a small `quota`.
 
 **Clock skew.** `iat ≤ now` is checked strictly. Issuers SHOULD backdate `iat`
-by up to 30 seconds if their clock may run ahead of the relay's.
+by up to 60 seconds if their clock may run ahead of the relay's (one-shot open
+tokens by at most half their lifetime). Lifetimes are measured from the
+backdated `iat`.
 
 ### 5.3 Relay-side validation order
 
@@ -282,6 +284,7 @@ GET /v1/mailbox?wait=25&max=32       (owner-signed)
 → 200 { "messages": [ { "msg_id": "<ULID>",
                         "deposited_at": "<RFC3339>",
                         "sender": "<base64 depositor relay pubkey>",
+                        "jti": "<jti of the deposit token>",
                         "payload": "<base64>" }, ... ] }
 ```
 
@@ -289,6 +292,11 @@ GET /v1/mailbox?wait=25&max=32       (owner-signed)
   sender-bound tokens, the signer for open tokens (§5.6). The relay vouches
   only that this key signed the deposit; the payload's own E2E authentication
   remains the authority on who wrote it.
+- `jti` (0.4.0) is the `jti` of the deposit token the message was accepted
+  under, so an owner holding several tokens for one sender (e.g. a standing
+  and a reconnect token) can tell which was used. Like `sender`, it is
+  visible only to the mailbox owner. Messages stored by a pre-0.4 relay MAY
+  omit it; clients MUST tolerate its absence.
 - `wait` defaults to 0 and `max` to 32; larger values are clamped to the caps.
 - Returns up to `max` (cap 100) oldest messages that are unexpired and not
   currently leased; returned messages become leased for
@@ -305,7 +313,7 @@ GET /v1/mailbox?wait=25&max=32       (owner-signed)
 GET /v1/mailbox/ws                   (owner-signed at upgrade)
 ```
 
-Server frames: `{ "msg_id", "deposited_at", "sender", "payload" }` — same
+Server frames: `{ "msg_id", "deposited_at", "sender", "jti", "payload" }` — same
 lease semantics. Client frames: `{ "ack": "<msg_id>" }`. WebSocket support is
 OPTIONAL for relays and clients; long-poll is the mandatory baseline.
 
@@ -612,6 +620,9 @@ The push gateway API is specified separately.
 
 ## 10. Changelog
 
+- **0.4.0** — collect results carry the deposit token's `jti` (§6.3, §6.4) so
+  owners can distinguish a sender's tokens (VAULT-MESSAGING §6.6); `iat`
+  backdating guidance raised to 60 s (§5.2). Additive for clients.
 - **0.3.0** — first contact: one-shot open deposit tokens (§5.6; deposit
   only, no blobs) and single-fetch claims for bootstrap bundles (§6.9; TTL in
   the signed path, never retried by clients), with maximum lifetimes as advertised

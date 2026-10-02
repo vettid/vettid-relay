@@ -464,6 +464,13 @@ func TestMigrateFromV1(t *testing.T) {
 	if _, err := s.IsConsumed(ctx, "old", "x"); err != nil {
 		t.Fatalf("v2 table missing: %v", err)
 	}
+	m, err := s.Deposit(ctx, "old", "s", []byte("x"), time.Hour, Limits{TokenJTI: "j1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Lease(ctx, "old", 10, time.Minute); err != nil || len(got) != 1 || got[0].ID != m.ID || got[0].TokenJTI != "j1" {
+		t.Fatalf("v3 token_jti: %+v %v", got, err)
+	}
 }
 
 func TestClaims(t *testing.T) {

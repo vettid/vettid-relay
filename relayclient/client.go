@@ -234,7 +234,7 @@ func (c *Client) MintToken(senderB64, audience string, o TokenOptions) (string, 
 	})
 }
 
-const tokenBackdate = 30 * time.Second
+const tokenBackdate = 60 * time.Second // RELAY-PROTOCOL §5.2
 
 // MintOpenToken issues a one-shot open token (spec §5.6) for first contact:
 // whoever holds it may deposit exactly one message, signed with any key,
@@ -282,6 +282,7 @@ type Message struct {
 	MsgID       string `json:"msg_id"`
 	DepositedAt string `json:"deposited_at"`
 	Sender      string `json:"sender"` // base64 relay key that signed the deposit
+	JTI         string `json:"jti"`    // jti of the token used (protocol ≥ 0.4.0)
 	Payload     []byte `json:"payload"`
 }
 
