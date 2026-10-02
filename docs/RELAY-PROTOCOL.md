@@ -1,6 +1,6 @@
 # VettID Relay Protocol
 
-**Version:** 0.2.0 (draft)
+**Version:** 0.3.0 (draft)
 **Status:** Pre-implementation draft for review
 
 ## 1. Purpose & design principles
@@ -77,7 +77,7 @@ Every authenticated request carries three headers:
 | Header | Content |
 |---|---|
 | `X-VettID-Key` | base64(raw 32-byte Ed25519 public key) of the requester |
-| `X-VettID-Timestamp` | RFC 3339 UTC timestamp of the request |
+| `X-VettID-Timestamp` | RFC 3339 UTC timestamp of the request; MAY include fractional seconds (clients SHOULD send millisecond precision, see below) |
 | `X-VettID-Sig` | base64(Ed25519 signature) over the request digest (below) |
 
 **Canonical request digest:**
@@ -95,11 +95,18 @@ signature = Ed25519-Sign(requester_private_key, digest)
   (`code: timestamp_stale`).
 - The relay MUST keep an in-memory replay cache of (key, signature) pairs for at
   least the freshness window and reject duplicates (`code: replay_detected`).
+- The canonical string uses the `X-VettID-Timestamp` header value **verbatim**.
+  Because the digest does not cover the query string and Ed25519 signatures are
+  deterministic, two otherwise identical requests in the same second would
+  collide in the replay cache (e.g. a long-poll re-issued immediately, §6.2).
+  Clients SHOULD therefore send fractional seconds (millisecond precision);
+  relays MUST accept them.
 - For **owner routes** (collect, ack, denylist, rotate), the relay MUST verify
   that `X-VettID-Key` equals the registered pubkey of the mailbox being operated
   on.
 - For **deposit**, `X-VettID-Key` MUST equal the `sub` of the presented deposit
-  token (sender binding, §5.3).
+  token (sender binding, §5.3) — except for one-shot open tokens (§5.6), where
+  the signer becomes the depositor.
 
 ### 4.2 Deposit tokens
 
@@ -119,17 +126,29 @@ whitespace). The footer and implicit assertion are empty in v1.
 | Claim | Req | Meaning |
 |---|---|---|
 | `iss` | MUST | mailbox_id of the issuing (recipient) mailbox |
-| `sub` | MUST | base64 raw pubkey of the authorized sender's relay key |
+| `sub` | MUST | base64 raw pubkey of the authorized sender's relay key; the literal `*` only in open tokens (§5.6) |
 | `aud` | MUST | base URL of the relay the token is valid for (exact match) |
 | `iat` | MUST | issuance time |
 | `exp` | MUST | expiry. SHOULD be ≤ 30 days for standing (connection) tokens; SHOULD be ≤ 5 minutes for one-shot tokens |
 | `jti` | MUST | unique token ID (ULID recommended); the revocation handle |
-| `scope` | MUST | the string `deposit` (only scope in v1; field reserved for future use) |
+| `scope` | MUST | `deposit` (sender-bound) or `deposit_open` (one-shot open token, §5.6) |
 | `quota` | MAY | `{ "msgs": n, "bytes": n }` — cap on this token's total deposits; relay enforces best-effort per relay instance |
+
+**Lifetime cap.** A relay MAY refuse tokens whose `exp − iat` exceeds its
+`max_token_lifetime_seconds` (`token_invalid`) and MUST advertise that limit at
+registration (§6.1). This is what bounds denylist retention (§5.5). The limit
+is relay policy: the 30-day guidance above is for standing tokens, while
+applications MAY mint rarely used, low-quota tokens with longer lifetimes
+(e.g. a connection's reconnect token, up to about a year) where the relay
+allows it. Long-lived tokens SHOULD carry a small `quota`.
+
+**Clock skew.** `iat ≤ now` is checked strictly. Issuers SHOULD backdate `iat`
+by up to 30 seconds if their clock may run ahead of the relay's.
 
 ### 5.3 Relay-side validation order
 
-On `POST /v1/mailbox/{mailbox_id}` the relay MUST verify, in order:
+On `POST /v1/mailbox/{mailbox_id}` the relay MUST first enforce the body size
+limit (`payload_too_large`, §8.5), then verify, in order:
 
 1. Mailbox exists → else `mailbox_unknown`
 2. Token parses as PASETO v4.public and its signature verifies against the
@@ -138,9 +157,10 @@ On `POST /v1/mailbox/{mailbox_id}` the relay MUST verify, in order:
 4. `aud` == this relay's configured base URL → else `token_invalid`
 5. `iat` ≤ now < `exp` → else `token_expired`
 6. `jti` not in mailbox denylist AND `sub` not in mailbox denylist
-   → else `token_revoked`
+   → else `token_revoked`; for open tokens (§5.6), `jti` not already consumed
+   → else `token_used`
 7. Request signature (§4.1) verifies AND `X-VettID-Key` == token `sub`
-   → else `signature_invalid`
+   (open tokens: the signature alone) → else `signature_invalid`
 8. Quota counters (token quota if present, mailbox quota) not exceeded
    → else `quota_exceeded`
 
@@ -168,7 +188,33 @@ POST /v1/mailbox/denylist            (owner-signed, §4.1)
 The relay MUST retain each denylist entry at least until the latest possible
 expiry of any token it could match; entries MAY then be garbage-collected.
 Issuers SHOULD bound token lifetimes (§5.2) precisely so that denylists stay
-small.
+small. A `sub` entry also blocks tokens minted for that sender *after* the
+revocation, until the entry expires.
+
+### 5.6 One-shot open tokens (first contact)
+
+A sender-bound token needs the sender's relay key in advance, which first
+contact (scanning a QR code, a pairing code, an invitation) cannot provide.
+For that case an owner MAY mint a **one-shot open token**:
+
+- `scope` = `deposit_open`, `sub` = `*`;
+- `exp − iat` MUST be ≤ `open_token_max_lifetime_seconds`, a relay policy
+  value advertised at registration (default **600 s**; relays MAY allow longer
+  for remote invitations — RECOMMENDED ≤ 7 days);
+- it permits **exactly one** deposit: the relay MUST record the `jti` as
+  consumed on the first successful deposit and retain that record until `exp`
+  (a second use → `409 token_used`);
+- the deposit request MUST still be signed (§4.1) by *some* Ed25519 key; that
+  key becomes the deposit's `sender` (§6.3), so the recipient learns the first
+  contact's relay key and can answer with a normal sender-bound token.
+
+Open tokens are bearer capabilities: whoever holds one can deposit one
+message. Owners SHOULD keep them as short-lived as the use allows (minutes for
+an in-person QR code; longer only for invitations sent through other
+channels) and deliver them only out of band — typically alongside a claim id
+(§6.9) whose content is committed to by hash. Applications SHOULD treat a
+contact arriving through a long-lived open token as unconfirmed until the
+owner approves it. Revocation by `jti` works as for any token.
 
 ## 6. Endpoints
 
@@ -184,6 +230,10 @@ POST /v1/register                    (signed request; key being registered)
         "limits": { "max_payload_bytes": 262144,
                     "message_ttl_seconds": 1209600,
                     "visibility_timeout_seconds": 60,
+                    "max_token_lifetime_seconds": 34560000,
+                    "open_token_max_lifetime_seconds": 604800,
+                    "max_claim_bytes": 16384,
+                    "claim_ttl_seconds": 604800,
                     "max_blob_bytes": 8388608,
                     "blob_ttl_seconds": 604800 } }
 ```
@@ -226,9 +276,15 @@ POST /v1/mailbox/{mailbox_id}        (deposit token §5 + signed request §4.1)
 GET /v1/mailbox?wait=25&max=32       (owner-signed)
 → 200 { "messages": [ { "msg_id": "<ULID>",
                         "deposited_at": "<RFC3339>",
+                        "sender": "<base64 depositor relay pubkey>",
                         "payload": "<base64>" }, ... ] }
 ```
 
+- `sender` is the key that signed the deposit request: the token's `sub` for
+  sender-bound tokens, the signer for open tokens (§5.6). The relay vouches
+  only that this key signed the deposit; the payload's own E2E authentication
+  remains the authority on who wrote it.
+- `wait` defaults to 0 and `max` to 32; larger values are clamped to the caps.
 - Returns up to `max` (cap 100) oldest messages that are unexpired and not
   currently leased; returned messages become leased for
   `visibility_timeout_seconds`.
@@ -244,8 +300,8 @@ GET /v1/mailbox?wait=25&max=32       (owner-signed)
 GET /v1/mailbox/ws                   (owner-signed at upgrade)
 ```
 
-Server frames: `{ "msg_id", "deposited_at", "payload" }` — same lease
-semantics. Client frames: `{ "ack": "<msg_id>" }`. WebSocket support is
+Server frames: `{ "msg_id", "deposited_at", "sender", "payload" }` — same
+lease semantics. Client frames: `{ "ack": "<msg_id>" }`. WebSocket support is
 OPTIONAL for relays and clients; long-poll is the mandatory baseline.
 
 ### 6.5 Ack
@@ -255,8 +311,10 @@ DELETE /v1/mailbox/{msg_id}          (owner-signed)
 → 204
 ```
 
-Idempotent: `204` whether or not the message still existed. Acking a message
-belonging to another mailbox → `404 mailbox_unknown` (no existence oracle).
+Always `204`: whether the message existed, was already acked, or belongs to
+another mailbox (in which case nothing happens). A uniform answer means ack
+can't be used to probe which message ids exist. (0.2.0 returned 404 for
+another mailbox's message, which was itself an existence oracle.)
 
 ### 6.6 Denylist
 
@@ -334,6 +392,41 @@ relay-visible fields.
 
 Additional error code: `blob_unknown`.
 
+### 6.9 Claims (bootstrap bundles for first contact)
+
+A **claim** is a small blob an owner leaves on the relay for someone who does
+not yet have a token — e.g. the key bundle behind a QR code (PQC-MIGRATION
+§6.5: the QR carries `{claim_id, bundle_hash}`, never the bundle itself).
+
+```
+PUT /v1/claim                        (signed by a registered mailbox key, §4.1)
+Content-Type: application/octet-stream
+X-VettID-Claim-TTL: <seconds>        (optional, ≤ claim_ttl_seconds; default 900)
+<raw bytes, ≤ max_claim_bytes>
+→ 201 { "claim_id": "<26-char lowercase base32 of 128 random bits>",
+        "expires_at": "<RFC3339>" }
+
+GET /v1/claim/{claim_id}             (unauthenticated; rate-limited)
+→ 200 application/octet-stream       (single fetch: the claim is deleted)
+
+DELETE /v1/claim/{claim_id}          (signed by the creating key)
+→ 204                                (idempotent)
+```
+
+- `claim_ttl_seconds` (advertised at registration) is relay policy: the
+  maximum TTL a creator may request. Default 900 s; relays MAY allow longer
+  for remote invitations (RECOMMENDED ≤ 7 days).
+- Claims are **single-fetch**: the first successful GET deletes the claim.
+  Unknown, expired, already-fetched and never-existed claims all return the
+  same `404 claim_unknown`.
+- The relay vouches for nothing about the content; integrity comes from the
+  hash commitment carried out of band. Content SHOULD be public key material
+  only.
+- Claim ids MUST be generated by the relay from a CSPRNG and MUST NOT be logged.
+  Claims count against the creating mailbox's storage quota; relays SHOULD rate
+  limit GETs per client network (IPv4 address / IPv6 /64) to resist guessing
+  and scraping.
+
 ## 7. Errors, limits, versioning
 
 ### 7.1 Error body
@@ -342,10 +435,26 @@ Additional error code: `blob_unknown`.
 { "code": "<canonical_code>", "message": "<human readable>", "retry_after": <seconds, optional> }
 ```
 
-Canonical codes: `token_invalid`, `token_expired`, `token_revoked`,
-`mailbox_unknown`, `blob_unknown`, `payload_too_large`, `quota_exceeded`,
-`rate_limited`, `signature_invalid`, `timestamp_stale`, `replay_detected`,
-`internal`.
+Canonical codes and their HTTP statuses:
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `bad_request` | 400 | malformed JSON, base64, header or parameter |
+| `signature_invalid` | 401 | request signature missing, wrong, or not the required key |
+| `timestamp_stale` | 401 | timestamp outside the freshness window |
+| `replay_detected` | 401 | (key, signature) already seen |
+| `token_invalid` | 401 | token malformed, bad signature, wrong `iss`/`aud`/`scope`, lifetime too long |
+| `token_expired` | 401 | outside `iat`..`exp` |
+| `token_revoked` | 403 | `jti` or `sub` on the owner's denylist |
+| `mailbox_unknown` | 404 | no such mailbox (or not yours — indistinguishable) |
+| `blob_unknown` | 404 | no such blob for this owner |
+| `claim_unknown` | 404 | no such claim (unknown, expired or already fetched) |
+| `not_found` | 404 | no such route |
+| `token_used` | 409 | one-shot open token already consumed (§5.6) |
+| `payload_too_large` | 413 | body over the advertised limit |
+| `quota_exceeded` | 429 | token or mailbox quota exhausted |
+| `rate_limited` | 429 | slow down; see `retry_after` |
+| `internal` | 500 | relay fault |
 
 ### 7.2 Rate limiting
 
@@ -490,6 +599,16 @@ The push gateway API is specified separately.
 
 ## 10. Changelog
 
+- **0.3.0** — first contact: one-shot open deposit tokens (§5.6) and single-fetch
+  claims for bootstrap bundles (§6.9), with maximum lifetimes as advertised
+  relay policy (short by default, up to ~7 days for remote invitations); collect results carry the depositor's
+  `sender` key (§6.3, §6.4); fractional-second timestamps (§4.1); ack always
+  `204` (§6.5, removes an existence oracle); token lifetime cap advertised at
+  registration and `sub`-revocation semantics; long-lived low-quota tokens
+  (e.g. reconnect) allowed by relay policy (§5.2, §5.5); size check before
+  token validation (§5.3); collect defaults; complete error-code table with
+  HTTP statuses (§7.1). All additive for clients; relays must implement the new
+  endpoints and fields.
 - **0.2.0** — wake-on-deposit latency requirements (§6.2); OPTIONAL blob
   transfer endpoints with claim-check flow (§6.8) and blob limits advertised
   at registration (§6.1); `blob_unknown` error code; blob security
