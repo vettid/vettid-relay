@@ -59,3 +59,28 @@ func TestLoadRejects(t *testing.T) {
 		}
 	}
 }
+
+func TestLifetimePolicyConfig(t *testing.T) {
+	c, err := Load(env(map[string]string{
+		"RELAY_MAX_TOKEN_LIFETIME":      "34560000", // 400 days, integer seconds
+		"RELAY_OPEN_TOKEN_MAX_LIFETIME": "168h",
+		"RELAY_CLAIM_TTL":               "604800",
+		"RELAY_MAX_CLAIM_BYTES":         "4096",
+		"RELAY_RATE_CLAIM_GET_RPS":      "0.5",
+		"RELAY_RATE_CLAIM_GET_BURST":    "3",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxTokenLifetime != 400*24*time.Hour || c.OpenTokenMaxLifetime != 7*24*time.Hour ||
+		c.ClaimTTL != 7*24*time.Hour || c.MaxClaimBytes != 4096 || c.RateClaimPerSec != 0.5 || c.RateClaimBurst != 3 {
+		t.Fatalf("%+v", c)
+	}
+	d := Defaults()
+	if d.OpenTokenMaxLifetime != 600*time.Second || d.ClaimTTL != 900*time.Second || d.MaxClaimBytes != 16384 {
+		t.Fatalf("0.3 defaults: %+v", d)
+	}
+	if _, err := Load(env(map[string]string{"RELAY_MAX_CLAIM_BYTES": "0"})); err == nil {
+		t.Fatal("zero claim size accepted")
+	}
+}

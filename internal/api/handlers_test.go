@@ -22,6 +22,7 @@ type collectResp struct {
 	Messages []struct {
 		MsgID       string `json:"msg_id"`
 		DepositedAt string `json:"deposited_at"`
+		Sender      string `json:"sender"`
 		Payload     []byte `json:"payload"`
 	} `json:"messages"`
 }
@@ -81,7 +82,9 @@ func TestRegister(t *testing.T) {
 	if code != http.StatusCreated {
 		t.Fatalf("%d %s", code, b)
 	}
-	want := `{"mailbox_id":"` + p.mbx + `","limits":{"max_payload_bytes":262144,"message_ttl_seconds":1209600,"visibility_timeout_seconds":60,"max_blob_bytes":8388608,"blob_ttl_seconds":604800}}` + "\n"
+	want := `{"mailbox_id":"` + p.mbx + `","limits":{"max_payload_bytes":262144,"message_ttl_seconds":1209600,"visibility_timeout_seconds":60,` +
+		`"max_token_lifetime_seconds":2592000,"open_token_max_lifetime_seconds":600,"max_claim_bytes":16384,"claim_ttl_seconds":900,` +
+		`"max_blob_bytes":8388608,"blob_ttl_seconds":604800}}` + "\n"
 	if string(b) != want {
 		t.Fatalf("register body:\n got %s\nwant %s", b, want)
 	}
@@ -119,7 +122,8 @@ func TestDepositCollectAck(t *testing.T) {
 		ids = append(ids, f.mustDeposit(owner, sender, tok, []byte(fmt.Sprintf("ciphertext-%d", i))))
 	}
 	got := f.collect(owner, "?max=2")
-	if len(got.Messages) != 2 || got.Messages[0].MsgID != ids[0] || string(got.Messages[1].Payload) != "ciphertext-1" {
+	if len(got.Messages) != 2 || got.Messages[0].MsgID != ids[0] || string(got.Messages[1].Payload) != "ciphertext-1" ||
+		got.Messages[0].Sender != sender.b64 {
 		t.Fatalf("collect: %+v", got)
 	}
 	if _, err := time.Parse(time.RFC3339, got.Messages[0].DepositedAt); err != nil || !strings.HasSuffix(got.Messages[0].DepositedAt, "Z") {
@@ -293,10 +297,12 @@ func TestAckForeignMessage(t *testing.T) {
 	f.register(alice)
 	f.register(bob)
 	id := f.mustDeposit(alice, sender, f.mint(alice, sender, nil), []byte("for alice"))
-	// Spec §6.5: acking another mailbox's message → 404 mailbox_unknown, and
-	// the message survives.
-	if code, b := f.ack(bob, id); code != 404 || !strings.Contains(string(b), CodeMailboxUnknown) {
-		t.Fatalf("foreign ack: %d %s", code, b)
+	// Spec §6.5 (0.3.0): acking another mailbox's message is a uniform 204
+	// no-op — indistinguishable from acking a nonexistent id.
+	code, b := f.ack(bob, id)
+	code2, b2 := f.ack(bob, "01J00000000000000000000000")
+	if code != 204 || code2 != 204 || !bytes.Equal(b, b2) {
+		t.Fatalf("foreign ack: %d %q vs %d %q", code, b, code2, b2)
 	}
 	if got := f.collect(alice, ""); len(got.Messages) != 1 {
 		t.Fatal("foreign ack deleted the message")
@@ -314,11 +320,11 @@ func TestQuotaExceeded(t *testing.T) {
 	one := int64(1)
 	qt := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "quota"; c.Quota = &auth.Quota{Msgs: &one} })
 	f.mustDeposit(owner, sender, qt, []byte("1"))
-	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("2")), signer: &sender, token: qt}, 403, CodeQuotaExceeded)
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("2")), signer: &sender, token: qt}, 429, CodeQuotaExceeded)
 	tok := f.mint(owner, sender, nil)
 	f.mustDeposit(owner, sender, tok, []byte("3"))
 	f.mustDeposit(owner, sender, tok, []byte("4"))
-	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("5")), signer: &sender, token: tok}, 403, CodeQuotaExceeded)
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("5")), signer: &sender, token: tok}, 429, CodeQuotaExceeded)
 }
 
 func TestSenderRateLimit(t *testing.T) {
@@ -457,7 +463,7 @@ func TestDenylistValidation(t *testing.T) {
 	f.revoke(owner, "jti", "a")
 	f.revoke(owner, "jti", "a") // idempotent
 	f.revoke(owner, "jti", "b")
-	f.expectCode(req{method: "POST", path: "/v1/mailbox/denylist", body: []byte(`{"revoke":[{"kind":"jti","value":"c"}]}`), signer: &owner}, 403, CodeQuotaExceeded)
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/denylist", body: []byte(`{"revoke":[{"kind":"jti","value":"c"}]}`), signer: &owner}, 429, CodeQuotaExceeded)
 }
 
 func waitFor(t *testing.T, cond func() bool) {
@@ -469,4 +475,35 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// vettid.org runs a ~400-day cap for reconnect tokens and 7-day open
+// tokens/claims; registration advertises the configured values and the
+// denylist keeps entries for the whole configured lifetime.
+func TestLongLifetimePolicy(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		c.MaxTokenLifetime = 400 * 24 * time.Hour
+		c.OpenTokenMaxLifetime = 7 * 24 * time.Hour
+		c.ClaimTTL = 7 * 24 * time.Hour
+	})
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	body := []byte(`{"pubkey":"` + owner.b64 + `"}`)
+	_, b := f.do(req{method: "POST", path: "/v1/register", body: body, signer: &owner})
+	for _, want := range []string{`"max_token_lifetime_seconds":34560000`, `"open_token_max_lifetime_seconds":604800`, `"claim_ttl_seconds":604800`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("limits missing %s: %s", want, b)
+		}
+	}
+	reconnect := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "reconnect"; c.Exp = c.Iat.Add(400 * 24 * time.Hour) })
+	f.mustDeposit(owner, sender, reconnect, []byte("year-long token works"))
+	tooLong := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "too-long"; c.Exp = c.Iat.Add(401 * 24 * time.Hour) })
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("x")), signer: &sender, token: tooLong}, 401, CodeTokenInvalid)
+
+	f.revoke(owner, "jti", "reconnect")
+	// 300 days later the token is still unexpired, so the entry must survive sweeps.
+	f.clk.add(300 * 24 * time.Hour)
+	if _, err := f.st.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("x")), signer: &sender, token: reconnect}, 403, CodeTokenRevoked)
 }

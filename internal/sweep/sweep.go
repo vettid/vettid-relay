@@ -38,7 +38,7 @@ func New(st Store, interval time.Duration, log *slog.Logger, reg *metrics.Regist
 		errs:    reg.Counter("relay_sweep_errors_total", "Sweeper passes that failed."),
 		deleted: reg.CounterVec("relay_sweep_removed_total", "Rows removed or released by the sweeper.", "kind"),
 	}
-	for _, k := range []string{"messages", "leases", "denylist", "blobs", "token_usage", "mailboxes"} {
+	for _, k := range []string{"messages", "leases", "denylist", "blobs", "token_usage", "mailboxes", "consumed_tokens", "claims"} {
 		s.deleted.With(k)
 	}
 	return s
@@ -79,9 +79,12 @@ func (s *Sweeper) Once(ctx context.Context) {
 	s.deleted.With("blobs").Add(st.Blobs)
 	s.deleted.With("token_usage").Add(st.TokenUsage)
 	s.deleted.With("mailboxes").Add(st.Mailboxes)
+	s.deleted.With("consumed_tokens").Add(st.ConsumedTokens)
+	s.deleted.With("claims").Add(st.Claims)
 	if st != (store.SweepStats{}) {
 		s.log.Info("sweep", "messages", st.Messages, "leases", st.Leases, "denylist", st.Denylist,
 			"blobs", st.Blobs, "token_usage", st.TokenUsage, "mailboxes", st.Mailboxes,
+			"consumed_tokens", st.ConsumedTokens, "claims", st.Claims,
 			"dur", time.Since(start))
 	}
 }

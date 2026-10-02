@@ -7,7 +7,7 @@ import (
 )
 
 // schemaVersion is bumped with every migration appended to migrations.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // migrations[i] upgrades the schema from version i to i+1.
 //
@@ -68,6 +68,29 @@ CREATE TABLE blobs (
 );
 CREATE INDEX idx_blobs_mailbox ON blobs(mailbox_id);
 CREATE INDEX idx_blobs_expiry  ON blobs(expires_at);
+`,
+	// v2 (protocol 0.3.0): consumed one-shot open tokens (§5.6), kept until
+	// the token's exp so a second use is refused even after a restart or a
+	// Litestream restore; and single-fetch claims (§6.9).
+	`
+CREATE TABLE consumed_tokens (
+  mailbox_id TEXT NOT NULL REFERENCES mailboxes(mailbox_id) ON DELETE CASCADE,
+  jti        TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY (mailbox_id, jti)
+);
+CREATE INDEX idx_consumed_tokens_expiry ON consumed_tokens(expires_at);
+
+CREATE TABLE claims (
+  claim_id   TEXT PRIMARY KEY,     -- 128-bit CSPRNG id, lowercase base32
+  mailbox_id TEXT NOT NULL REFERENCES mailboxes(mailbox_id) ON DELETE CASCADE, -- creator
+  size       INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  data       BLOB NOT NULL
+);
+CREATE INDEX idx_claims_mailbox ON claims(mailbox_id);
+CREATE INDEX idx_claims_expiry  ON claims(expires_at);
 `,
 }
 

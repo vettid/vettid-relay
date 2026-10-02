@@ -45,6 +45,12 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
+	// One-shot open tokens permit exactly one *message* deposit (§5.6); they
+	// are not accepted for blob uploads (see README interpretation notes).
+	if da.claims.Open() {
+		s.writeError(w, fail(CodeTokenInvalid))
+		return
+	}
 	if e := s.allowSender(da.claims.Sub); e != nil {
 		s.writeError(w, e)
 		return
@@ -74,14 +80,15 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	}
 	var bodyHash [32]byte
 	h.Sum(bodyHash[:0])
-	if e := s.verifySender(r, da, bodyHash); e != nil { // step 7
+	sender, e := s.verifySender(r, da, bodyHash) // step 7
+	if e != nil {
 		s.writeError(w, e)
 		return
 	}
 	size := int64(buf.Len())
 	info, err := s.blobs.PutBlob(r.Context(), store.BlobPut{
 		Mailbox:   mailboxID,
-		SenderSub: da.claims.Sub,
+		SenderSub: sender,
 		Size:      size,
 		TTL:       s.cfg.BlobTTL,
 		Limits:    s.limitsFor(da, true), // step 8: token bytes + mailbox blob cap

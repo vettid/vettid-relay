@@ -35,6 +35,7 @@ fuzz:
 	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzCanonical$$' -fuzztime $(FUZZTIME)
 	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzVerifyRequest$$' -fuzztime $(FUZZTIME)
 	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzParseClaims$$' -fuzztime $(FUZZTIME)
+	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzParseClaimID$$' -fuzztime $(FUZZTIME)
 
 scan:
 	gitleaks git --redact .

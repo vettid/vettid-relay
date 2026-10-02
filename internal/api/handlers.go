@@ -64,12 +64,18 @@ func setLog(w http.ResponseWriter, key string, v any) {
 
 // ---------------------------------------------------------------- register
 
+// limitsBody is the registration limits object (spec §6.1), fields in the
+// spec's order.
 type limitsBody struct {
-	MaxPayloadBytes          int64  `json:"max_payload_bytes"`
-	MessageTTLSeconds        int64  `json:"message_ttl_seconds"`
-	VisibilityTimeoutSeconds int64  `json:"visibility_timeout_seconds"`
-	MaxBlobBytes             *int64 `json:"max_blob_bytes,omitempty"`
-	BlobTTLSeconds           *int64 `json:"blob_ttl_seconds,omitempty"`
+	MaxPayloadBytes             int64  `json:"max_payload_bytes"`
+	MessageTTLSeconds           int64  `json:"message_ttl_seconds"`
+	VisibilityTimeoutSeconds    int64  `json:"visibility_timeout_seconds"`
+	MaxTokenLifetimeSeconds     int64  `json:"max_token_lifetime_seconds"`
+	OpenTokenMaxLifetimeSeconds int64  `json:"open_token_max_lifetime_seconds"`
+	MaxClaimBytes               int64  `json:"max_claim_bytes"`
+	ClaimTTLSeconds             int64  `json:"claim_ttl_seconds"`
+	MaxBlobBytes                *int64 `json:"max_blob_bytes,omitempty"`
+	BlobTTLSeconds              *int64 `json:"blob_ttl_seconds,omitempty"`
 }
 
 type registerResponse struct {
@@ -82,6 +88,11 @@ func (s *Server) limits() limitsBody {
 		MaxPayloadBytes:          s.cfg.MaxPayloadBytes,
 		MessageTTLSeconds:        int64(s.cfg.MessageTTL / time.Second),
 		VisibilityTimeoutSeconds: int64(s.cfg.VisibilityTimeout / time.Second),
+
+		MaxTokenLifetimeSeconds:     int64(s.cfg.MaxTokenLifetime / time.Second),
+		OpenTokenMaxLifetimeSeconds: int64(s.cfg.OpenTokenMaxLifetime / time.Second),
+		MaxClaimBytes:               s.cfg.MaxClaimBytes,
+		ClaimTTLSeconds:             int64(s.cfg.ClaimTTL / time.Second),
 	}
 	if s.cfg.BlobsEnabled {
 		mb, ttl := s.cfg.MaxBlobBytes, int64(s.cfg.BlobTTL/time.Second)
@@ -149,11 +160,12 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	if e := s.allowSender(da.claims.Sub); e != nil {
+	if e := s.allowSender(senderRateKey(da)); e != nil {
 		s.writeError(w, e)
 		return
 	}
-	if e := s.verifySender(r, da, auth.BodyHash(body)); e != nil { // step 7
+	sender, e := s.verifySender(r, da, auth.BodyHash(body)) // step 7
+	if e != nil {
 		s.writeError(w, e)
 		return
 	}
@@ -178,8 +190,11 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Step 8 (quota) is enforced atomically with the insert.
-	msg, err := s.st.Deposit(r.Context(), mailboxID, da.claims.Sub, payload, s.cfg.MessageTTL, s.limitsFor(da, false))
+	msg, err := s.st.Deposit(r.Context(), mailboxID, sender, payload, s.cfg.MessageTTL, s.limitsFor(da, false))
 	switch {
+	case errors.Is(err, store.ErrTokenUsed):
+		s.writeError(w, fail(CodeTokenUsed))
+		return
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))
 		return
@@ -196,8 +211,18 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"msg_id": msg.ID})
 }
 
+// senderRateKey keys the per-sender bucket: the bound sender's key, or the
+// open token's jti (the signer is only known after step 7, and an open token
+// is single-use anyway).
+func senderRateKey(da *depositAuth) string {
+	if da.claims.Open() {
+		return "open:" + da.mailbox.ID + ":" + da.claims.Jti
+	}
+	return da.claims.Sub
+}
+
 func (s *Server) limitsFor(da *depositAuth, blob bool) store.Limits {
-	l := store.Limits{TokenJTI: da.claims.Jti, TokenExpires: da.claims.Exp}
+	l := store.Limits{TokenJTI: da.claims.Jti, TokenExpires: da.claims.Exp, ConsumeJTI: da.claims.Open()}
 	if blob {
 		l.MailboxMaxBytes = s.cfg.MailboxMaxBlobBytes
 	} else {
@@ -214,11 +239,12 @@ func (s *Server) limitsFor(da *depositAuth, blob bool) store.Limits {
 type wireMessage struct {
 	MsgID       string `json:"msg_id"`
 	DepositedAt string `json:"deposited_at"`
+	Sender      string `json:"sender"`  // base64 key that signed the deposit (spec §6.3)
 	Payload     []byte `json:"payload"` // encoding/json: standard padded base64
 }
 
 func toWire(m store.Message) wireMessage {
-	return wireMessage{MsgID: m.ID, DepositedAt: m.DepositedAt.UTC().Format(timeFormat), Payload: m.Payload}
+	return wireMessage{MsgID: m.ID, DepositedAt: m.DepositedAt.UTC().Format(timeFormat), Sender: m.Sender, Payload: m.Payload}
 }
 
 func parseCollectParams(r *http.Request) (wait time.Duration, max int, ok bool) {
@@ -361,27 +387,34 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ack is shared by DELETE and WebSocket ack frames.
+// ack is shared by DELETE and WebSocket ack frames. Spec §6.5 (0.3.0):
+// always success — whether the message existed, was already acked, or
+// belongs to another mailbox (then nothing happens) — so ack cannot be used
+// to probe which message ids exist.
 func (s *Server) ack(ctx context.Context, mailbox, msgID string) *apiError {
 	if len(msgID) != 26 {
-		return nil // cannot exist: idempotent success
+		return nil // cannot exist
 	}
-	res, err := s.st.Ack(ctx, mailbox, msgID)
+	deleted, err := s.st.Ack(ctx, mailbox, msgID)
 	if err != nil {
 		s.log.Error("ack failed", "err", err)
 		return fail(CodeInternal)
 	}
-	switch res {
-	case store.AckForeign:
-		// Spec §6.5: acking another mailbox's message → 404 mailbox_unknown.
-		return fail(CodeMailboxUnknown)
-	case store.AckDeleted:
+	if deleted {
 		s.m.acks.Inc()
 	}
 	return nil
 }
 
 // ---------------------------------------------------------------- denylist
+
+// denylistRetention is how long a denylist entry must live (spec §5.5):
+// every token it could match has iat ≤ now and a lifetime bounded by the
+// configured caps (sender-bound or open), so it expires within the larger
+// cap; a margin covers the freshness window.
+func (s *Server) denylistRetention() time.Duration {
+	return max(s.cfg.MaxTokenLifetime, s.cfg.OpenTokenMaxLifetime) + auth.FreshnessWindow + time.Minute
+}
 
 // POST /v1/mailbox/denylist (spec §5.5)
 func (s *Server) handleDenylist(w http.ResponseWriter, r *http.Request) {
@@ -426,9 +459,7 @@ func (s *Server) handleDenylist(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Retain each entry until any token it could match has expired: tokens
-	// are valid at most MaxTokenLifetime past iat ≤ now (spec §5.5).
-	exp := s.now().Add(s.cfg.MaxTokenLifetime + auth.FreshnessWindow + time.Minute)
+	exp := s.now().Add(s.denylistRetention())
 	switch err := s.st.AddDenylist(r.Context(), mb.ID, entries, exp, s.cfg.MailboxMaxDenylist); {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))

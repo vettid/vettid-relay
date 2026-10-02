@@ -272,3 +272,31 @@ func TestSubSecondTimestamps(t *testing.T) {
 		}
 	}
 }
+
+// Spec §4.1 (0.3.0): the canonical string uses X-VettID-Timestamp verbatim.
+// Spellings that a parse/re-format round trip would change must verify as
+// signed, and re-spelling the same instant must not.
+func TestTimestampUsedVerbatim(t *testing.T) {
+	sender := vecKey(t, vecSenderSeed)
+	now := vecTime(t, vecTimestamp)
+	for _, ts := range []string{"2026-06-10T12:00:00.120Z", "2026-06-10T12:00:00.000Z", "2026-06-10T12:00:00+00:00", "2026-06-10T14:00:00.5+02:00"} {
+		bh := BodyHash([]byte("b"))
+		h := http.Header{}
+		h.Set(HeaderKey, EncodeKey(sender.Public().(ed25519.PublicKey)))
+		h.Set(HeaderTimestamp, ts)
+		h.Set(HeaderSig, b64.EncodeToString(SignRequest(sender, "POST", "/v1/x", ts, bh)))
+		sr, err := ParseHeaders(h)
+		if err != nil {
+			t.Fatalf("%s: %v", ts, err)
+		}
+		if err := sr.Verify("POST", "/v1/x", bh, now); err != nil {
+			t.Fatalf("%s: verbatim timestamp did not verify: %v", ts, err)
+		}
+		// Same instant, different spelling → signature no longer matches.
+		h.Set(HeaderTimestamp, sr.Time.UTC().Format("2006-01-02T15:04:05.000000Z"))
+		sr2, _ := ParseHeaders(h)
+		if err := sr2.Verify("POST", "/v1/x", bh, now); !errors.Is(err, ErrSignatureInvalid) {
+			t.Fatalf("%s: re-spelled timestamp verified", ts)
+		}
+	}
+}

@@ -16,6 +16,9 @@ import (
 	"github.com/vettid/vettid-relay/internal/store"
 )
 
+// ProtocolVersion is the docs/RELAY-PROTOCOL.md version this relay implements.
+const ProtocolVersion = "0.3.0"
+
 // Server is the relay API.
 type Server struct {
 	cfg   config.Config
@@ -35,9 +38,10 @@ type Server struct {
 	bgCancel context.CancelFunc
 	bg       sync.WaitGroup
 
-	replay   *auth.ReplayCache
-	ipLimit  *ratelimit.Limiter // per source IP (IPv4 / IPv6 /64), before any parsing
-	subLimit *ratelimit.Limiter // per sender key, after token parse
+	replay     *auth.ReplayCache
+	ipLimit    *ratelimit.Limiter // per source IP (IPv4 / IPv6 /64), before any parsing
+	subLimit   *ratelimit.Limiter // per sender key, after token parse
+	claimLimit *ratelimit.Limiter // unauthenticated claim GETs, per IPv4 / IPv6 /64
 
 	hub       *hub
 	blobSlots chan struct{} // bounds concurrent blob transfers
@@ -61,6 +65,8 @@ type serverMetrics struct {
 	blobBytes     metrics.Counter
 	blobGets      metrics.Counter
 	blobDeletes   metrics.Counter
+	claimPuts     metrics.Counter
+	claimGets     metrics.Counter
 }
 
 func newServerMetrics(reg *metrics.Registry) *serverMetrics {
@@ -82,6 +88,8 @@ func newServerMetrics(reg *metrics.Registry) *serverMetrics {
 		blobBytes:     reg.Counter("relay_blob_bytes_total", "Blob bytes uploaded."),
 		blobGets:      reg.Counter("relay_blob_gets_total", "Blobs fetched."),
 		blobDeletes:   reg.Counter("relay_blob_deletes_total", "Blob delete requests."),
+		claimPuts:     reg.Counter("relay_claim_puts_total", "Claims created."),
+		claimGets:     reg.Counter("relay_claim_fetches_total", "Claims fetched (and thereby deleted)."),
 	}
 	for _, c := range allCodes {
 		m.errors.With(c) // pre-create every series so rates start at 0
@@ -109,9 +117,10 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 
 		blobSlots: make(chan struct{}, cfg.MaxConcurrentBlobTransfers),
 
-		replay:   auth.NewReplayCache(cfg.ReplayCacheMax),
-		ipLimit:  ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
-		subLimit: ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
+		replay:     auth.NewReplayCache(cfg.ReplayCacheMax),
+		ipLimit:    ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
+		subLimit:   ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
+		claimLimit: ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
 	}
 	s.drainCtx, s.drainCancel = context.WithCancel(context.Background())
 	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
@@ -132,6 +141,7 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 		s.replay.Sweep(now)
 		s.ipLimit.Prune(now)
 		s.subLimit.Prune(now)
+		s.claimLimit.Prune(now)
 	})
 	return s
 }
@@ -145,6 +155,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/mailbox/{msg_id}", s.handleAck)
 	s.mux.HandleFunc("POST /v1/mailbox/denylist", s.handleDenylist)
 	s.mux.HandleFunc("POST /v1/mailbox/rotate", s.handleRotate)
+	s.mux.HandleFunc("PUT /v1/claim", s.handleClaimPut)
+	s.mux.HandleFunc("PUT /v1/claim/ttl/{ttl_seconds}", s.handleClaimPut)
+	s.mux.HandleFunc("GET /v1/claim/{claim_id}", s.handleClaimGet)
+	s.mux.HandleFunc("DELETE /v1/claim/{claim_id}", s.handleClaimDelete)
 	if s.cfg.BlobsEnabled {
 		s.mux.HandleFunc("PUT /v1/blob/{mailbox_id}", s.handleBlobPut)
 		s.mux.HandleFunc("GET /v1/blob/{blob_id}", s.handleBlobGet)
@@ -175,7 +189,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "db_unreachable"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "protocol": ProtocolVersion})
 }
 
 // Drain begins shutdown: parked long-polls return immediately, WebSocket

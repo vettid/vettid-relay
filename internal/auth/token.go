@@ -90,10 +90,17 @@ type Quota struct {
 	Bytes *int64 `json:"bytes,omitempty"`
 }
 
+// Token scopes (spec §5.2, §5.6).
+const (
+	ScopeDeposit     = "deposit"      // sender-bound
+	ScopeDepositOpen = "deposit_open" // one-shot open token, sub = "*"
+	OpenSub          = "*"
+)
+
 // Claims are the deposit-token claims (spec §5.2).
 type Claims struct {
 	Iss   string // issuing mailbox_id
-	Sub   string // canonical base64 sender relay pubkey
+	Sub   string // canonical base64 sender relay pubkey, or "*" for open tokens
 	Aud   string // relay base URL
 	Iat   time.Time
 	Exp   time.Time
@@ -101,8 +108,11 @@ type Claims struct {
 	Scope string
 	Quota *Quota
 
-	SubKey ed25519.PublicKey // decoded Sub
+	SubKey ed25519.PublicKey // decoded Sub (nil for open tokens)
 }
+
+// Open reports whether this is a one-shot open token (spec §5.6).
+func (c Claims) Open() bool { return c.Scope == ScopeDepositOpen }
 
 type wireClaims struct {
 	Iss   *string `json:"iss"`
@@ -142,11 +152,20 @@ func ParseClaims(m []byte) (Claims, error) {
 	if c.Exp, err = time.Parse(time.RFC3339, *w.Exp); err != nil {
 		return Claims{}, ErrTokenInvalid
 	}
-	var ok bool
-	if c.SubKey, ok = DecodeKey(c.Sub); !ok {
+	switch c.Scope {
+	case ScopeDeposit:
+		var ok bool
+		if c.SubKey, ok = DecodeKey(c.Sub); !ok {
+			return Claims{}, ErrTokenInvalid
+		}
+	case ScopeDepositOpen:
+		if c.Sub != OpenSub {
+			return Claims{}, ErrTokenInvalid
+		}
+	default:
 		return Claims{}, ErrTokenInvalid
 	}
-	if c.Scope != "deposit" || c.Jti == "" || len(c.Jti) > MaxJTILen || !ValidMailboxID(c.Iss) {
+	if c.Jti == "" || len(c.Jti) > MaxJTILen || !ValidMailboxID(c.Iss) {
 		return Claims{}, ErrTokenInvalid
 	}
 	if q := c.Quota; q != nil {
@@ -159,15 +178,16 @@ func ParseClaims(m []byte) (Claims, error) {
 
 // TokenPolicy holds the relay-side inputs to claim validation.
 type TokenPolicy struct {
-	Audience    string        // exact-match aud (relay base URL)
-	MaxLifetime time.Duration // exp−iat bound; 0 disables
+	Audience        string        // exact-match aud (relay base URL)
+	MaxLifetime     time.Duration // exp−iat bound for sender-bound tokens; 0 disables
+	OpenMaxLifetime time.Duration // exp−iat bound for open tokens (§5.6); required
 }
 
 // ValidateClaims applies spec §5.3 steps 3–5 for the given mailbox:
 // iss == mailbox (token_invalid), aud == audience (token_invalid),
-// iat ≤ now < exp (token_expired). Additionally, as relay policy that keeps
-// denylists bounded (§5.5), exp−iat must not exceed MaxLifetime
-// (token_invalid).
+// iat ≤ now < exp (token_expired). exp−iat must not exceed the lifetime cap
+// for the token's kind (§5.2 max_token_lifetime_seconds, §5.6
+// open_token_max_lifetime_seconds) → token_invalid.
 func ValidateClaims(c Claims, mailboxID string, p TokenPolicy, now time.Time) error {
 	if c.Iss != mailboxID {
 		return ErrTokenInvalid
@@ -175,7 +195,12 @@ func ValidateClaims(c Claims, mailboxID string, p TokenPolicy, now time.Time) er
 	if c.Aud != p.Audience {
 		return ErrTokenInvalid
 	}
-	if p.MaxLifetime > 0 && c.Exp.Sub(c.Iat) > p.MaxLifetime {
+	if c.Open() {
+		// MUST for open tokens: a zero/unset cap admits nothing.
+		if c.Exp.Sub(c.Iat) > p.OpenMaxLifetime {
+			return ErrTokenInvalid
+		}
+	} else if p.MaxLifetime > 0 && c.Exp.Sub(c.Iat) > p.MaxLifetime {
 		return ErrTokenInvalid
 	}
 	if now.Before(c.Iat) || !now.Before(c.Exp) {
@@ -200,7 +225,7 @@ func MintToken(priv ed25519.PrivateKey, c Claims) (string, error) {
 	iat, exp := c.Iat.UTC().Format(time.RFC3339), c.Exp.UTC().Format(time.RFC3339)
 	scope := c.Scope
 	if scope == "" {
-		scope = "deposit"
+		scope = ScopeDeposit
 	}
 	w := wireClaims{Iss: &c.Iss, Sub: &c.Sub, Aud: &c.Aud, Iat: &iat, Exp: &exp, Jti: &c.Jti, Scope: &scope, Quota: c.Quota}
 	var buf bytes.Buffer

@@ -6,11 +6,19 @@ deposit, and moves them between vaults, apps and agents. The relay holds no
 keys to payload content: a compromised relay can drop or delay messages, but
 can't read or forge them.
 
-- **Protocol:** [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md) (v0.2.0).
-  This repository implements all of it: registration, deposit tokens
-  (PASETO v4.public, sender-bound), deposit, long-poll and WebSocket collect,
-  ack, denylist revocation, key rotation, and the optional blob transfer
-  (§6.8). Every test vector in §9 is reproduced byte-for-byte in the tests.
+- **Protocol:** [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md)
+  (**v0.3.0**, reported by `relay -version` and `/healthz`). This repository
+  implements all of it:
+  - registration
+  - deposit tokens (PASETO v4.public, sender-bound), plus one-shot open
+    tokens for first contact (§5.6)
+  - deposit, and long-poll and WebSocket collect with the depositor's
+    `sender` key
+  - ack, denylist revocation and key rotation
+  - the optional blob transfer (§6.8)
+  - single-fetch claims for bootstrap bundles (§6.9)
+
+  Every test vector in §9 is reproduced byte-for-byte in the tests.
 - **Client guide:** [`docs/CLIENT-NOTES.md`](docs/CLIENT-NOTES.md).
 - **Stack:** Go standard library `net/http`, pure-Go SQLite
   (`modernc.org/sqlite`, WAL), `github.com/coder/websocket`,
@@ -29,10 +37,15 @@ RELAY_BASE_URL=http://localhost:8080 RELAY_DB_PATH=./relay.db ./bin/relay
 `relayctl smoke` registers two throwaway principals, then runs the main flow:
 it mints a token, deposits a message, collects it by long-poll (and reports
 the wake latency), and acks it. It then uploads, fetches and deletes a 1 MiB
-blob, revokes the sender, and checks that the next deposit is rejected. Other
-`relayctl` commands (`keygen`, `register`, `mint`, `deposit`, `collect`,
-`revoke`, `blob-put`, `blob-get`) run each step by hand. Run `relayctl` with
-no arguments for usage.
+blob. Next it runs first contact: it leaves a claim, a stranger fetches it
+exactly once, the stranger deposits once with a one-shot open token, and
+the collect shows the stranger as `sender`. Finally it revokes the sender
+and checks that the next deposit is rejected.
+
+Other `relayctl` commands run each step by hand: `keygen`, `register`,
+`mint`, `mint-open`, `deposit`, `collect`, `revoke`, `blob-put`,
+`blob-get`, `claim-put` and `claim-get`. Run `relayctl` with no arguments
+for usage.
 
 ## Container
 
@@ -79,12 +92,16 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` | `8` | Concurrent blob uploads plus downloads. Each can hold up to `max_blob_bytes` in memory. |
 | `RELAY_MAILBOX_MAX_MESSAGES` | `10000` | Per-mailbox cap on stored messages (`quota_exceeded`). |
 | `RELAY_MAILBOX_MAX_BYTES` | `134217728` | Per-mailbox cap on stored payload bytes. |
-| `RELAY_MAILBOX_MAX_BLOB_BYTES` | `67108864` | Per-mailbox blob storage cap (§8.8). |
+| `RELAY_MAILBOX_MAX_BLOB_BYTES` | `67108864` | Per-mailbox storage cap (§8.8, §6.9). It counts blobs deposited to the mailbox plus claims the mailbox created. |
 | `RELAY_MAILBOX_MAX_DENYLIST` | `10000` | Per-mailbox cap on live denylist entries. |
 | `RELAY_ROTATION_GRACE` | `168h` (7 d) | How long a rotated-away mailbox keeps collecting before deletion (§6.7). |
-| `RELAY_MAX_TOKEN_LIFETIME` | `720h` (30 d) | Relay policy: tokens with `exp − iat` above this are `token_invalid`. This bounds denylist retention (§5.5). |
+| `RELAY_MAX_TOKEN_LIFETIME` | `720h` (30 d) | `max_token_lifetime_seconds` (§5.2). Sender-bound tokens with `exp − iat` above this are `token_invalid`. It also bounds denylist retention (§5.5). Any positive duration is accepted, for example `9600h` (400 d) for long-lived, low-quota reconnect tokens. |
+| `RELAY_OPEN_TOKEN_MAX_LIFETIME` | `600s` | `open_token_max_lifetime_seconds` (§5.6). This is the cap on `exp − iat` for one-shot open tokens. Up to 7 days is recommended for remote invitations. |
+| `RELAY_MAX_CLAIM_BYTES` | `16384` | `max_claim_bytes` (§6.9). This is the maximum claim body. |
+| `RELAY_CLAIM_TTL` | `900s` | `claim_ttl_seconds` (§6.9). It's the longest TTL a creator may request with `PUT /v1/claim/ttl/<seconds>`. Up to 7 days is recommended. A bare `PUT /v1/claim` gets min(900 s, this). |
 | `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `20` / `40` | Per-source-IP token bucket on `/v1/*`, applied before any parsing. The key is the IPv4 address or the IPv6 /64. |
-| `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket keyed by token `sub`, applied to deposits and blob uploads. |
+| `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits and blob uploads. It's keyed by token `sub`, or by `jti` for open tokens. |
+| `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
 | `RELAY_MAX_COLLECTORS_PER_MAILBOX` | `4` | Concurrent long-polls plus WebSockets per mailbox. |
 | `RELAY_REPLAY_CACHE_MAX` | `1000000` | Replay-cache capacity. When it's full, requests are shed with `rate_limited` and no live entries are evicted. |
 | `RELAY_SWEEP_INTERVAL` | `60s` | TTL sweeper period. The first pass is jittered. |
@@ -139,28 +156,33 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | Method and path | Auth | Success |
 |---|---|---|
 | `POST /v1/register` | signed by the key being registered | `201` (new) or `200` (existing): `{mailbox_id, limits}` |
-| `POST /v1/mailbox/{mailbox_id}` | deposit token + signed by token `sub` | `201 {msg_id}` |
-| `GET /v1/mailbox?wait=0..25&max=1..100` | owner | `200 {messages:[{msg_id, deposited_at, payload}]}` (defaults: `wait=0`, `max=32`) |
+| `POST /v1/mailbox/{mailbox_id}` | deposit token + signed by token `sub` (open token: any signer) | `201 {msg_id}` |
+| `GET /v1/mailbox?wait=0..25&max=1..100` | owner | `200 {messages:[{msg_id, deposited_at, sender, payload}]}` (defaults: `wait=0`, `max=32`) |
 | `GET /v1/mailbox/ws` | owner (at upgrade) | WebSocket: server frames are messages, client frames are `{"ack": "<msg_id>"}` |
-| `DELETE /v1/mailbox/{msg_id}` | owner | `204` (idempotent) |
+| `DELETE /v1/mailbox/{msg_id}` | owner | always `204`, including for another mailbox's message (a no-op) |
 | `POST /v1/mailbox/denylist` | owner | `204` |
 | `POST /v1/mailbox/rotate` | owner (current key) | `200 {mailbox_id}` |
 | `PUT /v1/blob/{mailbox_id}` | deposit token + signed by `sub` | `201 {blob_id, expires_at}` |
 | `GET /v1/blob/{blob_id}` | owner of the recipient mailbox | `200 application/octet-stream` |
 | `DELETE /v1/blob/{blob_id}` | owner | `204` (idempotent) |
+| `PUT /v1/claim` | signed by a registered mailbox key | `201 {claim_id, expires_at}` |
+| `GET /v1/claim/{claim_id}` | none (rate-limited) | `200 application/octet-stream`. Single fetch: the claim is deleted. |
+| `DELETE /v1/claim/{claim_id}` | the creating key | `204` (idempotent) |
 | `GET /healthz` | none | `200` when the DB is reachable and not draining, else `503` |
 
-Error bodies are `{"code", "message", "retry_after"?}` (§7.1). HTTP status by
-code:
+Error bodies are `{"code", "message", "retry_after"?}`. HTTP statuses follow
+the spec's §7.1 table exactly, and a test parses the table from the spec to
+keep them in step:
 
 | Status | Codes |
 |---|---|
-| 401 | `token_invalid`, `token_expired`, `signature_invalid`, `timestamp_stale`, `replay_detected` |
-| 403 | `token_revoked`, `quota_exceeded` |
-| 404 | `mailbox_unknown`, `blob_unknown`, `not_found` |
-| 413 | `payload_too_large` |
-| 429 | `rate_limited`, with `Retry-After` |
 | 400 | `bad_request` |
+| 401 | `signature_invalid`, `timestamp_stale`, `replay_detected`, `token_invalid`, `token_expired` |
+| 403 | `token_revoked` |
+| 404 | `mailbox_unknown`, `blob_unknown`, `claim_unknown`, `not_found` |
+| 409 | `token_used` |
+| 413 | `payload_too_large` |
+| 429 | `quota_exceeded`; `rate_limited` (with `Retry-After`) |
 | 500 | `internal` |
 
 ## Security notes (spec §8)
@@ -176,11 +198,24 @@ code:
   all come before any database write. Key comparisons are constant-time.
 - **Fixed error messages.** Messages are fixed per code and never echo
   request content.
-- **No existence oracles.** Deposits to unknown mailboxes get a
-  byte-identical `mailbox_unknown` whatever the token. Owner routes signed
-  by an unregistered key get the same response. Unknown, expired and
-  other-mailbox blobs get an identical `blob_unknown`. The one exception
-  is ack, described in the next section.
+- **No existence oracles.** Every lookup below answers the same way
+  whether or not the target exists:
+  - Deposits to unknown mailboxes get a byte-identical `mailbox_unknown`
+    whatever the token. Owner routes signed by an unregistered key get the
+    same response.
+  - Unknown, expired and other-mailbox blobs get an identical
+    `blob_unknown`.
+  - Unknown, expired, deleted and already-fetched claims get an identical
+    `claim_unknown`.
+  - Ack is always `204`.
+- **One-shot open tokens** (§5.6) are consumed atomically with the
+  deposit. The record is stored in SQLite until the token's `exp`, so a
+  second use is `token_used` even after a restart or a Litestream restore.
+  The signer becomes the message's `sender`.
+- **Claims** (§6.9) have 128-bit ids drawn from `crypto/rand`. The ids are
+  never logged and never appear in metrics: the access log records the
+  route pattern only. A claim is fetched and deleted in one SQL statement,
+  so concurrent fetches can't both succeed.
 - **Blobs.** Blob bytes are never parsed or logged. Storage is capped per
   mailbox, and blob metadata (filename, type) never reaches the relay.
 - **Cryptography.** Relay keys and deposit tokens stay Ed25519 / PASETO
@@ -189,40 +224,36 @@ code:
 
 ## Spec interpretation notes
 
-Where the spec is silent or ambiguous, this implementation chooses as
-follows:
+Version 0.3.0 of the spec settled most of the questions raised against 0.2:
+fractional-second timestamps used verbatim (§4.1), the uniform `204` ack
+(§6.5), `iat` strictness and backdating (§5.2), the size check coming first
+(§5.3), collect defaults (§6.3), the complete code and status table (§7.1),
+and `sub`-revocation semantics (§5.5). Where the spec is still silent, this
+implementation chooses as follows:
 
-- **Sub-second timestamps.** The canonical string doesn't cover the query
-  string, and Ed25519 is deterministic. Two requests with the same method,
-  path, body and timestamp therefore have the same signature, and the
-  replay cache rejects the second. Clients should send RFC 3339 timestamps
-  with fractional seconds (accepted by the relay, and emitted by
-  `internal/client`), especially when they re-issue long-polls back-to-back.
-- **Ack of another mailbox's message** returns `404 mailbox_unknown`, as
-  §6.5 literally specifies. A nonexistent message returns `204`. That
-  difference reveals whether a ULID exists in *some* mailbox. ULIDs carry
-  80 random bits from `crypto/rand`, so the risk is small, but it's flagged
-  for spec review.
 - **Rotation proof** (§6.7) is an Ed25519 signature by the new key over the
   ASCII bytes of the current `mailbox_id`. During the grace period the old
   mailbox keeps accepting deposits and collects, and it's deleted (with
   its tokens' effect) afterwards.
-- **Denylist retention** (§5.5) is the time of revocation plus
-  `RELAY_MAX_TOKEN_LIFETIME` plus the freshness window. To keep this safe,
-  the relay refuses tokens whose `exp − iat` exceeds the max lifetime. A
-  `sub` entry also blocks tokens minted for that sender after the
-  revocation until the entry expires.
-- **`iat` check.** `iat ≤ now < exp` is applied strictly, with no skew
-  allowance, as written. Issuers should backdate `iat` slightly if their
-  clock may run ahead of the relay's.
-- **Non-canonical codes.** `bad_request` (400) covers malformed JSON,
-  base64 or parameters, and `not_found` (404) covers unrouted paths. The
-  spec's code list doesn't cover these cases.
-- **Size limit before mailbox lookup.** An oversized deposit body is
-  rejected with `payload_too_large` before the §5.3 mailbox lookup (§8.5:
-  size limits first).
-- **Collect defaults.** `wait` defaults to 0 (return immediately) and `max`
-  defaults to 32. Values above the caps are clamped.
+- **Denylist retention** (§5.5) is the time of revocation, plus the larger
+  of `RELAY_MAX_TOKEN_LIFETIME` and `RELAY_OPEN_TOKEN_MAX_LIFETIME`, plus
+  the freshness window.
+- **Open tokens and blobs.** One-shot open tokens are refused for
+  `PUT /v1/blob` with `token_invalid`. §5.6 grants "exactly one deposit".
+  §6.8 says blob authorization is "identical to deposit", but letting a
+  bearer token upload a large blob is not needed for first contact, so the
+  relay refuses it.
+- **Open tokens and rate limits.** For open tokens, the per-sender rate
+  bucket is keyed by the token's `jti`, because the signer is known only
+  after §5.3 step 7.
+- **Claim TTL.** The TTL is part of the signed path
+  (`PUT /v1/claim/ttl/<seconds>`, canonical decimal between 1 and
+  `claim_ttl_seconds`). Anything else is `bad_request`; it is not clamped.
+  The unsigned `X-VettID-Claim-TTL` header from an early 0.3 draft is
+  refused with `bad_request`.
+- **Claim limits.** Empty claim bodies are `bad_request`. Claims count
+  toward the creating mailbox's `RELAY_MAILBOX_MAX_BLOB_BYTES`, together
+  with blobs deposited to it.
 - **Blob storage.** Blobs are kept in the SQLite file (a separate table
   behind the `BlobStore` interface) rather than as files on disk, which
   §6.8 says SHOULD be used. This is deliberate: one file is the entire

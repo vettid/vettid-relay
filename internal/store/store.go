@@ -33,6 +33,8 @@ var (
 	ErrNotFound = errors.New("store: not found")
 	// ErrQuota is returned when a token or mailbox quota would be exceeded.
 	ErrQuota = errors.New("store: quota exceeded")
+	// ErrTokenUsed is returned when a one-shot token was already consumed.
+	ErrTokenUsed = errors.New("store: token already used")
 )
 
 // Store is the SQLite-backed relay store.
@@ -282,6 +284,17 @@ func (s *Store) IsDenied(ctx context.Context, mailbox, jti, sub string) (bool, e
 	return err == nil, err
 }
 
+// IsConsumed reports whether a one-shot token's jti has been used.
+func (s *Store) IsConsumed(ctx context.Context, mailbox, jti string) (bool, error) {
+	var one int
+	err := s.r.QueryRowContext(ctx,
+		`SELECT 1 FROM consumed_tokens WHERE mailbox_id=? AND jti=?`, mailbox, jti).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // ---------------------------------------------------------------- messages
 
 // Limits are the quota limits applied atomically with a deposit or blob put.
@@ -295,17 +308,25 @@ type Limits struct {
 	TokenExpires    time.Time
 	TokenQuotaMsgs  *int64
 	TokenQuotaBytes *int64
+
+	// ConsumeJTI marks a one-shot open token: the deposit atomically records
+	// TokenJTI as consumed (until TokenExpires) and fails with ErrTokenUsed
+	// if it already was. Nothing is recorded if the deposit fails.
+	ConsumeJTI bool
 }
 
 // Message is a stored message.
 type Message struct {
 	ID          string
 	Mailbox     string
+	Sender      string // canonical base64 pubkey that signed the deposit (spec §6.3)
 	Payload     []byte
 	DepositedAt time.Time
 }
 
 // Deposit stores a message, enforcing quotas atomically, and returns its ULID.
+// senderSub is the canonical base64 key that signed the deposit; it is
+// returned to the recipient as `sender` and kept for abuse attribution.
 func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload []byte, ttl time.Duration, lim Limits) (Message, error) {
 	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
@@ -315,6 +336,17 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 	now := s.now()
 	size := int64(len(payload))
 
+	if lim.ConsumeJTI {
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO consumed_tokens(mailbox_id, jti, expires_at) VALUES(?,?,?)
+			 ON CONFLICT(mailbox_id, jti) DO NOTHING`, mailbox, lim.TokenJTI, ms(lim.TokenExpires))
+		if err != nil {
+			return Message{}, err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return Message{}, ErrTokenUsed
+		}
+	}
 	if lim.MailboxMaxMsgs > 0 || lim.MailboxMaxBytes > 0 {
 		var count, bytes int64
 		if err := tx.QueryRowContext(ctx,
@@ -330,7 +362,7 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 	if err := chargeToken(ctx, tx, mailbox, lim, 1, size); err != nil {
 		return Message{}, err
 	}
-	m := Message{ID: s.newID(now), Mailbox: mailbox, Payload: payload, DepositedAt: now.UTC()}
+	m := Message{ID: s.newID(now), Mailbox: mailbox, Sender: senderSub, Payload: payload, DepositedAt: now.UTC()}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO messages(msg_id, mailbox_id, size, deposited_at, expires_at, sender_sub, payload)
 		 VALUES(?,?,?,?,?,?,?)`,
@@ -375,7 +407,7 @@ func (s *Store) Lease(ctx context.Context, mailbox string, max int, visibility t
 	defer tx.Rollback()
 	now := ms(s.now())
 	rows, err := tx.QueryContext(ctx,
-		`SELECT msg_id, deposited_at, payload FROM messages
+		`SELECT msg_id, deposited_at, sender_sub, payload FROM messages
 		 WHERE mailbox_id=? AND expires_at>? AND (leased_until IS NULL OR leased_until<=?)
 		 ORDER BY msg_id LIMIT ?`, mailbox, now, now, max)
 	if err != nil {
@@ -385,7 +417,7 @@ func (s *Store) Lease(ctx context.Context, mailbox string, max int, visibility t
 	for rows.Next() {
 		var m Message
 		var dep int64
-		if err := rows.Scan(&m.ID, &dep, &m.Payload); err != nil {
+		if err := rows.Scan(&m.ID, &dep, &m.Sender, &m.Payload); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -425,45 +457,23 @@ func (s *Store) NextLeaseExpiry(ctx context.Context, mailbox string) (time.Time,
 	return fromMS(v.Int64), true, nil
 }
 
-// AckResult is the outcome of an ack.
-type AckResult int
-
-const (
-	AckDeleted AckResult = iota // the mailbox's message was deleted
-	AckAbsent                   // no such message anywhere (idempotent success)
-	AckForeign                  // the message exists but belongs to another mailbox
-)
-
-// Ack deletes msgID if it belongs to mailbox.
-func (s *Store) Ack(ctx context.Context, mailbox, msgID string) (AckResult, error) {
-	tx, err := s.w.BeginTx(ctx, nil)
+// Ack deletes msgID if it belongs to mailbox and reports whether a row was
+// deleted. Another mailbox's message is never touched, and callers must not
+// reveal the difference (spec §6.5).
+func (s *Store) Ack(ctx context.Context, mailbox, msgID string) (bool, error) {
+	res, err := s.w.ExecContext(ctx, `DELETE FROM messages WHERE msg_id=? AND mailbox_id=?`, msgID, mailbox)
 	if err != nil {
-		return 0, err
+		return false, err
 	}
-	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE msg_id=? AND mailbox_id=?`, msgID, mailbox)
-	if err != nil {
-		return 0, err
-	}
-	if n, _ := res.RowsAffected(); n == 1 {
-		return AckDeleted, tx.Commit()
-	}
-	var one int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM messages WHERE msg_id=?`, msgID).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return AckAbsent, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	return AckForeign, nil
+	n, _ := res.RowsAffected()
+	return n == 1, nil
 }
 
 // ------------------------------------------------------------------- sweep
 
 // SweepStats counts what one sweep pass removed.
 type SweepStats struct {
-	Messages, Leases, Denylist, Blobs, TokenUsage, Mailboxes int64
+	Messages, Leases, Denylist, Blobs, TokenUsage, Mailboxes, ConsumedTokens, Claims int64
 }
 
 // Sweep deletes expired messages, blobs, denylist rows, token counters and
@@ -488,6 +498,8 @@ func (s *Store) Sweep(ctx context.Context) (SweepStats, error) {
 		{&st.Denylist, `DELETE FROM denylist WHERE expires_at<=?`},
 		{&st.Blobs, `DELETE FROM blobs WHERE expires_at<=?`},
 		{&st.TokenUsage, `DELETE FROM token_usage WHERE expires_at<=?`},
+		{&st.ConsumedTokens, `DELETE FROM consumed_tokens WHERE expires_at<=?`},
+		{&st.Claims, `DELETE FROM claims WHERE expires_at<=?`},
 	}
 	for _, step := range steps {
 		res, err := tx.ExecContext(ctx, step.sql, now)

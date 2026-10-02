@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/vettid/vettid-relay/internal/auth"
 )
@@ -35,6 +36,14 @@ func TestLogsCarryNoSecretsOrPayloads(t *testing.T) {
 	f.do(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody(payload), signer: &mallory, token: tok})
 	f.do(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody(payload), signer: &sender, token: "v4.public.garbage"})
 	f.revoke(owner, "sub", mallory.b64)
+	claimBody := []byte("CLAIM-BUNDLE-MARKER")
+	claim := f.mustPutClaim(owner, claimBody, "")
+	f.getClaim(claim.ClaimID, nil)
+	f.getClaim(claim.ClaimID, nil)
+	unfetched := f.mustPutClaim(owner, claimBody, "")
+	f.do(req{method: "DELETE", path: "/v1/claim/" + unfetched.ClaimID, signer: &owner})
+	openTok := f.mintOpen(owner, "hygiene-open", time.Minute)
+	f.mustDeposit(owner, mallory, openTok, []byte("x"))
 
 	out := logs.String()
 	if !strings.Contains(out, id) || !strings.Contains(out, `"code":"signature_invalid"`) {
@@ -52,6 +61,10 @@ func TestLogsCarryNoSecretsOrPayloads(t *testing.T) {
 		"sender pubkey":   sender.b64,
 		"mallory pubkey":  mallory.b64,
 		"owner mailbox":   owner.mbx,
+		"claim id":        claim.ClaimID,
+		"claim id 2":      unfetched.ClaimID,
+		"claim body":      string(claimBody),
+		"open token":      openTok,
 		"sig header name": auth.HeaderSig,
 		"a signature":     hr.Header.Get(auth.HeaderSig)[:40],
 	} {

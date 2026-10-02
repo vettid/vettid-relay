@@ -38,6 +38,10 @@ commands:
   register -key FILE                         register the key's mailbox
   mint     -key OWNER -sender PUBKEY_B64 [-ttl 720h] [-jti ID]
                                              mint a deposit token (printed to stdout)
+  mint-open -key OWNER [-ttl 5m] [-jti ID]   mint a one-shot open token (first contact)
+  claim-put -key OWNER (-data TEXT | -file PATH | stdin) [-ttl 15m]
+                                             leave a single-fetch claim; prints claim_id
+  claim-get -id CLAIM_ID [-out PATH]         fetch (and thereby delete) a claim; no key needed
   deposit  -key SENDER -to MAILBOX -token TOKEN (-data TEXT | -file PATH | stdin)
   collect  -key OWNER [-wait 25] [-max 32] [-ack] [-follow]
   revoke   -key OWNER (-jti ID | -sub PUBKEY_B64)
@@ -153,6 +157,55 @@ func dispatch(ctx context.Context, url, cmd string, args []string) error {
 		}
 		fmt.Println(tok)
 		return nil
+	case "mint-open":
+		c, err := load()
+		if err != nil {
+			return err
+		}
+		ttl := *ttl
+		if !flagSet(fs, "ttl") {
+			ttl = 5 * time.Minute
+		}
+		tok, err := c.MintOpenToken(url, ttl, *jti)
+		if err != nil {
+			return err
+		}
+		fmt.Println(tok)
+		return nil
+	case "claim-put":
+		c, err := load()
+		if err != nil {
+			return err
+		}
+		data, err := readPayload(*data, *file)
+		if err != nil {
+			return err
+		}
+		var claimTTL time.Duration
+		if flagSet(fs, "ttl") {
+			claimTTL = *ttl
+		}
+		id, exp, err := c.PutClaim(ctx, data, claimTTL)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s expires %s\n", id, exp.Format(time.RFC3339))
+		return nil
+	case "claim-get":
+		if *id == "" {
+			return errors.New("-id is required")
+		}
+		// Unauthenticated: any key will do for the client struct.
+		_, k, _ := ed25519.GenerateKey(rand.Reader)
+		b, err := client.New(url, k).GetClaim(ctx, *id)
+		if err != nil {
+			return err
+		}
+		if *out != "" {
+			return os.WriteFile(*out, b, 0o600)
+		}
+		_, err = os.Stdout.Write(b)
+		return err
 	case "deposit":
 		c, err := load()
 		if err != nil {
@@ -245,6 +298,16 @@ func dispatch(ctx context.Context, url, cmd string, args []string) error {
 		flag.Usage()
 		return fmt.Errorf("unknown command %q", cmd)
 	}
+}
+
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 func readKey(path string) (ed25519.PrivateKey, error) {
@@ -345,6 +408,55 @@ func smoke(ctx context.Context, url string) error {
 		if err := step("blob delete", owner.DeleteBlob(ctx, id)); err != nil {
 			return err
 		}
+	}
+	// First contact: claim + one-shot open token for a key the owner has
+	// never seen.
+	stranger := client.New(url, newKey())
+	bundle := []byte("relayctl smoke bundle")
+	claimID, _, err := owner.PutClaim(ctx, bundle, 0)
+	if err := step("claim put", err); err != nil {
+		return err
+	}
+	fetched, err := stranger.GetClaim(ctx, claimID)
+	if err == nil && !bytes.Equal(fetched, bundle) {
+		err = errors.New("claim content mismatch")
+	}
+	if err := step("claim get (unauthenticated)", err); err != nil {
+		return err
+	}
+	if _, err = stranger.GetClaim(ctx, claimID); client.IsCode(err, "claim_unknown") {
+		err = nil
+	} else if err == nil {
+		err = errors.New("claim fetched twice")
+	}
+	if err := step("claim is single-fetch", err); err != nil {
+		return err
+	}
+	openTok, err := owner.MintOpenToken(url, 2*time.Minute, "")
+	if err := step("mint open token", err); err != nil {
+		return err
+	}
+	firstID, err := stranger.Deposit(ctx, reg.MailboxID, openTok, []byte("first contact"))
+	if err := step("open-token deposit", err); err != nil {
+		return err
+	}
+	if _, err = stranger.Deposit(ctx, reg.MailboxID, openTok, []byte("again")); client.IsCode(err, "token_used") {
+		err = nil
+	} else if err == nil {
+		err = errors.New("open token accepted twice")
+	}
+	if err := step("open token is one-shot", err); err != nil {
+		return err
+	}
+	msgs, err := owner.Collect(ctx, 5*time.Second, 10)
+	if err == nil && (len(msgs) != 1 || msgs[0].MsgID != firstID || msgs[0].Sender != stranger.PublicKeyB64()) {
+		err = fmt.Errorf("unexpected collect result (%d messages)", len(msgs))
+	}
+	if err := step("collect shows the stranger as sender", err); err != nil {
+		return err
+	}
+	if err := step("ack", owner.Ack(ctx, firstID)); err != nil {
+		return err
 	}
 	if err := step("revoke sender", owner.Revoke(ctx, client.Revocation{Kind: "sub", Value: sender.PublicKeyB64()})); err != nil {
 		return err

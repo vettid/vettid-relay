@@ -124,13 +124,13 @@ func TestBlobLimitsAndAuth(t *testing.T) {
 
 	// Mailbox blob storage cap: 1000 stored; +1000 ok; +1000 over 2500.
 	f.mustPutBlob(owner, sender, tok, make([]byte, 1000))
-	f.expectCode(req{method: "PUT", path: path, body: make([]byte, 1000), signer: &sender, token: tok}, 403, CodeQuotaExceeded)
+	f.expectCode(req{method: "PUT", path: path, body: make([]byte, 1000), signer: &sender, token: tok}, 429, CodeQuotaExceeded)
 
 	// Token byte quota counts blob bytes.
 	q := int64(600)
 	qt := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "bytes-quota"; c.Quota = &auth.Quota{Bytes: &q} })
 	f.mustPutBlob(owner, sender, qt, make([]byte, 400))
-	f.expectCode(req{method: "PUT", path: path, body: make([]byte, 300), signer: &sender, token: qt}, 403, CodeQuotaExceeded)
+	f.expectCode(req{method: "PUT", path: path, body: make([]byte, 300), signer: &sender, token: qt}, 429, CodeQuotaExceeded)
 }
 
 func TestBlobTTL(t *testing.T) {
