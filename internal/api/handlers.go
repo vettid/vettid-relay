@@ -160,11 +160,12 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	if e := s.allowSender(da.claims.Sub); e != nil {
+	if e := s.allowSender(senderRateKey(da)); e != nil {
 		s.writeError(w, e)
 		return
 	}
-	if e := s.verifySender(r, da, auth.BodyHash(body)); e != nil { // step 7
+	sender, e := s.verifySender(r, da, auth.BodyHash(body)) // step 7
+	if e != nil {
 		s.writeError(w, e)
 		return
 	}
@@ -189,8 +190,11 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Step 8 (quota) is enforced atomically with the insert.
-	msg, err := s.st.Deposit(r.Context(), mailboxID, da.claims.Sub, payload, s.cfg.MessageTTL, s.limitsFor(da, false))
+	msg, err := s.st.Deposit(r.Context(), mailboxID, sender, payload, s.cfg.MessageTTL, s.limitsFor(da, false))
 	switch {
+	case errors.Is(err, store.ErrTokenUsed):
+		s.writeError(w, fail(CodeTokenUsed))
+		return
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))
 		return
@@ -207,8 +211,18 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"msg_id": msg.ID})
 }
 
+// senderRateKey keys the per-sender bucket: the bound sender's key, or the
+// open token's jti (the signer is only known after step 7, and an open token
+// is single-use anyway).
+func senderRateKey(da *depositAuth) string {
+	if da.claims.Open() {
+		return "open:" + da.mailbox.ID + ":" + da.claims.Jti
+	}
+	return da.claims.Sub
+}
+
 func (s *Server) limitsFor(da *depositAuth, blob bool) store.Limits {
-	l := store.Limits{TokenJTI: da.claims.Jti, TokenExpires: da.claims.Exp}
+	l := store.Limits{TokenJTI: da.claims.Jti, TokenExpires: da.claims.Exp, ConsumeJTI: da.claims.Open()}
 	if blob {
 		l.MailboxMaxBytes = s.cfg.MailboxMaxBlobBytes
 	} else {

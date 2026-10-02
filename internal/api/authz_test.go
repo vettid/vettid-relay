@@ -46,11 +46,11 @@ func TestAuthorizeDepositOrder(t *testing.T) {
 	if e != nil {
 		t.Fatalf("steps 1-6: %v", e)
 	}
-	if e := f.s.verifySender(r, da, auth.BodyHash(body)); e != nil {
+	if got, e := f.s.verifySender(r, da, auth.BodyHash(body)); e != nil || got != sender.b64 {
 		t.Fatalf("step 7: %v", e)
 	}
 	// Same request again → replay.
-	if e := f.s.verifySender(r, da, auth.BodyHash(body)); code(e) != CodeReplayDetected {
+	if _, e := f.s.verifySender(r, da, auth.BodyHash(body)); code(e) != CodeReplayDetected {
 		t.Fatalf("replay: %v", code(e))
 	}
 
@@ -97,7 +97,7 @@ func TestAuthorizeDepositOrder(t *testing.T) {
 	if e != nil {
 		t.Fatal(code(e))
 	}
-	if e := f.s.verifySender(r, da, auth.BodyHash(body)); code(e) != CodeSignatureInvalid {
+	if _, e := f.s.verifySender(r, da, auth.BodyHash(body)); code(e) != CodeSignatureInvalid {
 		t.Fatalf("sender binding: %v", code(e))
 	}
 }

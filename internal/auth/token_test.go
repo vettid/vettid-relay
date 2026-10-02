@@ -180,6 +180,7 @@ func FuzzParseClaims(f *testing.F) {
 	f.Add([]byte(vecClaims))
 	f.Add([]byte(`{"quota":{"msgs":1}}`))
 	f.Add([]byte(`{"iss":"a","iss":"b"}`))
+	f.Add([]byte(strings.Replace(strings.Replace(vecClaims, vecSenderPub, "*", 1), `"deposit"`, `"deposit_open"`, 1)))
 	f.Fuzz(func(t *testing.T, m []byte) {
 		c, err := ParseClaims(m)
 		if err != nil {
@@ -188,7 +189,8 @@ func FuzzParseClaims(f *testing.F) {
 			}
 			return
 		}
-		if c.Scope != "deposit" || len(c.SubKey) != ed25519.PublicKeySize || !ValidMailboxID(c.Iss) || c.Jti == "" {
+		okSub := (c.Scope == ScopeDeposit && len(c.SubKey) == ed25519.PublicKeySize) || (c.Scope == ScopeDepositOpen && c.Sub == OpenSub && c.SubKey == nil)
+		if !okSub || !ValidMailboxID(c.Iss) || c.Jti == "" {
 			t.Fatalf("invalid claims accepted: %+v", c)
 		}
 	})
@@ -209,4 +211,58 @@ func TestTokenRejectsEmbeddedNewlines(t *testing.T) {
 			t.Errorf("DecodeStd accepted %q", s)
 		}
 	}
+}
+
+func TestOpenTokenClaims(t *testing.T) {
+	recipient := vecKey(t, vecRecipientSeed)
+	pub := recipient.Public().(ed25519.PublicKey)
+	now := vecTime(t, vecTimestamp)
+	pol := TokenPolicy{Audience: vecAud, MaxLifetime: 30 * 24 * time.Hour, OpenMaxLifetime: 600 * time.Second}
+	open := Claims{Iss: vecRecipientMailbox, Sub: OpenSub, Aud: vecAud, Iat: now.Add(-time.Second),
+		Exp: now.Add(599 * time.Second), Jti: "first-contact", Scope: ScopeDepositOpen}
+	tok, err := MintToken(recipient, open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(mustVerify(t, tok, pub)), `"sub":"*"`) || !strings.Contains(string(mustVerify(t, tok, pub)), `"scope":"deposit_open"`) {
+		t.Fatal("open token claims not encoded as expected")
+	}
+	c, err := ParseToken(tok, pub)
+	if err != nil || !c.Open() || c.SubKey != nil {
+		t.Fatalf("parse open: %+v %v", c, err)
+	}
+	if err := ValidateClaims(c, vecRecipientMailbox, pol, now); err != nil {
+		t.Fatalf("valid open token: %v", err)
+	}
+	// Lifetime above the open cap (but far below the bound-token cap).
+	long := open
+	long.Exp = long.Iat.Add(601 * time.Second)
+	tl, _ := MintToken(recipient, long)
+	if c, err := ParseToken(tl, pub); err != nil || !errors.Is(ValidateClaims(c, vecRecipientMailbox, pol, now), ErrTokenInvalid) {
+		t.Fatal("open token above open_token_max_lifetime accepted")
+	}
+	// An unset open cap admits no open token at all.
+	if !errors.Is(ValidateClaims(c, vecRecipientMailbox, TokenPolicy{Audience: vecAud}, now), ErrTokenInvalid) {
+		t.Fatal("open token accepted without an open cap")
+	}
+	// Scope and sub must agree.
+	for _, m := range []Claims{
+		{Iss: vecRecipientMailbox, Sub: vecSenderPub, Aud: vecAud, Iat: now, Exp: now.Add(time.Minute), Jti: "x", Scope: ScopeDepositOpen},
+		{Iss: vecRecipientMailbox, Sub: OpenSub, Aud: vecAud, Iat: now, Exp: now.Add(time.Minute), Jti: "x", Scope: ScopeDeposit},
+		{Iss: vecRecipientMailbox, Sub: "", Aud: vecAud, Iat: now, Exp: now.Add(time.Minute), Jti: "x", Scope: ScopeDepositOpen},
+	} {
+		bad, _ := MintToken(recipient, m)
+		if _, err := ParseToken(bad, pub); !errors.Is(err, ErrTokenInvalid) {
+			t.Errorf("scope %q with sub %q accepted", m.Scope, m.Sub)
+		}
+	}
+}
+
+func mustVerify(t *testing.T, tok string, pub ed25519.PublicKey) []byte {
+	t.Helper()
+	m, err := VerifyToken(tok, pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
 }

@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"os"
@@ -352,5 +353,113 @@ func TestConcurrentDepositsKeepOrderAndQuota(t *testing.T) {
 		if got[i].ID <= got[i-1].ID {
 			t.Fatal("lease order is not ULID order")
 		}
+	}
+}
+
+func TestConsumeOpenToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.db")
+	c := &clock{t: time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)}
+	s, err := Open(ctx, path, WithClock(c.now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "a", 1)
+	exp := c.now().Add(10 * time.Minute)
+	open := Limits{TokenJTI: "otk", TokenExpires: exp, ConsumeJTI: true}
+
+	// A failed deposit (quota) does not consume the token.
+	q := open
+	q.MailboxMaxMsgs = -1 // unlimited
+	q.MailboxMaxBytes = 1
+	if _, err := s.Deposit(ctx, "a", "signer", []byte("too big"), time.Hour, q); !errors.Is(err, ErrQuota) {
+		t.Fatalf("quota: %v", err)
+	}
+	if used, _ := s.IsConsumed(ctx, "a", "otk"); used {
+		t.Fatal("failed deposit consumed the token")
+	}
+	if _, err := s.Deposit(ctx, "a", "signer", []byte("hello"), time.Hour, open); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Deposit(ctx, "a", "other", []byte("again"), time.Hour, open); !errors.Is(err, ErrTokenUsed) {
+		t.Fatalf("second use: %v", err)
+	}
+	// Same jti in another mailbox is independent.
+	mustRegister(t, s, "b", 2)
+	if _, err := s.Deposit(ctx, "b", "signer", []byte("x"), time.Hour, open); err != nil {
+		t.Fatal(err)
+	}
+
+	// Survives a restart (persisted in the database file).
+	s.Close()
+	s, err = Open(ctx, path, WithClock(c.now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if used, err := s.IsConsumed(ctx, "a", "otk"); err != nil || !used {
+		t.Fatalf("consumption lost across restart: %v %v", used, err)
+	}
+	if _, err := s.Deposit(ctx, "a", "signer", []byte("after restart"), time.Hour, open); !errors.Is(err, ErrTokenUsed) {
+		t.Fatalf("after restart: %v", err)
+	}
+	// Retained until exp, then swept.
+	c.add(10 * time.Minute)
+	if st, _ := s.Sweep(ctx); st.ConsumedTokens != 2 {
+		t.Fatalf("sweep: %+v", st)
+	}
+}
+
+func TestConcurrentOpenTokenSingleUse(t *testing.T) {
+	s, c := open(t)
+	mustRegister(t, s, "a", 1)
+	lim := Limits{TokenJTI: "race", TokenExpires: c.now().Add(time.Minute), ConsumeJTI: true}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok := 0
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Deposit(ctx, "a", "s", []byte("x"), time.Hour, lim); err == nil {
+				mu.Lock()
+				ok++
+				mu.Unlock()
+			} else if !errors.Is(err, ErrTokenUsed) {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if ok != 1 {
+		t.Fatalf("open token used %d times", ok)
+	}
+}
+
+// A database created by a 0.2 relay (schema v1) upgrades in place.
+func TestMigrateFromV1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.db")
+	db, err := sql.Open("sqlite", dsn(path, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(migrations[0] + `; PRAGMA user_version=1; INSERT INTO mailboxes(mailbox_id,pubkey,created_at) VALUES('old',x'00',0)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var v int
+	s.r.QueryRow("PRAGMA user_version").Scan(&v)
+	if v != schemaVersion {
+		t.Fatalf("user_version %d", v)
+	}
+	if _, err := s.Mailbox(ctx, "old"); err != nil {
+		t.Fatal("v1 data lost")
+	}
+	if _, err := s.IsConsumed(ctx, "old", "x"); err != nil {
+		t.Fatalf("v2 table missing: %v", err)
 	}
 }

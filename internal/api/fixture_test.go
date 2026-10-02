@@ -32,14 +32,16 @@ func (c *testClock) now() time.Time      { c.mu.Lock(); defer c.mu.Unlock(); ret
 func (c *testClock) add(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.mu.Unlock() }
 
 type fixture struct {
-	seq atomic.Int64 // per-request signature timestamp offset (µs)
-	t   *testing.T
-	cfg config.Config
-	clk *testClock
-	st  *store.Store
-	s   *Server
-	ts  *httptest.Server
-	reg *metrics.Registry
+	seq    atomic.Int64 // per-request signature timestamp offset (µs)
+	logw   io.Writer
+	dbPath string
+	t      *testing.T
+	cfg    config.Config
+	clk    *testClock
+	st     *store.Store
+	s      *Server
+	ts     *httptest.Server
+	reg    *metrics.Registry
 }
 
 // newFixture starts a relay on an httptest server. Server and store share a
@@ -57,27 +59,50 @@ func newFixtureLog(t *testing.T, mut func(*config.Config), logw io.Writer) *fixt
 	cfg.BaseURL = testAud
 	cfg.RateIPPerSec, cfg.RateIPBurst = 1000, 1000
 	cfg.RateSenderPerSec, cfg.RateSenderBurst = 1000, 1000
+	cfg.RateClaimPerSec, cfg.RateClaimBurst = 1000, 1000
 	if mut != nil {
 		mut(&cfg)
 	}
 	clk := &testClock{t: time.Now().UTC().Truncate(time.Second)}
-	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "relay.db"), store.WithClock(clk.now))
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg := metrics.New()
-	s := New(cfg, st, slog.New(slog.NewJSONHandler(logw, &slog.HandlerOptions{Level: slog.LevelDebug})), reg, WithClock(clk.now))
-	ts := httptest.NewServer(s.Handler())
-	f := &fixture{t: t, cfg: cfg, clk: clk, st: st, s: s, ts: ts, reg: reg}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		s.Drain(ctx)
-		ts.Close()
-		s.Close()
-		st.Close()
-	})
+	f := &fixture{t: t, cfg: cfg, clk: clk, logw: logw, dbPath: filepath.Join(t.TempDir(), "relay.db")}
+	f.start()
+	t.Cleanup(f.stop)
 	return f
+}
+
+// start opens the store and serves a fresh relay instance on f.dbPath.
+func (f *fixture) start() {
+	f.t.Helper()
+	st, err := store.Open(context.Background(), f.dbPath, store.WithClock(f.clk.now))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.st = st
+	f.reg = metrics.New()
+	f.s = New(f.cfg, st, slog.New(slog.NewJSONHandler(f.logw, &slog.HandlerOptions{Level: slog.LevelDebug})), f.reg, WithClock(f.clk.now))
+	f.ts = httptest.NewServer(f.s.Handler())
+}
+
+// stop drains and shuts the relay down and closes the store.
+func (f *fixture) stop() {
+	if f.s == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	f.s.Drain(ctx)
+	f.ts.Close()
+	f.s.Close()
+	f.st.Close()
+	f.s = nil
+}
+
+// restart simulates a process restart on the same database file (in-memory
+// state such as the replay cache and rate limiters is lost).
+func (f *fixture) restart() {
+	f.t.Helper()
+	f.stop()
+	f.start()
 }
 
 type principal struct {
@@ -172,6 +197,18 @@ func (f *fixture) register(p principal) {
 	if code != http.StatusCreated && code != http.StatusOK {
 		f.t.Fatalf("register: %d %s", code, b)
 	}
+}
+
+// mintOpen issues a one-shot open token (spec §5.6) for owner's mailbox.
+func (f *fixture) mintOpen(owner principal, jti string, lifetime time.Duration) string {
+	f.t.Helper()
+	now := f.clk.now()
+	tok, err := auth.MintToken(owner.priv, auth.Claims{Iss: owner.mbx, Sub: auth.OpenSub, Aud: testAud,
+		Iat: now.Add(-time.Second), Exp: now.Add(-time.Second + lifetime), Jti: jti, Scope: auth.ScopeDepositOpen})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return tok
 }
 
 // mint issues a deposit token from owner to sender.

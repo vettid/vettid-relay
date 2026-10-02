@@ -73,24 +73,42 @@ func (s *Server) authorizeDepositToken(ctx context.Context, r *http.Request, mai
 	if denied {
 		return nil, fail(CodeTokenRevoked)
 	}
+	// 6b. One-shot open tokens (§5.6): not already consumed. (Consumption is
+	// recorded atomically with the deposit, which re-checks under the write
+	// lock; this early check just avoids work for an obviously used token.)
+	if claims.Open() {
+		used, err := s.st.IsConsumed(ctx, mailboxID, claims.Jti)
+		if err != nil {
+			s.log.Error("consumed-token lookup failed", "err", err)
+			return nil, fail(CodeInternal)
+		}
+		if used {
+			return nil, fail(CodeTokenUsed)
+		}
+	}
 	return &depositAuth{mailbox: mb, claims: claims}, nil
 }
 
 func (s *Server) tokenPolicy() auth.TokenPolicy {
-	return auth.TokenPolicy{Audience: s.cfg.BaseURL, MaxLifetime: s.cfg.MaxTokenLifetime}
+	return auth.TokenPolicy{Audience: s.cfg.BaseURL, MaxLifetime: s.cfg.MaxTokenLifetime, OpenMaxLifetime: s.cfg.OpenTokenMaxLifetime}
 }
 
 // verifySender is spec §5.3 step 7: the request signature verifies and
-// X-VettID-Key equals the token's sub (sender binding).
-func (s *Server) verifySender(r *http.Request, da *depositAuth, bodyHash [32]byte) *apiError {
+// X-VettID-Key equals the token's sub (sender binding). For one-shot open
+// tokens (§5.6) the signature alone suffices and the signing key becomes the
+// deposit's sender. It returns the canonical base64 sender key.
+func (s *Server) verifySender(r *http.Request, da *depositAuth, bodyHash [32]byte) (string, *apiError) {
 	sr, e := s.verifySignature(r, bodyHash)
 	if e != nil {
-		return e
+		return "", e
 	}
-	if subtle.ConstantTimeCompare(sr.Key, da.claims.SubKey) != 1 {
-		return fail(CodeSignatureInvalid)
+	sender := da.claims.Sub
+	if da.claims.Open() {
+		sender = auth.EncodeKey(sr.Key)
+	} else if subtle.ConstantTimeCompare(sr.Key, da.claims.SubKey) != 1 {
+		return "", fail(CodeSignatureInvalid)
 	}
-	return s.checkReplay(sr)
+	return sender, s.checkReplay(sr)
 }
 
 // verifySignature parses and verifies the §4.1 headers (freshness + signature).
