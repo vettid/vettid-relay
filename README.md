@@ -7,7 +7,7 @@ keys to payload content: a compromised relay can drop or delay messages, but
 can't read or forge them.
 
 - **Protocol:** [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md)
-  (**v0.3.0**, reported by `relay -version` and `/healthz`). This repository
+  (**v0.4.0**, reported by `relay -version` and `/healthz`). This repository
   implements all of it:
   - registration
   - deposit tokens (PASETO v4.public, sender-bound), plus one-shot open

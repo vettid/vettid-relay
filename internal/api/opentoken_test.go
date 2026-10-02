@@ -34,7 +34,8 @@ func TestOpenTokenSingleUse(t *testing.T) {
 	// The owner learns the stranger's key as `sender` and can answer with a
 	// normal sender-bound token.
 	got := f.collect(owner, "")
-	if len(got.Messages) != 1 || got.Messages[0].MsgID != id || got.Messages[0].Sender != stranger.b64 {
+	if len(got.Messages) != 1 || got.Messages[0].MsgID != id || got.Messages[0].Sender != stranger.b64 ||
+		got.Messages[0].JTI != "otk-1" {
 		t.Fatalf("collect: %+v", got)
 	}
 	bound := f.mint(owner, stranger, func(c *auth.Claims) { c.Sub = got.Messages[0].Sender; c.Jti = "bound" })
@@ -125,7 +126,24 @@ func TestOpenTokenSenderOverWebSocket(t *testing.T) {
 	}
 	defer c.Close(websocket.StatusNormalClosure, "")
 	f.mustDeposit(owner, stranger, f.mintOpen(owner, "ws", time.Minute), []byte("hi"))
-	if m := readFrame(t, c, 2*time.Second); m.Sender != stranger.b64 {
-		t.Fatalf("ws sender %q", m.Sender)
+	if m := readFrame(t, c, 2*time.Second); m.Sender != stranger.b64 || m.JTI != "ws" {
+		t.Fatalf("ws sender %q jti %q", m.Sender, m.JTI)
+	}
+}
+
+// Spec §6.3 (0.4.0): collect reports which token each deposit used, so an
+// owner can tell a standing token from a reconnect token of the same sender.
+func TestCollectReportsTokenJTI(t *testing.T) {
+	f := newFixture(t, nil)
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	standing := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "standing" })
+	reconnect := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "reconnect" })
+	f.mustDeposit(owner, sender, standing, []byte("a"))
+	f.mustDeposit(owner, sender, reconnect, []byte("b"))
+	got := f.collect(owner, "")
+	if len(got.Messages) != 2 || got.Messages[0].JTI != "standing" || got.Messages[1].JTI != "reconnect" ||
+		got.Messages[0].Sender != sender.b64 || got.Messages[1].Sender != sender.b64 {
+		t.Fatalf("collect: %+v", got)
 	}
 }

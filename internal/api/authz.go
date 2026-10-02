@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"strings"
 
-	auth "github.com/vettid/vettid-relay/relayauth"
 	"github.com/vettid/vettid-relay/internal/store"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 // depositAuth is the result of spec §5.3 steps 1–6.

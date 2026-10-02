@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	auth "github.com/vettid/vettid-relay/relayauth"
 	"github.com/vettid/vettid-relay/internal/config"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 type claimResp struct {

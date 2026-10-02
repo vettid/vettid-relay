@@ -6,9 +6,9 @@ import (
 	"strconv"
 	"time"
 
-	auth "github.com/vettid/vettid-relay/relayauth"
 	"github.com/vettid/vettid-relay/internal/ratelimit"
 	"github.com/vettid/vettid-relay/internal/store"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 // Claims (spec §6.9): single-fetch bootstrap bundles for first contact.

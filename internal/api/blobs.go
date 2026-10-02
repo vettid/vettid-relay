@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"strconv"
 
-	auth "github.com/vettid/vettid-relay/relayauth"
 	"github.com/vettid/vettid-relay/internal/store"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 // Blob transfer (spec §6.8). Blob bodies are opaque ciphertext: never parsed,

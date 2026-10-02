@@ -9,15 +9,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	auth "github.com/vettid/vettid-relay/relayauth"
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/ratelimit"
 	"github.com/vettid/vettid-relay/internal/store"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 // ProtocolVersion is the docs/RELAY-PROTOCOL.md version this relay implements.
-const ProtocolVersion = "0.3.0"
+const ProtocolVersion = "0.4.0"
 
 // Server is the relay API.
 type Server struct {

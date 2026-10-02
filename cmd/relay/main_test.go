@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	client "github.com/vettid/vettid-relay/relayclient"
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/store"
+	client "github.com/vettid/vettid-relay/relayclient"
 )
 
 func freeAddr(t *testing.T) string {
