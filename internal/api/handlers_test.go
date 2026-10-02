@@ -82,7 +82,9 @@ func TestRegister(t *testing.T) {
 	if code != http.StatusCreated {
 		t.Fatalf("%d %s", code, b)
 	}
-	want := `{"mailbox_id":"` + p.mbx + `","limits":{"max_payload_bytes":262144,"message_ttl_seconds":1209600,"visibility_timeout_seconds":60,"max_blob_bytes":8388608,"blob_ttl_seconds":604800}}` + "\n"
+	want := `{"mailbox_id":"` + p.mbx + `","limits":{"max_payload_bytes":262144,"message_ttl_seconds":1209600,"visibility_timeout_seconds":60,` +
+		`"max_token_lifetime_seconds":2592000,"open_token_max_lifetime_seconds":600,"max_claim_bytes":16384,"claim_ttl_seconds":900,` +
+		`"max_blob_bytes":8388608,"blob_ttl_seconds":604800}}` + "\n"
 	if string(b) != want {
 		t.Fatalf("register body:\n got %s\nwant %s", b, want)
 	}
@@ -473,4 +475,35 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// vettid.org runs a ~400-day cap for reconnect tokens and 7-day open
+// tokens/claims; registration advertises the configured values and the
+// denylist keeps entries for the whole configured lifetime.
+func TestLongLifetimePolicy(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		c.MaxTokenLifetime = 400 * 24 * time.Hour
+		c.OpenTokenMaxLifetime = 7 * 24 * time.Hour
+		c.ClaimTTL = 7 * 24 * time.Hour
+	})
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	body := []byte(`{"pubkey":"` + owner.b64 + `"}`)
+	_, b := f.do(req{method: "POST", path: "/v1/register", body: body, signer: &owner})
+	for _, want := range []string{`"max_token_lifetime_seconds":34560000`, `"open_token_max_lifetime_seconds":604800`, `"claim_ttl_seconds":604800`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("limits missing %s: %s", want, b)
+		}
+	}
+	reconnect := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "reconnect"; c.Exp = c.Iat.Add(400 * 24 * time.Hour) })
+	f.mustDeposit(owner, sender, reconnect, []byte("year-long token works"))
+	tooLong := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "too-long"; c.Exp = c.Iat.Add(401 * 24 * time.Hour) })
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("x")), signer: &sender, token: tooLong}, 401, CodeTokenInvalid)
+
+	f.revoke(owner, "jti", "reconnect")
+	// 300 days later the token is still unexpired, so the entry must survive sweeps.
+	f.clk.add(300 * 24 * time.Hour)
+	if _, err := f.st.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("x")), signer: &sender, token: reconnect}, 403, CodeTokenRevoked)
 }

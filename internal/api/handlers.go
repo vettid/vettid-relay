@@ -64,12 +64,18 @@ func setLog(w http.ResponseWriter, key string, v any) {
 
 // ---------------------------------------------------------------- register
 
+// limitsBody is the registration limits object (spec §6.1), fields in the
+// spec's order.
 type limitsBody struct {
-	MaxPayloadBytes          int64  `json:"max_payload_bytes"`
-	MessageTTLSeconds        int64  `json:"message_ttl_seconds"`
-	VisibilityTimeoutSeconds int64  `json:"visibility_timeout_seconds"`
-	MaxBlobBytes             *int64 `json:"max_blob_bytes,omitempty"`
-	BlobTTLSeconds           *int64 `json:"blob_ttl_seconds,omitempty"`
+	MaxPayloadBytes             int64  `json:"max_payload_bytes"`
+	MessageTTLSeconds           int64  `json:"message_ttl_seconds"`
+	VisibilityTimeoutSeconds    int64  `json:"visibility_timeout_seconds"`
+	MaxTokenLifetimeSeconds     int64  `json:"max_token_lifetime_seconds"`
+	OpenTokenMaxLifetimeSeconds int64  `json:"open_token_max_lifetime_seconds"`
+	MaxClaimBytes               int64  `json:"max_claim_bytes"`
+	ClaimTTLSeconds             int64  `json:"claim_ttl_seconds"`
+	MaxBlobBytes                *int64 `json:"max_blob_bytes,omitempty"`
+	BlobTTLSeconds              *int64 `json:"blob_ttl_seconds,omitempty"`
 }
 
 type registerResponse struct {
@@ -82,6 +88,11 @@ func (s *Server) limits() limitsBody {
 		MaxPayloadBytes:          s.cfg.MaxPayloadBytes,
 		MessageTTLSeconds:        int64(s.cfg.MessageTTL / time.Second),
 		VisibilityTimeoutSeconds: int64(s.cfg.VisibilityTimeout / time.Second),
+
+		MaxTokenLifetimeSeconds:     int64(s.cfg.MaxTokenLifetime / time.Second),
+		OpenTokenMaxLifetimeSeconds: int64(s.cfg.OpenTokenMaxLifetime / time.Second),
+		MaxClaimBytes:               s.cfg.MaxClaimBytes,
+		ClaimTTLSeconds:             int64(s.cfg.ClaimTTL / time.Second),
 	}
 	if s.cfg.BlobsEnabled {
 		mb, ttl := s.cfg.MaxBlobBytes, int64(s.cfg.BlobTTL/time.Second)
@@ -383,6 +394,14 @@ func (s *Server) ack(ctx context.Context, mailbox, msgID string) *apiError {
 
 // ---------------------------------------------------------------- denylist
 
+// denylistRetention is how long a denylist entry must live (spec §5.5):
+// every token it could match has iat ≤ now and a lifetime bounded by the
+// configured caps (sender-bound or open), so it expires within the larger
+// cap; a margin covers the freshness window.
+func (s *Server) denylistRetention() time.Duration {
+	return max(s.cfg.MaxTokenLifetime, s.cfg.OpenTokenMaxLifetime) + auth.FreshnessWindow + time.Minute
+}
+
 // POST /v1/mailbox/denylist (spec §5.5)
 func (s *Server) handleDenylist(w http.ResponseWriter, r *http.Request) {
 	body, e := s.readBody(w, r, smallBodyLimit)
@@ -426,9 +445,7 @@ func (s *Server) handleDenylist(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Retain each entry until any token it could match has expired: tokens
-	// are valid at most MaxTokenLifetime past iat ≤ now (spec §5.5).
-	exp := s.now().Add(s.cfg.MaxTokenLifetime + auth.FreshnessWindow + time.Minute)
+	exp := s.now().Add(s.denylistRetention())
 	switch err := s.st.AddDenylist(r.Context(), mb.ID, entries, exp, s.cfg.MailboxMaxDenylist); {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))

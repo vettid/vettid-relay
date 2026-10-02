@@ -38,13 +38,19 @@ type Config struct {
 	MailboxMaxBlobBytes int64 // RELAY_MAILBOX_MAX_BLOB_BYTES
 	MailboxMaxDenylist  int64 // RELAY_MAILBOX_MAX_DENYLIST
 
-	RotationGrace    time.Duration // RELAY_ROTATION_GRACE
-	MaxTokenLifetime time.Duration // RELAY_MAX_TOKEN_LIFETIME
+	RotationGrace        time.Duration // RELAY_ROTATION_GRACE
+	MaxTokenLifetime     time.Duration // RELAY_MAX_TOKEN_LIFETIME
+	OpenTokenMaxLifetime time.Duration // RELAY_OPEN_TOKEN_MAX_LIFETIME
+
+	MaxClaimBytes int64         // RELAY_MAX_CLAIM_BYTES
+	ClaimTTL      time.Duration // RELAY_CLAIM_TTL (max TTL a creator may request)
 
 	RateIPPerSec     float64 // RELAY_RATE_IP_RPS
 	RateIPBurst      int     // RELAY_RATE_IP_BURST
 	RateSenderPerSec float64 // RELAY_RATE_SENDER_RPS
 	RateSenderBurst  int     // RELAY_RATE_SENDER_BURST
+	RateClaimPerSec  float64 // RELAY_RATE_CLAIM_GET_RPS
+	RateClaimBurst   int     // RELAY_RATE_CLAIM_GET_BURST
 
 	MaxCollectorsPerMailbox int // RELAY_MAX_COLLECTORS_PER_MAILBOX
 	ReplayCacheMax          int // RELAY_REPLAY_CACHE_MAX
@@ -76,13 +82,19 @@ func Defaults() Config {
 		MailboxMaxBlobBytes: 64 << 20,
 		MailboxMaxDenylist:  10000,
 
-		RotationGrace:    7 * 24 * time.Hour,
-		MaxTokenLifetime: 30 * 24 * time.Hour,
+		RotationGrace:        7 * 24 * time.Hour,
+		MaxTokenLifetime:     30 * 24 * time.Hour,
+		OpenTokenMaxLifetime: 600 * time.Second,
+
+		MaxClaimBytes: 16384,
+		ClaimTTL:      900 * time.Second,
 
 		RateIPPerSec:     20,
 		RateIPBurst:      40,
 		RateSenderPerSec: 5,
 		RateSenderBurst:  20,
+		RateClaimPerSec:  1,
+		RateClaimBurst:   10,
 
 		MaxCollectorsPerMailbox: 4,
 		ReplayCacheMax:          1_000_000,
@@ -180,11 +192,16 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 
 	dur("RELAY_ROTATION_GRACE", &c.RotationGrace)
 	dur("RELAY_MAX_TOKEN_LIFETIME", &c.MaxTokenLifetime)
+	dur("RELAY_OPEN_TOKEN_MAX_LIFETIME", &c.OpenTokenMaxLifetime)
+	i64("RELAY_MAX_CLAIM_BYTES", &c.MaxClaimBytes)
+	dur("RELAY_CLAIM_TTL", &c.ClaimTTL)
 
 	f64("RELAY_RATE_IP_RPS", &c.RateIPPerSec)
 	integer("RELAY_RATE_IP_BURST", &c.RateIPBurst)
 	f64("RELAY_RATE_SENDER_RPS", &c.RateSenderPerSec)
 	integer("RELAY_RATE_SENDER_BURST", &c.RateSenderBurst)
+	f64("RELAY_RATE_CLAIM_GET_RPS", &c.RateClaimPerSec)
+	integer("RELAY_RATE_CLAIM_GET_BURST", &c.RateClaimBurst)
 
 	integer("RELAY_MAX_COLLECTORS_PER_MAILBOX", &c.MaxCollectorsPerMailbox)
 	integer("RELAY_REPLAY_CACHE_MAX", &c.ReplayCacheMax)
@@ -219,6 +236,12 @@ func (c Config) Validate() error {
 	if c.MetricsAddr != "" && c.MetricsAddr == c.ListenAddr {
 		errs = append(errs, errors.New("RELAY_METRICS_ADDR must differ from RELAY_LISTEN_ADDR (metrics are never served on the public port)"))
 	}
+	if c.MaxTokenLifetime < time.Second || c.OpenTokenMaxLifetime < time.Second || c.ClaimTTL < time.Second {
+		errs = append(errs, errors.New("token lifetimes and claim TTL must be at least 1s"))
+	}
+	if c.MaxClaimBytes <= 0 {
+		errs = append(errs, errors.New("RELAY_MAX_CLAIM_BYTES must be > 0"))
+	}
 	if c.MaxPayloadBytes <= 0 {
 		errs = append(errs, errors.New("RELAY_MAX_PAYLOAD_BYTES must be > 0"))
 	}
@@ -226,7 +249,7 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("RELAY_MAX_BLOB_BYTES must be > 0 when blobs are enabled"))
 	}
 	if c.MaxConcurrentBlobTransfers <= 0 || c.MaxCollectorsPerMailbox <= 0 || c.ReplayCacheMax <= 0 ||
-		c.RateIPBurst <= 0 || c.RateSenderBurst <= 0 {
+		c.RateIPBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 {
 		errs = append(errs, errors.New("concurrency, burst and cache limits must be > 0"))
 	}
 	switch strings.ToLower(c.LogLevel) {
