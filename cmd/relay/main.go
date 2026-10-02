@@ -61,18 +61,22 @@ func main() {
 var version string
 
 func buildVersion() string {
+	return "vettid-relay " + buildRevision() + " (protocol " + api.ProtocolVersion + ")"
+}
+
+func buildRevision() string {
 	if version != "" {
-		return "vettid-relay " + version
+		return version
 	}
 	if bi, ok := debug.ReadBuildInfo(); ok {
 		for _, s := range bi.Settings {
 			if s.Key == "vcs.revision" {
-				return "vettid-relay " + s.Value
+				return s.Value
 			}
 		}
-		return "vettid-relay " + bi.Main.Version
+		return bi.Main.Version
 	}
-	return "vettid-relay (unknown)"
+	return "unknown"
 }
 
 // runHealthcheck only needs RELAY_LISTEN_ADDR, so it works even if some other

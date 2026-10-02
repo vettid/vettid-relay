@@ -425,38 +425,16 @@ func (s *Store) NextLeaseExpiry(ctx context.Context, mailbox string) (time.Time,
 	return fromMS(v.Int64), true, nil
 }
 
-// AckResult is the outcome of an ack.
-type AckResult int
-
-const (
-	AckDeleted AckResult = iota // the mailbox's message was deleted
-	AckAbsent                   // no such message anywhere (idempotent success)
-	AckForeign                  // the message exists but belongs to another mailbox
-)
-
-// Ack deletes msgID if it belongs to mailbox.
-func (s *Store) Ack(ctx context.Context, mailbox, msgID string) (AckResult, error) {
-	tx, err := s.w.BeginTx(ctx, nil)
+// Ack deletes msgID if it belongs to mailbox and reports whether a row was
+// deleted. Another mailbox's message is never touched, and callers must not
+// reveal the difference (spec §6.5).
+func (s *Store) Ack(ctx context.Context, mailbox, msgID string) (bool, error) {
+	res, err := s.w.ExecContext(ctx, `DELETE FROM messages WHERE msg_id=? AND mailbox_id=?`, msgID, mailbox)
 	if err != nil {
-		return 0, err
+		return false, err
 	}
-	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE msg_id=? AND mailbox_id=?`, msgID, mailbox)
-	if err != nil {
-		return 0, err
-	}
-	if n, _ := res.RowsAffected(); n == 1 {
-		return AckDeleted, tx.Commit()
-	}
-	var one int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM messages WHERE msg_id=?`, msgID).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return AckAbsent, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	return AckForeign, nil
+	n, _ := res.RowsAffected()
+	return n == 1, nil
 }
 
 // ------------------------------------------------------------------- sweep

@@ -293,10 +293,12 @@ func TestAckForeignMessage(t *testing.T) {
 	f.register(alice)
 	f.register(bob)
 	id := f.mustDeposit(alice, sender, f.mint(alice, sender, nil), []byte("for alice"))
-	// Spec §6.5: acking another mailbox's message → 404 mailbox_unknown, and
-	// the message survives.
-	if code, b := f.ack(bob, id); code != 404 || !strings.Contains(string(b), CodeMailboxUnknown) {
-		t.Fatalf("foreign ack: %d %s", code, b)
+	// Spec §6.5 (0.3.0): acking another mailbox's message is a uniform 204
+	// no-op — indistinguishable from acking a nonexistent id.
+	code, b := f.ack(bob, id)
+	code2, b2 := f.ack(bob, "01J00000000000000000000000")
+	if code != 204 || code2 != 204 || !bytes.Equal(b, b2) {
+		t.Fatalf("foreign ack: %d %q vs %d %q", code, b, code2, b2)
 	}
 	if got := f.collect(alice, ""); len(got.Messages) != 1 {
 		t.Fatal("foreign ack deleted the message")
@@ -314,11 +316,11 @@ func TestQuotaExceeded(t *testing.T) {
 	one := int64(1)
 	qt := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "quota"; c.Quota = &auth.Quota{Msgs: &one} })
 	f.mustDeposit(owner, sender, qt, []byte("1"))
-	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("2")), signer: &sender, token: qt}, 403, CodeQuotaExceeded)
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("2")), signer: &sender, token: qt}, 429, CodeQuotaExceeded)
 	tok := f.mint(owner, sender, nil)
 	f.mustDeposit(owner, sender, tok, []byte("3"))
 	f.mustDeposit(owner, sender, tok, []byte("4"))
-	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("5")), signer: &sender, token: tok}, 403, CodeQuotaExceeded)
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("5")), signer: &sender, token: tok}, 429, CodeQuotaExceeded)
 }
 
 func TestSenderRateLimit(t *testing.T) {
@@ -457,7 +459,7 @@ func TestDenylistValidation(t *testing.T) {
 	f.revoke(owner, "jti", "a")
 	f.revoke(owner, "jti", "a") // idempotent
 	f.revoke(owner, "jti", "b")
-	f.expectCode(req{method: "POST", path: "/v1/mailbox/denylist", body: []byte(`{"revoke":[{"kind":"jti","value":"c"}]}`), signer: &owner}, 403, CodeQuotaExceeded)
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/denylist", body: []byte(`{"revoke":[{"kind":"jti","value":"c"}]}`), signer: &owner}, 429, CodeQuotaExceeded)
 }
 
 func waitFor(t *testing.T, cond func() bool) {

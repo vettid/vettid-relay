@@ -91,7 +91,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 					conn.Close(websocket.StatusInternalError, "internal error")
 					return
 				}
-				// Foreign msg_id: nothing to report on this channel (no oracle).
 			}
 		}
 	}()

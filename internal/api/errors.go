@@ -20,11 +20,10 @@ const (
 	CodeTimestampStale   = "timestamp_stale"
 	CodeReplayDetected   = "replay_detected"
 	CodeInternal         = "internal"
-
-	// Non-canonical codes for situations the spec's code list does not
-	// cover (malformed JSON / parameters, unrouted paths). See README.
-	CodeBadRequest = "bad_request"
-	CodeNotFound   = "not_found"
+	CodeBadRequest       = "bad_request"
+	CodeNotFound         = "not_found"
+	CodeTokenUsed        = "token_used"    // 0.3.0 §5.6
+	CodeClaimUnknown     = "claim_unknown" // 0.3.0 §6.9
 )
 
 // allCodes is the closed set used for metric labels.
@@ -32,22 +31,23 @@ var allCodes = []string{
 	CodeTokenInvalid, CodeTokenExpired, CodeTokenRevoked, CodeMailboxUnknown,
 	CodeBlobUnknown, CodePayloadTooLarge, CodeQuotaExceeded, CodeRateLimited,
 	CodeSignatureInvalid, CodeTimestampStale, CodeReplayDetected, CodeInternal,
-	CodeBadRequest, CodeNotFound,
+	CodeBadRequest, CodeNotFound, CodeTokenUsed, CodeClaimUnknown,
 }
 
-// statusFor maps codes to HTTP status. The spec fixes 429 for rate_limited
-// and 404 for mailbox_unknown; the rest are this relay's choice.
+// statusFor maps codes to HTTP status exactly as the spec §7.1 table does.
 func statusFor(code string) int {
 	switch code {
 	case CodeTokenInvalid, CodeTokenExpired, CodeSignatureInvalid, CodeTimestampStale, CodeReplayDetected:
 		return http.StatusUnauthorized
-	case CodeTokenRevoked, CodeQuotaExceeded:
+	case CodeTokenRevoked:
 		return http.StatusForbidden
-	case CodeMailboxUnknown, CodeBlobUnknown, CodeNotFound:
+	case CodeMailboxUnknown, CodeBlobUnknown, CodeClaimUnknown, CodeNotFound:
 		return http.StatusNotFound
+	case CodeTokenUsed:
+		return http.StatusConflict
 	case CodePayloadTooLarge:
 		return http.StatusRequestEntityTooLarge
-	case CodeRateLimited:
+	case CodeQuotaExceeded, CodeRateLimited:
 		return http.StatusTooManyRequests
 	case CodeBadRequest:
 		return http.StatusBadRequest
@@ -71,6 +71,8 @@ var defaultMessages = map[string]string{
 	CodeInternal:         "internal error",
 	CodeBadRequest:       "malformed request",
 	CodeNotFound:         "not found",
+	CodeTokenUsed:        "one-shot token already used",
+	CodeClaimUnknown:     "claim unknown",
 }
 
 type errorBody struct {

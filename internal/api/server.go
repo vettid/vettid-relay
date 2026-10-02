@@ -16,6 +16,9 @@ import (
 	"github.com/vettid/vettid-relay/internal/store"
 )
 
+// ProtocolVersion is the docs/RELAY-PROTOCOL.md version this relay implements.
+const ProtocolVersion = "0.3.0"
+
 // Server is the relay API.
 type Server struct {
 	cfg   config.Config
@@ -175,7 +178,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "db_unreachable"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "protocol": ProtocolVersion})
 }
 
 // Drain begins shutdown: parked long-polls return immediately, WebSocket

@@ -121,15 +121,15 @@ func TestDepositLeaseAck(t *testing.T) {
 	if next, ok, err := s.NextLeaseExpiry(ctx, "a"); err != nil || !ok || !next.Equal(c.now().Add(time.Minute)) {
 		t.Fatalf("next lease expiry %v %v %v", next, ok, err)
 	}
-	// Ack scoping.
-	if r, _ := s.Ack(ctx, "b", ids[0]); r != AckForeign {
-		t.Fatalf("foreign ack = %v", r)
+	// Ack scoping: another mailbox cannot delete it.
+	if d, _ := s.Ack(ctx, "b", ids[0]); d {
+		t.Fatal("foreign ack deleted a message")
 	}
-	if r, _ := s.Ack(ctx, "a", ids[0]); r != AckDeleted {
-		t.Fatalf("ack = %v", r)
+	if d, _ := s.Ack(ctx, "a", ids[0]); !d {
+		t.Fatal("ack did not delete")
 	}
-	if r, _ := s.Ack(ctx, "a", ids[0]); r != AckAbsent {
-		t.Fatalf("re-ack = %v", r)
+	if d, _ := s.Ack(ctx, "a", ids[0]); d {
+		t.Fatal("re-ack reported a deletion")
 	}
 	// Lease expiry → redelivery of unacked messages, in order.
 	c.add(time.Minute)

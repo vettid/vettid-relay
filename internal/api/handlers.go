@@ -361,21 +361,20 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ack is shared by DELETE and WebSocket ack frames.
+// ack is shared by DELETE and WebSocket ack frames. Spec §6.5 (0.3.0):
+// always success — whether the message existed, was already acked, or
+// belongs to another mailbox (then nothing happens) — so ack cannot be used
+// to probe which message ids exist.
 func (s *Server) ack(ctx context.Context, mailbox, msgID string) *apiError {
 	if len(msgID) != 26 {
-		return nil // cannot exist: idempotent success
+		return nil // cannot exist
 	}
-	res, err := s.st.Ack(ctx, mailbox, msgID)
+	deleted, err := s.st.Ack(ctx, mailbox, msgID)
 	if err != nil {
 		s.log.Error("ack failed", "err", err)
 		return fail(CodeInternal)
 	}
-	switch res {
-	case store.AckForeign:
-		// Spec §6.5: acking another mailbox's message → 404 mailbox_unknown.
-		return fail(CodeMailboxUnknown)
-	case store.AckDeleted:
+	if deleted {
 		s.m.acks.Inc()
 	}
 	return nil
