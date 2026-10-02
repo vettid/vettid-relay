@@ -268,3 +268,80 @@ func TestKeyRotation(t *testing.T) {
 		t.Fatalf("old token on new mailbox: %v", err)
 	}
 }
+
+// First contact (spec §5.6 + §6.9): the owner leaves a bootstrap bundle as a
+// claim and mints a one-shot open token; both travel out of band (e.g. a QR
+// code carrying {claim_id, bundle_hash, token}). A stranger with no prior
+// relationship fetches the bundle, deposits exactly once with its own key,
+// and the owner learns that key and answers with a sender-bound token.
+func TestFirstContact(t *testing.T) {
+	url := startRelay(t)
+	ctx := context.Background()
+	owner := newPrincipal(t, url)
+	stranger := newPrincipal(t, url) // never registers
+	if _, err := owner.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	bundle := []byte("owner's public key bundle")
+	bundleHash := sha256.Sum256(bundle)
+	claimID, _, err := owner.PutClaim(ctx, bundle, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openTok, err := owner.MintOpenToken(url, 5*time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// --- out of band: {claimID, bundleHash, openTok, owner address} ---
+
+	got, err := stranger.GetClaim(ctx, claimID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := sha256.Sum256(got); h != bundleHash {
+		t.Fatal("bundle does not match the out-of-band hash")
+	}
+	if _, err := stranger.GetClaim(ctx, claimID); !client.IsCode(err, "claim_unknown") {
+		t.Fatalf("claim must be single-fetch: %v", err)
+	}
+
+	hello, err := stranger.Deposit(ctx, owner.MailboxID(), openTok, []byte("hello (E2E-encrypted to the bundle)"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stranger.Deposit(ctx, owner.MailboxID(), openTok, []byte("again")); !client.IsCode(err, "token_used") {
+		t.Fatalf("second use: %v", err)
+	}
+	thief := newPrincipal(t, url)
+	if _, err := thief.Deposit(ctx, owner.MailboxID(), openTok, []byte("me too")); !client.IsCode(err, "token_used") {
+		t.Fatalf("reuse by another key: %v", err)
+	}
+
+	msgs, err := owner.Collect(ctx, 5*time.Second, 10)
+	if err != nil || len(msgs) != 1 || msgs[0].MsgID != hello {
+		t.Fatalf("collect: %+v %v", msgs, err)
+	}
+	if msgs[0].Sender != stranger.PublicKeyB64() {
+		t.Fatalf("sender %q, want the stranger's key", msgs[0].Sender)
+	}
+	owner.Ack(ctx, hello)
+
+	// The owner approves the contact: a normal sender-bound token for the
+	// key it just learned. The stranger registers its own mailbox to receive.
+	bound, err := owner.MintToken(msgs[0].Sender, url, client.TokenOptions{TTL: 24 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := stranger.Deposit(ctx, owner.MailboxID(), bound, []byte("now a known contact"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, err := owner.Collect(ctx, 5*time.Second, 10); err != nil || len(m) != 1 || m[0].MsgID != id || m[0].Sender != stranger.PublicKeyB64() {
+		t.Fatalf("bound follow-up: %+v %v", m, err)
+	}
+	// The thief cannot use the bound token.
+	if _, err := thief.Deposit(ctx, owner.MailboxID(), bound, []byte("x")); !client.IsCode(err, "signature_invalid") {
+		t.Fatalf("bound token theft: %v", err)
+	}
+}

@@ -75,6 +75,8 @@ type request struct {
 	body                []byte
 	token               string
 	contentType         string
+	header              http.Header
+	unsigned            bool // claim GETs are unauthenticated
 }
 
 // do sends a signed request, retrying 429/5xx/transport errors with
@@ -135,7 +137,12 @@ func (c *Client) once(ctx context.Context, r request) (*http.Response, error) {
 	if r.body == nil {
 		req.Body, req.ContentLength = http.NoBody, 0
 	}
-	auth.SetHeaders(req.Header, c.Key, r.method, req.URL.EscapedPath(), c.Now(), auth.BodyHash(r.body))
+	if !r.unsigned {
+		auth.SetHeaders(req.Header, c.Key, r.method, req.URL.EscapedPath(), c.Now(), auth.BodyHash(r.body))
+	}
+	for k, v := range r.header {
+		req.Header[k] = v
+	}
 	if r.token != "" {
 		req.Header.Set("Authorization", "VettID-Deposit "+r.token)
 	}
@@ -176,11 +183,15 @@ func (c *Client) doJSON(ctx context.Context, r request, out any) (int, error) {
 
 // Limits are the relay limits returned at registration (spec §6.1).
 type Limits struct {
-	MaxPayloadBytes          int64  `json:"max_payload_bytes"`
-	MessageTTLSeconds        int64  `json:"message_ttl_seconds"`
-	VisibilityTimeoutSeconds int64  `json:"visibility_timeout_seconds"`
-	MaxBlobBytes             *int64 `json:"max_blob_bytes,omitempty"`
-	BlobTTLSeconds           *int64 `json:"blob_ttl_seconds,omitempty"`
+	MaxPayloadBytes             int64  `json:"max_payload_bytes"`
+	MessageTTLSeconds           int64  `json:"message_ttl_seconds"`
+	VisibilityTimeoutSeconds    int64  `json:"visibility_timeout_seconds"`
+	MaxTokenLifetimeSeconds     int64  `json:"max_token_lifetime_seconds"`
+	OpenTokenMaxLifetimeSeconds int64  `json:"open_token_max_lifetime_seconds"`
+	MaxClaimBytes               int64  `json:"max_claim_bytes"`
+	ClaimTTLSeconds             int64  `json:"claim_ttl_seconds"`
+	MaxBlobBytes                *int64 `json:"max_blob_bytes,omitempty"`
+	BlobTTLSeconds              *int64 `json:"blob_ttl_seconds,omitempty"`
 }
 
 // Registration is the register response.
@@ -215,10 +226,33 @@ func (c *Client) MintToken(senderB64, audience string, o TokenOptions) (string, 
 	if o.JTI == "" {
 		o.JTI = randomID()
 	}
-	now := c.Now().UTC().Truncate(time.Second)
+	// Backdate iat a little: the relay checks iat ≤ now strictly (§5.2).
+	now := c.Now().UTC().Truncate(time.Second).Add(-tokenBackdate)
 	return auth.MintToken(c.Key, auth.Claims{
 		Iss: c.MailboxID(), Sub: senderB64, Aud: audience,
-		Iat: now, Exp: now.Add(o.TTL), Jti: o.JTI, Scope: "deposit", Quota: o.Quota,
+		Iat: now, Exp: now.Add(o.TTL), Jti: o.JTI, Scope: auth.ScopeDeposit, Quota: o.Quota,
+	})
+}
+
+const tokenBackdate = 30 * time.Second
+
+// MintOpenToken issues a one-shot open token (spec §5.6) for first contact:
+// whoever holds it may deposit exactly one message, signed with any key,
+// which becomes that message's sender. ttl must not exceed the relay's
+// open_token_max_lifetime_seconds (default 600 s); keep it as short as the
+// use allows. The lifetime is measured from the backdated iat.
+func (c *Client) MintOpenToken(audience string, ttl time.Duration, jti string) (string, error) {
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	if jti == "" {
+		jti = randomID()
+	}
+	now := c.Now().UTC().Truncate(time.Second)
+	iat := now.Add(-min(tokenBackdate, ttl/2))
+	return auth.MintToken(c.Key, auth.Claims{
+		Iss: c.MailboxID(), Sub: auth.OpenSub, Aud: audience,
+		Iat: iat, Exp: iat.Add(ttl), Jti: jti, Scope: auth.ScopeDepositOpen,
 	})
 }
 
@@ -327,6 +361,43 @@ func (c *Client) GetBlob(ctx context.Context, blobID string) ([]byte, error) {
 // DeleteBlob deletes a blob (idempotent).
 func (c *Client) DeleteBlob(ctx context.Context, blobID string) error {
 	_, err := c.doJSON(ctx, request{method: "DELETE", path: "/v1/blob/" + blobID}, nil)
+	return err
+}
+
+// PutClaim leaves a single-fetch claim (spec §6.9) owned by this mailbox.
+// ttl 0 uses the relay default (900 s, capped by claim_ttl_seconds).
+func (c *Client) PutClaim(ctx context.Context, data []byte, ttl time.Duration) (claimID string, expires time.Time, err error) {
+	var h http.Header
+	if ttl > 0 {
+		h = http.Header{"X-Vettid-Claim-Ttl": {strconv.Itoa(int(ttl / time.Second))}}
+	}
+	var out struct {
+		ClaimID   string `json:"claim_id"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	_, err = c.doJSON(ctx, request{method: "PUT", path: "/v1/claim", body: data, header: h,
+		contentType: "application/octet-stream"}, &out)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	expires, _ = time.Parse(time.RFC3339, out.ExpiresAt)
+	return out.ClaimID, expires, nil
+}
+
+// GetClaim fetches (and thereby deletes) a claim. It is unauthenticated and
+// NOT retried: a retry after a lost response would find the claim gone.
+func (c *Client) GetClaim(ctx context.Context, claimID string) ([]byte, error) {
+	resp, err := c.once(ctx, request{method: "GET", path: "/v1/claim/" + claimID, unsigned: true})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+}
+
+// DeleteClaim deletes a claim this mailbox created (idempotent).
+func (c *Client) DeleteClaim(ctx context.Context, claimID string) error {
+	_, err := c.doJSON(ctx, request{method: "DELETE", path: "/v1/claim/" + claimID}, nil)
 	return err
 }
 
