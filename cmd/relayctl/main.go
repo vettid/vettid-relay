@@ -26,8 +26,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vettid/vettid-relay/internal/auth"
-	"github.com/vettid/vettid-relay/internal/client"
+	auth "github.com/vettid/vettid-relay/relayauth"
+	client "github.com/vettid/vettid-relay/relayclient"
 )
 
 const usage = `usage: relayctl [-url URL] <command> [flags]

@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/vettid/vettid-relay/internal/api"
-	"github.com/vettid/vettid-relay/internal/client"
+	client "github.com/vettid/vettid-relay/relayclient"
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/store"

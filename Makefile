@@ -31,11 +31,11 @@ lint: vet staticcheck
 # Each fuzz target runs for FUZZTIME. Seed corpora are the f.Add seeds in the
 # tests (plus any regression inputs saved under testdata/fuzz).
 fuzz:
-	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzParseToken$$' -fuzztime $(FUZZTIME)
-	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzCanonical$$' -fuzztime $(FUZZTIME)
-	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzVerifyRequest$$' -fuzztime $(FUZZTIME)
-	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzParseClaims$$' -fuzztime $(FUZZTIME)
-	$(GO) test ./internal/auth -run '^$$' -fuzz '^FuzzParseClaimID$$' -fuzztime $(FUZZTIME)
+	$(GO) test ./relayauth -run '^$$' -fuzz '^FuzzParseToken$$' -fuzztime $(FUZZTIME)
+	$(GO) test ./relayauth -run '^$$' -fuzz '^FuzzCanonical$$' -fuzztime $(FUZZTIME)
+	$(GO) test ./relayauth -run '^$$' -fuzz '^FuzzVerifyRequest$$' -fuzztime $(FUZZTIME)
+	$(GO) test ./relayauth -run '^$$' -fuzz '^FuzzParseClaims$$' -fuzztime $(FUZZTIME)
+	$(GO) test ./relayauth -run '^$$' -fuzz '^FuzzParseClaimID$$' -fuzztime $(FUZZTIME)
 
 scan:
 	gitleaks git --redact .

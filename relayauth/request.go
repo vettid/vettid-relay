@@ -4,7 +4,7 @@
 //
 // Nothing in this package logs. Errors are sentinel values that never carry
 // key, signature, token or payload material.
-package auth
+package relayauth
 
 import (
 	"crypto/ed25519"

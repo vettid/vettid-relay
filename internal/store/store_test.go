@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vettid/vettid-relay/internal/auth"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 type clock struct {
