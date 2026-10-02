@@ -64,9 +64,8 @@ func (s *Store) PutBlob(ctx context.Context, p BlobPut, r io.Reader) (BlobInfo, 
 	now := s.now()
 	if p.Limits.MailboxMaxBytes > 0 {
 		var used int64
-		if err := tx.QueryRowContext(ctx,
-			`SELECT COALESCE(SUM(size),0) FROM blobs WHERE mailbox_id=? AND expires_at>?`,
-			p.Mailbox, ms(now)).Scan(&used); err != nil {
+		var err error
+		if used, err = storedBytes(ctx, tx, p.Mailbox, now); err != nil {
 			return BlobInfo{}, err
 		}
 		if used+p.Size > p.Limits.MailboxMaxBytes {

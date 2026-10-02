@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/vettid/vettid-relay/internal/auth"
 )
 
 type clock struct {
@@ -461,5 +463,81 @@ func TestMigrateFromV1(t *testing.T) {
 	}
 	if _, err := s.IsConsumed(ctx, "old", "x"); err != nil {
 		t.Fatalf("v2 table missing: %v", err)
+	}
+}
+
+func TestClaims(t *testing.T) {
+	s, c := open(t)
+	mustRegister(t, s, "a", 1)
+	mustRegister(t, s, "b", 2)
+	id, exp, err := s.PutClaim(ctx, "a", []byte("bundle"), 15*time.Minute, 0)
+	if err != nil || !exp.Equal(c.now().Add(15*time.Minute)) {
+		t.Fatalf("put: %v %v", exp, err)
+	}
+	if _, ok := auth.ParseClaimID(id); !ok {
+		t.Fatalf("bad id %q", id)
+	}
+	// Another mailbox cannot delete it.
+	if err := s.DeleteClaim(ctx, "b", id); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.TakeClaim(ctx, id)
+	if err != nil || string(got) != "bundle" {
+		t.Fatalf("take: %q %v", got, err)
+	}
+	if _, err := s.TakeClaim(ctx, id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second take: %v", err)
+	}
+	// Expiry.
+	id2, _, _ := s.PutClaim(ctx, "a", []byte("x"), time.Minute, 0)
+	c.add(time.Minute)
+	if _, err := s.TakeClaim(ctx, id2); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired take: %v", err)
+	}
+	if st, _ := s.Sweep(ctx); st.Claims != 1 {
+		t.Fatalf("sweep: %+v", st)
+	}
+	// Owner delete.
+	id3, _, _ := s.PutClaim(ctx, "a", []byte("x"), time.Minute, 0)
+	s.DeleteClaim(ctx, "a", id3)
+	if _, err := s.TakeClaim(ctx, id3); !errors.Is(err, ErrNotFound) {
+		t.Fatal("deleted claim still fetchable")
+	}
+	// Claims and blobs share the creator's storage cap.
+	if _, _, err := s.PutClaim(ctx, "a", make([]byte, 600), time.Hour, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", SenderSub: "s", Size: 500, TTL: time.Hour, Limits: Limits{MailboxMaxBytes: 1000}}, bytes.NewReader(make([]byte, 500))); !errors.Is(err, ErrQuota) {
+		t.Fatalf("blob over shared cap: %v", err)
+	}
+	if _, _, err := s.PutClaim(ctx, "a", make([]byte, 401), time.Hour, 1000); !errors.Is(err, ErrQuota) {
+		t.Fatalf("claim over cap: %v", err)
+	}
+	if _, _, err := s.PutClaim(ctx, "a", make([]byte, 400), time.Hour, 1000); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTakeClaimConcurrent(t *testing.T) {
+	s, _ := open(t)
+	mustRegister(t, s, "a", 1)
+	id, _, _ := s.PutClaim(ctx, "a", []byte("once"), time.Minute, 0)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	hits := 0
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.TakeClaim(ctx, id); err == nil {
+				mu.Lock()
+				hits++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if hits != 1 {
+		t.Fatalf("claim fetched %d times", hits)
 	}
 }

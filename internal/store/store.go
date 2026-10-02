@@ -499,6 +499,7 @@ func (s *Store) Sweep(ctx context.Context) (SweepStats, error) {
 		{&st.Blobs, `DELETE FROM blobs WHERE expires_at<=?`},
 		{&st.TokenUsage, `DELETE FROM token_usage WHERE expires_at<=?`},
 		{&st.ConsumedTokens, `DELETE FROM consumed_tokens WHERE expires_at<=?`},
+		{&st.Claims, `DELETE FROM claims WHERE expires_at<=?`},
 	}
 	for _, step := range steps {
 		res, err := tx.ExecContext(ctx, step.sql, now)
