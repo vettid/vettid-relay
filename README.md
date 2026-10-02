@@ -278,11 +278,11 @@ Layout:
 - `cmd/relay`: the server.
 - `cmd/relayctl`: the CLI client.
 - `internal/api`: handlers, middleware and authorization.
-- `internal/auth`: mailbox ids, signed requests, replay cache and PASETO.
+- `relayauth` (public): mailbox ids, signed requests, replay cache and PASETO v4.public.
 - `internal/store`: SQLite, including blobs.
 - `internal/sweep`: the TTL sweeper.
 - `internal/ratelimit`, `internal/metrics` and `internal/config`.
-- `internal/client`: the reference client.
+- `relayclient` (public): the reference client, imported by vettid-vault. Inject `HTTP` to change transport (e.g. a vsock dialer).
 - `test/e2e`: the two-principal integration test.
 
 ## License

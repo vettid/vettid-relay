@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/vettid/vettid-relay/internal/auth"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 // Claims (spec §6.9) are small single-fetch blobs an owner leaves for someone

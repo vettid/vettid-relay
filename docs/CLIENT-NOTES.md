@@ -3,7 +3,7 @@
 These notes are for people implementing relay clients: the vault
 (vault-manager in the enclave, plus the parent-instance forwarder), apps
 (Android, iOS, desktop) and agents. The normative text is
-[RELAY-PROTOCOL.md](RELAY-PROTOCOL.md). `internal/client` in this repository
+[RELAY-PROTOCOL.md](RELAY-PROTOCOL.md). `relayclient` in this repository
 is a compact reference implementation in Go.
 
 ## 1. Keys and addresses

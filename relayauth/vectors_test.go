@@ -1,4 +1,4 @@
-package auth
+package relayauth
 
 // Test vectors from docs/RELAY-PROTOCOL.md §9. Every value here is copied
 // verbatim from the spec and must be reproduced byte-for-byte.

@@ -3,7 +3,7 @@
 // docs/RELAY-PROTOCOL.md: signing requests, minting deposit tokens,
 // long-poll/WebSocket collect, acks, revocation and blobs. See
 // docs/CLIENT-NOTES.md for guidance on production clients.
-package client
+package relayclient
 
 import (
 	"bytes"
@@ -22,7 +22,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/vettid/vettid-relay/internal/auth"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 // Client talks to one relay as one principal (one relay keypair).

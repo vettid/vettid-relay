@@ -9,7 +9,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/vettid/vettid-relay/internal/auth"
+	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
 // Spec §5.6: one-shot open tokens.
