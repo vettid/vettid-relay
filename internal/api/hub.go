@@ -75,6 +75,16 @@ func (h *hub) notify(mailbox string) {
 	}
 }
 
+// notifyAll wakes every parked collector (each re-checks the store).
+func (h *hub) notifyAll() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, e := range h.boxes {
+		close(e.ch)
+		e.ch = make(chan struct{})
+	}
+}
+
 // collectors returns the number of active collectors across all mailboxes.
 func (h *hub) collectors() int {
 	h.mu.Lock()

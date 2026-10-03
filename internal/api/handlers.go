@@ -198,12 +198,15 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))
 		return
+	case errors.Is(err, store.ErrNotFound): // mailbox reached its deletion time mid-request
+		s.writeError(w, fail(CodeMailboxUnknown))
+		return
 	case err != nil:
 		s.log.Error("deposit failed", "err", err)
 		s.writeError(w, fail(CodeInternal))
 		return
 	}
-	s.hub.notify(mailboxID) // wake-on-deposit
+	s.notifyDeposit(r.Context(), mailboxID) // wake-on-deposit (§6.2), here and on other relay processes
 	s.m.deposits.Inc()
 	s.m.depositBytes.Add(int64(len(payload)))
 	setLog(w, "msg_id", msg.ID)
@@ -299,9 +302,12 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 			s.m.parked.Dec()
 		}
 	}()
+	gen := s.forceGen.Load()
 	for {
 		wake := s.hub.wait(mb.ID) // before leasing: no lost wakeups
-		msgs, err := s.st.Lease(r.Context(), mb.ID, max, s.cfg.VisibilityTimeout)
+		g := s.forceGen.Load()
+		msgs, next, err := s.collectOnce(r.Context(), mb.ID, max, g != gen)
+		gen = g
 		if err != nil {
 			if r.Context().Err() != nil {
 				return
@@ -321,7 +327,7 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		// Also wake when a leased-but-unacked message becomes visible again.
 		var leaseC <-chan time.Time
 		var leaseT *time.Timer
-		if next, ok, err := s.st.NextLeaseExpiry(r.Context(), mb.ID); err == nil && ok {
+		if !next.IsZero() {
 			leaseT = time.NewTimer(max0(next.Sub(s.now())) + 5*time.Millisecond)
 			leaseC = leaseT.C
 		}

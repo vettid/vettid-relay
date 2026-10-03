@@ -22,7 +22,7 @@ const ProtocolVersion = "0.4.0"
 // Server is the relay API.
 type Server struct {
 	cfg   config.Config
-	st    *store.Store
+	st    store.Backend
 	blobs store.BlobStore
 	log   *slog.Logger
 	m     *serverMetrics
@@ -38,12 +38,15 @@ type Server struct {
 	bgCancel context.CancelFunc
 	bg       sync.WaitGroup
 
-	replay     *auth.ReplayCache
-	ipLimit    *ratelimit.Limiter // per source IP (IPv4 / IPv6 /64), before any parsing
-	subLimit   *ratelimit.Limiter // per sender key, after token parse
-	claimLimit *ratelimit.Limiter // unauthenticated claim GETs, per IPv4 / IPv6 /64
+	replay     ReplayGuard
+	ipLimit    RateLimiter // per source IP (IPv4 / IPv6 /64), before any parsing
+	subLimit   RateLimiter // per sender key, after token parse
+	claimLimit RateLimiter // unauthenticated claim GETs, per IPv4 / IPv6 /64
 
 	hub       *hub
+	bus       WakeBus       // cross-process wake-on-deposit (nil: single process)
+	hints     EmptyHints    // known-empty mailboxes (nil: always query)
+	forceGen  atomic.Uint64 // bumped by WakeAll: collectors then query for real
 	blobSlots chan struct{} // bounds concurrent blob transfers
 	mux       *http.ServeMux
 }
@@ -67,6 +70,8 @@ type serverMetrics struct {
 	blobDeletes   metrics.Counter
 	claimPuts     metrics.Counter
 	claimGets     metrics.Counter
+	storeQueries  metrics.Counter
+	storeSkips    metrics.Counter
 }
 
 func newServerMetrics(reg *metrics.Registry) *serverMetrics {
@@ -90,6 +95,8 @@ func newServerMetrics(reg *metrics.Registry) *serverMetrics {
 		blobDeletes:   reg.Counter("relay_blob_deletes_total", "Blob delete requests."),
 		claimPuts:     reg.Counter("relay_claim_puts_total", "Claims created."),
 		claimGets:     reg.Counter("relay_claim_fetches_total", "Claims fetched (and thereby deleted)."),
+		storeQueries:  reg.Counter("relay_collect_store_queries_total", "Collect attempts that queried the store."),
+		storeSkips:    reg.Counter("relay_collect_store_skips_total", "Collect attempts that skipped the store: mailbox known empty (empty hints)."),
 	}
 	for _, c := range allCodes {
 		m.errors.With(c) // pre-create every series so rates start at 0
@@ -103,8 +110,11 @@ type Option func(*Server)
 // WithClock overrides the clock used for auth freshness and token times.
 func WithClock(now func() time.Time) Option { return func(s *Server) { s.now = now } }
 
-// New builds the API server.
-func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Registry, opts ...Option) *Server {
+// New builds the API server. By default the replay cache, rate limiters and
+// wake-on-deposit are in-process, which is correct for exactly one relay
+// process; multi-process deployments pass shared ones (WithReplayGuard,
+// WithRateLimiters, WithWakeBus — see internal/coord).
+func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Registry, opts ...Option) *Server {
 	s := &Server{
 		cfg:   cfg,
 		st:    st,
@@ -128,7 +138,9 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 		o(s)
 	}
 	s.routes()
-	reg.GaugeFunc("relay_replay_cache_entries", "Entries in the signature replay cache.", func() int64 { return int64(s.replay.Len()) })
+	if rc, ok := s.replay.(interface{ Len() int }); ok {
+		reg.GaugeFunc("relay_replay_cache_entries", "Entries in the signature replay cache.", func() int64 { return int64(rc.Len()) })
+	}
 	reg.GaugeFunc("relay_active_collectors", "Active collectors (parked long-polls and WebSocket sessions).", func() int64 { return int64(s.hub.collectors()) })
 	reg.GaugeFunc("relay_draining", "1 while the relay is draining for shutdown.", func() int64 {
 		if s.draining.Load() {
@@ -138,10 +150,14 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger, reg *metrics.Regi
 	})
 	s.every(15*time.Second, func(time.Time) {
 		now := s.now()
-		s.replay.Sweep(now)
-		s.ipLimit.Prune(now)
-		s.subLimit.Prune(now)
-		s.claimLimit.Prune(now)
+		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
+			c.Sweep(now)
+		}
+		for _, l := range []RateLimiter{s.ipLimit, s.subLimit, s.claimLimit} {
+			if p, ok := l.(interface{ Prune(time.Time) }); ok {
+				p.Prune(now)
+			}
+		}
 	})
 	return s
 }

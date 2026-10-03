@@ -69,8 +69,10 @@ func TestWebSocketCollect(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Acks are processed asynchronously: past every lease, the mailbox must
+	// become (and stay) empty — an unacked message would keep coming back.
 	waitFor(t, func() bool {
-		f.clk.add(time.Millisecond)
+		f.clk.add(2 * f.cfg.VisibilityTimeout)
 		got := f.collect(owner, "")
 		return len(got.Messages) == 0
 	})

@@ -27,6 +27,31 @@ jobs:
       - name: fuzz (short)
         run: make fuzz FUZZTIME=10s
 
+  shared-backend:
+    # The multi-process backend (hosting option B): DynamoDB conformance,
+    # Valkey coordination, the whole API suite on DynamoDB, and the
+    # two-process e2e (wake, open token, claim, replay, shared rate limit).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+        ports: ["18000:8000"]
+        options: --memory 1g
+      valkey:
+        image: valkey/valkey:8.1.10-alpine@sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
+        ports: ["16379:6379"]
+        options: --memory 256m
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: wait for DynamoDB Local
+        run: for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:18000 && exit 0; sleep 1; done; exit 1
+      - name: tests against DynamoDB Local + Valkey
+        run: make test-shared
+
   gitleaks:
     # Pinned binary over the FULL history (the gitleaks-action fails on a
     # branch's first push, where there is no "before" commit).
@@ -63,7 +88,7 @@ jobs:
     # resulting digest (never a tag), so a push here deploys nothing by itself.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    needs: [test, gitleaks]
+    needs: [test, shared-backend, gitleaks]
     permissions:
       contents: read
       packages: write

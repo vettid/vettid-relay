@@ -84,3 +84,50 @@ func TestLifetimePolicyConfig(t *testing.T) {
 		t.Fatal("zero claim size accepted")
 	}
 }
+
+func TestDynamoStoreConfig(t *testing.T) {
+	base := map[string]string{
+		"RELAY_STORE":             "dynamodb",
+		"RELAY_DYNAMODB_TABLE":    "vettid-org-relay",
+		"RELAY_BLOB_BUCKET":       "vettid-org-relay-blobs-123",
+		"RELAY_VALKEY_ADDR":       "relay-abc.serverless.use1.cache.amazonaws.com:6379",
+		"RELAY_VALKEY_TLS":        "true",
+		"RELAY_VALKEY_IAM_USER":   "relay",
+		"RELAY_VALKEY_CACHE_NAME": "vettid-org-relay",
+	}
+	c, err := Load(env(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Store != "dynamodb" || !c.ValkeyTLS || !c.ValkeyServerless || c.ValkeyIAMUser != "relay" {
+		t.Fatalf("%+v", c)
+	}
+	for name, mut := range map[string]func(m map[string]string){
+		"no table":           func(m map[string]string) { delete(m, "RELAY_DYNAMODB_TABLE") },
+		"no bucket":          func(m map[string]string) { delete(m, "RELAY_BLOB_BUCKET") },
+		"no valkey":          func(m map[string]string) { delete(m, "RELAY_VALKEY_ADDR") },
+		"payload over item":  func(m map[string]string) { m["RELAY_MAX_PAYLOAD_BYTES"] = "400000" },
+		"iam without tls":    func(m map[string]string) { m["RELAY_VALKEY_TLS"] = "false" },
+		"iam without cache":  func(m map[string]string) { delete(m, "RELAY_VALKEY_CACHE_NAME") },
+		"unknown store kind": func(m map[string]string) { m["RELAY_STORE"] = "postgres" },
+	} {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		mut(m)
+		if _, err := Load(env(m)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	// Blobs disabled: no bucket needed.
+	m := map[string]string{"RELAY_BLOBS_ENABLED": "false"}
+	for k, v := range base {
+		if k != "RELAY_BLOB_BUCKET" {
+			m[k] = v
+		}
+	}
+	if _, err := Load(env(m)); err != nil {
+		t.Fatal(err)
+	}
+}

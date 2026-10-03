@@ -99,7 +99,11 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 				attrs = append(attrs, slog.Group("", rec.attrs...))
 			}
 			level := slog.LevelInfo
-			if route == "GET /healthz" && status == http.StatusOK {
+			if (route == "GET /healthz" && status == http.StatusOK) || (route == "GET /v1/mailbox" && status == http.StatusOK && emptyCollect(rec.attrs)) {
+				// Health probes and long-polls that end empty are most of
+				// the traffic and carry no information; at info level they
+				// would dominate log volume (and cost) with always-on
+				// collectors re-polling every 25 s.
 				level = slog.LevelDebug
 			}
 			s.log.LogAttrs(r.Context(), level, "request", attrs...)
@@ -178,4 +182,15 @@ func (s *Server) allowSender(sub string) *apiError {
 		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
 	}
 	return nil
+}
+
+// emptyCollect reports whether a collect response delivered no messages.
+func emptyCollect(attrs []any) bool {
+	for i := 0; i+1 < len(attrs); i += 2 {
+		if attrs[i] == "count" {
+			n, ok := attrs[i+1].(int)
+			return ok && n == 0
+		}
+	}
+	return false
 }

@@ -25,6 +25,12 @@ can't read or forge them.
   `github.com/oklog/ulid/v2`. PASETO v4.public and the Prometheus exporter
   are implemented in-tree on `crypto/ed25519` and the standard library.
   There is no CGO, and the binary is static.
+- **Two stores, one protocol.** `RELAY_STORE=sqlite` (default): one file,
+  one process. `RELAY_STORE=dynamodb`: DynamoDB + S3 + Valkey, shared by any
+  number of relay processes behind one URL (rolling deploys without
+  downtime, autoscaling). Clients can't tell them apart; both pass the same
+  conformance suite and the whole API test suite. For the shared store this
+  adds the AWS SDK for Go v2 (DynamoDB, S3) and `valkey-go`.
 
 ## Quick start
 
@@ -79,7 +85,18 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 |---|---|---|
 | `RELAY_LISTEN_ADDR` | `:8080` | Public HTTP listen address. |
 | `RELAY_BASE_URL` | `http://localhost:8080` | Public base URL of this relay, for example `https://relay.vettid.org`. Deposit-token `aud` must equal it **exactly**, so leave off any trailing slash. |
-| `RELAY_DB_PATH` | `relay.db` | SQLite database file (`/data/relay.db` in the image). |
+| `RELAY_STORE` | `sqlite` | `sqlite` (one process) or `dynamodb` (several processes on a shared store; see [Multi-process hosting](#multi-process-hosting)). |
+| `RELAY_DB_PATH` | `relay.db` | SQLite database file (`/data/relay.db` in the image). `sqlite` only. |
+| `RELAY_DYNAMODB_TABLE` | | DynamoDB table (`dynamodb`, required). Layout: `internal/store/dynamo`. |
+| `RELAY_BLOB_BUCKET` | | S3 bucket for blob bodies (`dynamodb` with blobs enabled, required). |
+| `RELAY_VALKEY_ADDR` | | Valkey `host:port` for the shared replay cache, rate limits and wake-on-deposit (`dynamodb`, required). |
+| `RELAY_VALKEY_TLS` | `false` | TLS to Valkey (ElastiCache Serverless requires it). |
+| `RELAY_VALKEY_IAM_USER` / `RELAY_VALKEY_CACHE_NAME` | | ElastiCache IAM authentication: user id and cache name for the SigV4 token (needs TLS; no password anywhere). |
+| `RELAY_VALKEY_SERVERLESS` | `true` | The IAM token targets a serverless cache (`false` for a replication group). |
+| `RELAY_VALKEY_PREFIX` | `relay` | Key and channel namespace. Processes serving one relay URL must share it. |
+| `RELAY_EMPTY_HINTS` | `true` | With Valkey: collectors skip the store query for mailboxes known to be empty (see below). |
+| `RELAY_EMPTY_SKIP_MAX` | `5m` | Longest time one "mailbox is empty" finding is trusted: the worst-case delivery delay if a deposit's hint update is lost. |
+| `RELAY_DYNAMODB_ENDPOINT` / `RELAY_S3_ENDPOINT` | | Development and tests only (DynamoDB Local, a fake S3). AWS credentials and region come from the standard SDK chain (`AWS_REGION`, the ECS task role). |
 | `RELAY_TRUST_PROXY` | `false` | `true` means the client IP is the **last** `X-Forwarded-For` hop, which is the one the load balancer (AWS ALB) appends. Earlier hops are client-controlled and ignored. Enable this only behind a proxy that always appends. |
 | `RELAY_METRICS_ADDR` | `127.0.0.1:9090` | Prometheus `/metrics` listener. It must differ from the public address; an empty value disables it. Never expose it publicly. |
 | `RELAY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
@@ -109,14 +126,14 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 
 ## Deployment notes
 
-> **Single writer.** A relay database must be opened by **exactly one**
+> **SQLite: single writer.** A relay database must be opened by **exactly one**
 > relay process. All writes go through one SQLite connection. That is how
 > per-mailbox ULID order equals arrival order and how quotas stay atomic.
 > Never point two instances (or two tasks during a rolling deploy) at the
 > same file, and never put the file on a network filesystem shared by
-> concurrent writers. To scale, run more relays and assign mailboxes to
-> them (spec §1). Configure the container platform to stop the old task
-> before it starts the new one.
+> concurrent writers. Configure the container platform to stop the old task
+> before it starts the new one. To run several processes for one relay URL,
+> use `RELAY_STORE=dynamodb` instead.
 
 - **Graceful shutdown.** On SIGTERM or SIGINT, `/healthz` switches to 503
   and parked long-polls return `{"messages":[]}` immediately. WebSockets are
@@ -150,6 +167,63 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
   error code, sizes, duration and, where relevant, the `msg_id` or
   `blob_id`. Payloads, blob bytes, tokens, signatures, public keys, mailbox
   ids and client IPs are never logged. A test enforces this.
+
+## Multi-process hosting
+
+With `RELAY_STORE=dynamodb` any number of relay processes serve one relay
+URL. Nothing about the protocol changes; what one process accepts, every
+other process sees, refuses or is woken by.
+
+- **State** is one DynamoDB table (on-demand, TTL attribute `ttl_s`, a
+  KEYS_ONLY GSI `due` on `gpk`/`gsk`; `dynamo.CreateTable` is the reference
+  definition). Every operation that SQLite does in one transaction is a
+  DynamoDB transaction or a single conditional write: deposit + quotas +
+  open-token consumption + ULID order; leasing on collect; claim single
+  fetch; rotation. Decisions use strongly consistent reads. Expiry is
+  checked on every read; TTL only reclaims space. A message is one item
+  (the payload as binary), so `RELAY_MAX_PAYLOAD_BYTES` is capped at
+  380,000 with this store.
+- **Blob bodies** are S3 objects `blobs/<mailbox>/<blob id>`; metadata and
+  the storage quota are in DynamoDB. Give the bucket a lifecycle rule that
+  expires objects a day after `RELAY_BLOB_TTL` (deleted or purged blobs are
+  removed directly).
+- **Valkey** holds the replay cache (`SET NX PX`, 91 s), the rate-limit
+  buckets (one GCRA script on Valkey's clock), and wake-on-deposit signals
+  (sharded pub/sub). If Valkey is unreachable, signed requests are shed with
+  `429 rate_limited` (a replay is never admitted unchecked), rate limits
+  fall back to per-process buckets, and parked collectors re-check the
+  store every 5 s. A lost wake signal delays delivery at most until the
+  collector's next re-check; it never loses a message.
+- **Empty hints.** Always-on collectors re-poll every 25 s, so most
+  collects find nothing. Valkey keeps, per mailbox, a deposit version `v`
+  (bumped by every deposit *after* its store commit and *before* its wake
+  signal) and the version `e` at which a real, strongly consistent query
+  last found the mailbox empty, valid until `u`. A collector registers for
+  wake-ups, then skips the store only if `e == v` and `u` has not passed.
+  `e` is written only if `v` did not change across the query, and `u` is at
+  most the moment a leased message can reappear and at most
+  `RELAY_EMPTY_SKIP_MAX` later. So a deposit is never skipped unless its
+  bump was lost after the store commit (process crash, Valkey failover), and
+  then for at most `RELAY_EMPTY_SKIP_MAX`. Any Valkey error, an unsubscribed
+  wake bus, or a forced re-check (resubscribe, Valkey outage) means a real
+  query. A real query that finds messages clears the hint. Metrics:
+  `relay_collect_store_queries_total`, `relay_collect_store_skips_total`,
+  `relay_empty_hint_bump_failures_total`.
+- **Per-process limits.** `RELAY_MAX_COLLECTORS_PER_MAILBOX`,
+  `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` and the replay-cache capacity bound
+  each process's own resources.
+- **Mailbox quotas** are counters updated in the same transaction as the
+  write. Acks, expiry and TTL deletions can leave them high; a failing quota
+  check recomputes them from the items (at most once a minute per
+  mailbox), so the observable limit is the same as with SQLite. Token quotas
+  are exact.
+- **Deploys.** Processes can start and stop at any time. On SIGTERM a
+  process drains as described above; give the load balancer a
+  deregistration delay longer than a long-poll (25 s) so clients move to
+  other processes without errors.
+- **Sweeper.** Each process sweeps; the only work left for it is purging
+  rotated mailboxes 10 minutes after their grace period (the cascade
+  SQLite does with foreign keys). Purges are idempotent.
 
 ## API summary
 
@@ -254,10 +328,11 @@ implementation chooses as follows:
 - **Claim limits.** Empty claim bodies are `bad_request`. Claims count
   toward the creating mailbox's `RELAY_MAILBOX_MAX_BLOB_BYTES`, together
   with blobs deposited to it.
-- **Blob storage.** Blobs are kept in the SQLite file (a separate table
-  behind the `BlobStore` interface) rather than as files on disk, which
-  §6.8 says SHOULD be used. This is deliberate: one file is the entire
-  state for replication.
+- **Blob storage.** With SQLite, blobs are kept in the database file (a
+  separate table behind the `BlobStore` interface) rather than as files on
+  disk, which §6.8 says SHOULD be used. This is deliberate: one file is the
+  entire state for replication. With DynamoDB, blob bodies are S3 objects,
+  outside the message store as §6.8 recommends.
 - **Revoked `jti` and `sub` values** are checked against the token's own
   claims. `sub` values are canonicalised (strict padded base64 of the
   32-byte key).
@@ -271,7 +346,16 @@ make lint          # go vet + staticcheck (pinned, via go run)
 make fuzz          # each fuzz target for FUZZTIME (default 20s)
 make scan          # gitleaks over history
 make image         # docker build
+make test-dynamo   # starts DynamoDB Local + Valkey (memory-capped containers),
+                   # runs the shared-store tests, then removes the containers
 ```
+
+`make test-dynamo` runs the store conformance suite on DynamoDB, the Valkey
+coordination tests, the whole API suite on DynamoDB, and a two-process e2e
+(the relay binary started twice on one table and one Valkey): wake-on-deposit
+across processes for long-poll and WebSocket, one open token raced from both
+processes, one claim fetched concurrently from both, a request replayed to
+the other process, a shared rate limit, and a process stopping mid-test.
 
 Layout:
 
@@ -279,11 +363,13 @@ Layout:
 - `cmd/relayctl`: the CLI client.
 - `internal/api`: handlers, middleware and authorization.
 - `relayauth` (public): mailbox ids, signed requests, replay cache and PASETO v4.public.
-- `internal/store`: SQLite, including blobs.
+- `internal/store`: the `Backend` interface and the SQLite store, including blobs.
+- `internal/store/dynamo`: the DynamoDB + S3 store; `internal/store/storetest`: the conformance suite both stores pass.
+- `internal/coord`: Valkey replay cache, rate limits and wake-on-deposit for multi-process relays.
 - `internal/sweep`: the TTL sweeper.
 - `internal/ratelimit`, `internal/metrics` and `internal/config`.
 - `relayclient` (public): the reference client, imported by vettid-vault. Inject `HTTP` to change transport (e.g. a vsock dialer).
-- `test/e2e`: the two-principal integration test.
+- `test/e2e`: the two-principal integration test, and the two-process test on the shared store.
 
 ## License
 
