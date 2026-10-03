@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.0
 	github.com/coder/websocket v1.8.15
 	github.com/oklog/ulid/v2 v2.1.2
+	github.com/valkey-io/valkey-go v1.0.78
 	modernc.org/sqlite v1.60.1
 )
 
