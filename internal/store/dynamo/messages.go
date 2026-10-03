@@ -283,13 +283,19 @@ func (s *Store) Collect(ctx context.Context, mailbox string, max int, visibility
 	if len(msgs) == 0 && firstErr != nil {
 		return nil, time.Time{}, firstErr
 	}
-	// Messages whose lease we did not win are someone else's for now; a
-	// later Collect sees them (they are not counted in next: the winner's
-	// lease time is unknown here, and a lost race means another collector
-	// is delivering them).
 	sort.Slice(msgs, func(i, j int) bool { return msgs[i].ID < msgs[j].ID })
 	if len(msgs) > 0 {
 		return msgs, time.Time{}, nil
+	}
+	// Candidates whose lease another collector won just now are leased
+	// until about now+visibility (by the winner's clock): report that as
+	// the next possible visibility, so a parked collector — and an empty
+	// hint (api.EmptyHints) — never wait past it.
+	if len(candidates) > 0 {
+		lost := ms(until.Add(time.Second))
+		if next == 0 || lost < next {
+			next = lost
+		}
 	}
 	if next == 0 {
 		return nil, time.Time{}, nil

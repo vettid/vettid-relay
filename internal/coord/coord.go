@@ -101,7 +101,7 @@ func Open(ctx context.Context, cfg Config, reg *metrics.Registry) (*Client, erro
 		return nil, fmt.Errorf("coord: connect %s: %w", cfg.Addr, err)
 	}
 	c := &Client{vk: vk, prefix: cfg.Prefix, errors: reg.CounterVec("relay_coord_errors_total", "Valkey operations that failed, by operation.", "op")}
-	for _, op := range []string{"replay", "ratelimit", "publish", "subscribe", "ping"} {
+	for _, op := range []string{"replay", "ratelimit", "publish", "subscribe", "ping", "hint"} {
 		c.errors.With(op)
 	}
 	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)

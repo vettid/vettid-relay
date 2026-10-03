@@ -43,7 +43,8 @@ type fixture struct {
 	cfg    config.Config
 	clk    *testClock
 	st     store.Backend
-	newSt  func() store.Backend // opens the backend on the fixture's state (again, after restart)
+	newSt  func() store.Backend    // opens the backend on the fixture's state (again, after restart)
+	opts   func(*fixture) []Option // extra server options (built per start)
 	s      *Server
 	ts     *httptest.Server
 	reg    *metrics.Registry
@@ -57,8 +58,19 @@ func newFixture(t *testing.T, mut func(*config.Config)) *fixture {
 	return newFixtureLog(t, mut, io.Discard)
 }
 
+// newFixtureWith is newFixture with extra server options.
+func newFixtureWith(t *testing.T, mut func(*config.Config), opts func(*fixture) []Option) *fixture {
+	t.Helper()
+	return newFixtureFull(t, mut, io.Discard, opts)
+}
+
 // newFixtureLog is newFixture with the relay's JSON logs written to logw.
 func newFixtureLog(t *testing.T, mut func(*config.Config), logw io.Writer) *fixture {
+	t.Helper()
+	return newFixtureFull(t, mut, logw, nil)
+}
+
+func newFixtureFull(t *testing.T, mut func(*config.Config), logw io.Writer, opts func(*fixture) []Option) *fixture {
 	t.Helper()
 	cfg := config.Defaults()
 	cfg.BaseURL = testAud
@@ -70,6 +82,7 @@ func newFixtureLog(t *testing.T, mut func(*config.Config), logw io.Writer) *fixt
 	}
 	clk := &testClock{t: time.Now().UTC().Truncate(time.Second)}
 	f := &fixture{t: t, cfg: cfg, clk: clk, logw: logw, dbPath: filepath.Join(t.TempDir(), "relay.db")}
+	f.opts = opts
 	f.newSt = f.backend()
 	f.start()
 	t.Cleanup(f.stop)
@@ -82,7 +95,11 @@ func (f *fixture) start() {
 	st := f.newSt()
 	f.st = st
 	f.reg = metrics.New()
-	f.s = New(f.cfg, st, slog.New(slog.NewJSONHandler(f.logw, &slog.HandlerOptions{Level: slog.LevelDebug})), f.reg, WithClock(f.clk.now))
+	opts := []Option{WithClock(f.clk.now)}
+	if f.opts != nil {
+		opts = append(opts, f.opts(f)...)
+	}
+	f.s = New(f.cfg, st, slog.New(slog.NewJSONHandler(f.logw, &slog.HandlerOptions{Level: slog.LevelDebug})), f.reg, opts...)
 	f.ts = httptest.NewServer(f.s.Handler())
 }
 

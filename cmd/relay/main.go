@@ -159,6 +159,9 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 			),
 			api.WithWakeBus(bus),
 		)
+		if cfg.EmptyHints {
+			opts = append(opts, api.WithEmptyHints(vc.EmptyHints(bus, cfg.EmptySkipMax, reg)))
+		}
 	}
 
 	srv := api.New(cfg, st, log, reg, opts...)

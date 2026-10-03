@@ -206,7 +206,7 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeInternal))
 		return
 	}
-	s.notifyDeposit(mailboxID) // wake-on-deposit (§6.2), here and on other relay processes
+	s.notifyDeposit(r.Context(), mailboxID) // wake-on-deposit (§6.2), here and on other relay processes
 	s.m.deposits.Inc()
 	s.m.depositBytes.Add(int64(len(payload)))
 	setLog(w, "msg_id", msg.ID)
@@ -302,9 +302,12 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 			s.m.parked.Dec()
 		}
 	}()
+	gen := s.forceGen.Load()
 	for {
 		wake := s.hub.wait(mb.ID) // before leasing: no lost wakeups
-		msgs, next, err := s.st.Collect(r.Context(), mb.ID, max, s.cfg.VisibilityTimeout)
+		g := s.forceGen.Load()
+		msgs, next, err := s.collectOnce(r.Context(), mb.ID, max, g != gen)
+		gen = g
 		if err != nil {
 			if r.Context().Err() != nil {
 				return

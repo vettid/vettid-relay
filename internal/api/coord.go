@@ -1,7 +1,10 @@
 package api
 
 import (
+	"context"
 	"time"
+
+	"github.com/vettid/vettid-relay/internal/store"
 
 	auth "github.com/vettid/vettid-relay/relayauth"
 )
@@ -35,6 +38,22 @@ type WakeBus interface {
 	Publish(mailbox string)
 }
 
+// EmptyHints lets collectors skip the store query for mailboxes known to be
+// empty (internal/coord.EmptyHints documents the invariant). The API keeps
+// its side of the contract: Bump after every committed deposit and before
+// its wake signal; register for wake-ups before Check; MarkEmpty only with
+// the version Check returned before the store query; force a real query
+// after any WakeAll.
+type EmptyHints interface {
+	Bump(ctx context.Context, mailbox string) error
+	Check(ctx context.Context, mailbox string) (version string, emptyFor time.Duration, err error)
+	MarkEmpty(ctx context.Context, mailbox, version string, validFor time.Duration)
+	Clear(ctx context.Context, mailbox string)
+}
+
+// WithEmptyHints enables skipping store queries for known-empty mailboxes.
+func WithEmptyHints(h EmptyHints) Option { return func(s *Server) { s.hints = h } }
+
 // WithReplayGuard replaces the in-memory replay cache.
 func WithReplayGuard(g ReplayGuard) Option { return func(s *Server) { s.replay = g } }
 
@@ -65,12 +84,55 @@ func (s *Server) Wake(mailbox string) { s.hub.notify(mailbox) }
 // WakeAll wakes every collector parked in this process so each re-checks the
 // store. Called when cross-process signals may have been missed (the bus
 // reconnected) and periodically while the bus is down.
-func (s *Server) WakeAll() { s.hub.notifyAll() }
+func (s *Server) WakeAll() {
+	s.forceGen.Add(1) // every woken collector queries the store for real
+	s.hub.notifyAll()
+}
 
-// notifyDeposit wakes local collectors immediately and tells other processes.
-func (s *Server) notifyDeposit(mailbox string) {
+// notifyDeposit records a committed deposit for the empty hints, then wakes
+// local collectors immediately and tells other processes (in that order: a
+// woken collector must see the new version).
+func (s *Server) notifyDeposit(ctx context.Context, mailbox string) {
+	if s.hints != nil {
+		if err := s.hints.Bump(context.WithoutCancel(ctx), mailbox); err != nil {
+			s.log.Warn("empty-hint bump failed; collectors may skip this deposit until their hint expires", "err", err)
+		}
+	}
 	s.hub.notify(mailbox)
 	if s.bus != nil {
 		s.bus.Publish(mailbox)
 	}
+}
+
+// collectOnce is one collect attempt for a registered collector (it must
+// have obtained its hub wait channel first). Unless force is set, a mailbox
+// the hints know to be empty is not queried: it returns no messages and the
+// time at which the hint expires, so the caller re-checks then. Otherwise it
+// queries the store and updates the hint.
+func (s *Server) collectOnce(ctx context.Context, mailbox string, max int, force bool) ([]store.Message, time.Time, error) {
+	version, haveVersion := "", false
+	if s.hints != nil {
+		v, emptyFor, err := s.hints.Check(ctx, mailbox)
+		if err == nil {
+			if emptyFor > 0 && !force {
+				s.m.storeSkips.Inc()
+				return nil, s.now().Add(emptyFor), nil
+			}
+			version, haveVersion = v, true
+		}
+	}
+	s.m.storeQueries.Inc()
+	msgs, next, err := s.st.Collect(ctx, mailbox, max, s.cfg.VisibilityTimeout)
+	if err != nil || !haveVersion {
+		return msgs, next, err
+	}
+	switch {
+	case len(msgs) > 0:
+		s.hints.Clear(ctx, mailbox)
+	case next.IsZero():
+		s.hints.MarkEmpty(ctx, mailbox, version, s.cfg.EmptySkipMax)
+	default: // trust the finding only until a leased message can reappear
+		s.hints.MarkEmpty(ctx, mailbox, version, next.Sub(s.now()))
+	}
+	return msgs, next, nil
 }

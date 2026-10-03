@@ -14,11 +14,14 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -71,9 +74,10 @@ func freePort(t *testing.T) string {
 }
 
 type proc struct {
-	url string
-	cmd *exec.Cmd
-	out *bytes.Buffer
+	url     string
+	metrics string
+	cmd     *exec.Cmd
+	out     *bytes.Buffer
 }
 
 // cluster is a shared backend for N relay processes.
@@ -106,15 +110,15 @@ func newCluster(t *testing.T, extra ...string) *cluster {
 
 func (c *cluster) start() *proc {
 	t := c.t
-	addr := freePort(t)
+	addr, maddr := freePort(t), freePort(t)
 	cmd := exec.Command(relayBinary(t))
-	cmd.Env = append(append([]string{}, c.env...), "RELAY_LISTEN_ADDR="+addr, "RELAY_METRICS_ADDR="+freePort(t))
+	cmd.Env = append(append([]string{}, c.env...), "RELAY_LISTEN_ADDR="+addr, "RELAY_METRICS_ADDR="+maddr)
 	out := &bytes.Buffer{}
 	cmd.Stdout, cmd.Stderr = out, out
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	p := &proc{url: "http://" + addr, cmd: cmd, out: out}
+	p := &proc{url: "http://" + addr, metrics: "http://" + maddr + "/metrics", cmd: cmd, out: out}
 	t.Cleanup(func() { p.stop() })
 	deadline := time.Now().Add(15 * time.Second)
 	for {
@@ -363,6 +367,44 @@ func TestMultiProcess(t *testing.T) {
 		vault.Ack(ctx, m[0].MsgID)
 	})
 
+	t.Run("empty hints: idle polls skip the store, deposits are still delivered", func(t *testing.T) {
+		vb := as(vault, b.url)
+		q0, s0 := metric(t, b, "relay_collect_store_queries_total"), metric(t, b, "relay_collect_store_skips_total")
+		for i := 0; i < 6; i++ {
+			if m, err := vb.Collect(ctx, 0, 10); err != nil || len(m) != 0 {
+				t.Fatalf("%+v %v", m, err)
+			}
+		}
+		q1, s1 := metric(t, b, "relay_collect_store_queries_total"), metric(t, b, "relay_collect_store_skips_total")
+		if s1-s0 < 5 || q1-q0 > 1 {
+			t.Fatalf("6 idle polls: %d queries, %d skips", q1-q0, s1-s0)
+		}
+		// A deposit on A is found by the next poll on B (version bump), and
+		// a long-poll parked on B in skip mode is woken by one.
+		id, err := as(app, a.url).Deposit(ctx, vault.MailboxID(), tok, []byte("after idle"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m, err := vb.Collect(ctx, 0, 10); err != nil || len(m) != 1 || m[0].MsgID != id {
+			t.Fatalf("%+v %v", m, err)
+		}
+		vb.Ack(ctx, id)
+		vb.Collect(ctx, 0, 10) // empty finding again
+		got := make(chan []client.Message, 1)
+		go func() { m, _ := vb.Collect(ctx, 20*time.Second, 10); got <- m }()
+		time.Sleep(300 * time.Millisecond)
+		id, _ = as(app, a.url).Deposit(ctx, vault.MailboxID(), tok, []byte("parked"))
+		select {
+		case m := <-got:
+			if len(m) != 1 || m[0].MsgID != id {
+				t.Fatalf("%+v", m)
+			}
+			vb.Ack(ctx, id)
+		case <-time.After(5 * time.Second):
+			t.Fatal("skipping long-poll on B not woken by a deposit on A")
+		}
+	})
+
 	t.Run("a process stops: the other serves everything", func(t *testing.T) {
 		id, err := as(app, a.url).Deposit(ctx, vault.MailboxID(), tok, []byte("before"))
 		if err != nil {
@@ -420,6 +462,24 @@ func TestMultiProcessRateLimitShared(t *testing.T) {
 	if retryAfter < 1 {
 		t.Fatalf("retry_after %d", retryAfter)
 	}
+}
+
+// metric reads one counter from a process's /metrics.
+func metric(t *testing.T, p *proc, name string) int64 {
+	resp, err := http.Get(p.metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, name+" "); ok {
+			n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			return n
+		}
+	}
+	t.Fatalf("metric %s not found", name)
+	return 0
 }
 
 func asErr(err error, e **client.Error) bool {

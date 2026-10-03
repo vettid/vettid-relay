@@ -45,6 +45,8 @@ type Server struct {
 
 	hub       *hub
 	bus       WakeBus       // cross-process wake-on-deposit (nil: single process)
+	hints     EmptyHints    // known-empty mailboxes (nil: always query)
+	forceGen  atomic.Uint64 // bumped by WakeAll: collectors then query for real
 	blobSlots chan struct{} // bounds concurrent blob transfers
 	mux       *http.ServeMux
 }
@@ -68,6 +70,8 @@ type serverMetrics struct {
 	blobDeletes   metrics.Counter
 	claimPuts     metrics.Counter
 	claimGets     metrics.Counter
+	storeQueries  metrics.Counter
+	storeSkips    metrics.Counter
 }
 
 func newServerMetrics(reg *metrics.Registry) *serverMetrics {
@@ -91,6 +95,8 @@ func newServerMetrics(reg *metrics.Registry) *serverMetrics {
 		blobDeletes:   reg.Counter("relay_blob_deletes_total", "Blob delete requests."),
 		claimPuts:     reg.Counter("relay_claim_puts_total", "Claims created."),
 		claimGets:     reg.Counter("relay_claim_fetches_total", "Claims fetched (and thereby deleted)."),
+		storeQueries:  reg.Counter("relay_collect_store_queries_total", "Collect attempts that queried the store."),
+		storeSkips:    reg.Counter("relay_collect_store_skips_total", "Collect attempts that skipped the store: mailbox known empty (empty hints)."),
 	}
 	for _, c := range allCodes {
 		m.errors.With(c) // pre-create every series so rates start at 0

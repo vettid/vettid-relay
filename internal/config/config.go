@@ -73,6 +73,12 @@ type Config struct {
 
 	SweepInterval   time.Duration // RELAY_SWEEP_INTERVAL
 	ShutdownTimeout time.Duration // RELAY_SHUTDOWN_TIMEOUT
+
+	// Empty hints (with Valkey): collectors skip the store query for
+	// mailboxes known to be empty, trusting one empty finding at most this
+	// long (the worst-case delay if a deposit's hint update is lost).
+	EmptyHints   bool          // RELAY_EMPTY_HINTS
+	EmptySkipMax time.Duration // RELAY_EMPTY_SKIP_MAX
 }
 
 // MaxDynamoPayloadBytes bounds max_payload_bytes for the DynamoDB store: a
@@ -126,6 +132,9 @@ func Defaults() Config {
 
 		SweepInterval:   60 * time.Second,
 		ShutdownTimeout: 20 * time.Second,
+
+		EmptyHints:   true,
+		EmptySkipMax: 5 * time.Minute,
 	}
 }
 
@@ -244,6 +253,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 
 	dur("RELAY_SWEEP_INTERVAL", &c.SweepInterval)
 	dur("RELAY_SHUTDOWN_TIMEOUT", &c.ShutdownTimeout)
+	boolean("RELAY_EMPTY_HINTS", &c.EmptyHints)
+	dur("RELAY_EMPTY_SKIP_MAX", &c.EmptySkipMax)
 
 	if err := c.Validate(); err != nil {
 		errs = append(errs, err)

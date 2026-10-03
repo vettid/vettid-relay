@@ -94,6 +94,8 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_VALKEY_IAM_USER` / `RELAY_VALKEY_CACHE_NAME` | | ElastiCache IAM authentication: user id and cache name for the SigV4 token (needs TLS; no password anywhere). |
 | `RELAY_VALKEY_SERVERLESS` | `true` | The IAM token targets a serverless cache (`false` for a replication group). |
 | `RELAY_VALKEY_PREFIX` | `relay` | Key and channel namespace. Processes serving one relay URL must share it. |
+| `RELAY_EMPTY_HINTS` | `true` | With Valkey: collectors skip the store query for mailboxes known to be empty (see below). |
+| `RELAY_EMPTY_SKIP_MAX` | `5m` | Longest time one "mailbox is empty" finding is trusted: the worst-case delivery delay if a deposit's hint update is lost. |
 | `RELAY_DYNAMODB_ENDPOINT` / `RELAY_S3_ENDPOINT` | | Development and tests only (DynamoDB Local, a fake S3). AWS credentials and region come from the standard SDK chain (`AWS_REGION`, the ECS task role). |
 | `RELAY_TRUST_PROXY` | `false` | `true` means the client IP is the **last** `X-Forwarded-For` hop, which is the one the load balancer (AWS ALB) appends. Earlier hops are client-controlled and ignored. Enable this only behind a proxy that always appends. |
 | `RELAY_METRICS_ADDR` | `127.0.0.1:9090` | Prometheus `/metrics` listener. It must differ from the public address; an empty value disables it. Never expose it publicly. |
@@ -192,6 +194,21 @@ other process sees, refuses or is woken by.
   fall back to per-process buckets, and parked collectors re-check the
   store every 5 s. A lost wake signal delays delivery at most until the
   collector's next re-check; it never loses a message.
+- **Empty hints.** Always-on collectors re-poll every 25 s, so most
+  collects find nothing. Valkey keeps, per mailbox, a deposit version `v`
+  (bumped by every deposit *after* its store commit and *before* its wake
+  signal) and the version `e` at which a real, strongly consistent query
+  last found the mailbox empty, valid until `u`. A collector registers for
+  wake-ups, then skips the store only if `e == v` and `u` has not passed.
+  `e` is written only if `v` did not change across the query, and `u` is at
+  most the moment a leased message can reappear and at most
+  `RELAY_EMPTY_SKIP_MAX` later. So a deposit is never skipped unless its
+  bump was lost after the store commit (process crash, Valkey failover), and
+  then for at most `RELAY_EMPTY_SKIP_MAX`. Any Valkey error, an unsubscribed
+  wake bus, or a forced re-check (resubscribe, Valkey outage) means a real
+  query. A real query that finds messages clears the hint. Metrics:
+  `relay_collect_store_queries_total`, `relay_collect_store_skips_total`,
+  `relay_empty_hint_bump_failures_total`.
 - **Per-process limits.** `RELAY_MAX_COLLECTORS_PER_MAILBOX`,
   `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` and the replay-cache capacity bound
   each process's own resources.

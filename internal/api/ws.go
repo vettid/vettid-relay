@@ -97,9 +97,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ping := time.NewTicker(wsPingInterval)
 	defer ping.Stop()
+	gen := s.forceGen.Load()
 	for {
 		wake := s.hub.wait(mb.ID) // before leasing: no lost wakeups
-		msgs, next, err := s.st.Collect(ctx, mb.ID, wsBatch, s.cfg.VisibilityTimeout)
+		g := s.forceGen.Load()
+		msgs, next, err := s.collectOnce(ctx, mb.ID, wsBatch, g != gen)
+		gen = g
 		if err != nil {
 			if ctx.Err() == nil {
 				s.log.Error("ws lease failed", "err", err)

@@ -170,3 +170,54 @@ func TestWakeAcrossProcesses(t *testing.T) {
 		t.Fatal("subscription must trigger a WakeAll re-check")
 	}
 }
+
+func TestEmptyHintsVersioning(t *testing.T) {
+	c := open(t, 2)
+	a, b := c[0].EmptyHints(nil, time.Minute, metrics.New()), c[1].EmptyHints(nil, time.Minute, metrics.New())
+	ctx := context.Background()
+	v, left, err := a.Check(ctx, "mbx")
+	if err != nil || left != 0 || v != "0" {
+		t.Fatalf("fresh: %q %v %v", v, left, err)
+	}
+	// A deposit (on another process) bumps between the check and the mark:
+	// the stale finding is refused.
+	if err := b.Bump(ctx, "mbx"); err != nil {
+		t.Fatal(err)
+	}
+	a.MarkEmpty(ctx, "mbx", v, time.Minute)
+	if _, left, _ := b.Check(ctx, "mbx"); left != 0 {
+		t.Fatal("a finding older than a deposit must not be trusted")
+	}
+	// Check → mark with the current version: trusted, on every process.
+	v, _, _ = a.Check(ctx, "mbx")
+	a.MarkEmpty(ctx, "mbx", v, time.Minute)
+	if _, left, _ := b.Check(ctx, "mbx"); left <= 50*time.Second {
+		t.Fatalf("trusted for %v", left)
+	}
+	// A deposit invalidates it; Clear does too.
+	b.Bump(ctx, "mbx")
+	if _, left, _ := a.Check(ctx, "mbx"); left != 0 {
+		t.Fatal("bump must invalidate")
+	}
+	v, _, _ = a.Check(ctx, "mbx")
+	a.MarkEmpty(ctx, "mbx", v, time.Minute)
+	a.Clear(ctx, "mbx")
+	if _, left, _ := a.Check(ctx, "mbx"); left != 0 {
+		t.Fatal("clear must invalidate")
+	}
+	// Validity is capped by MaxSkip and expires.
+	v, _, _ = a.Check(ctx, "mbx")
+	a.MarkEmpty(ctx, "mbx", v, 300*time.Millisecond)
+	if _, left, _ := a.Check(ctx, "mbx"); left <= 0 || left > 300*time.Millisecond {
+		t.Fatalf("left %v", left)
+	}
+	time.Sleep(350 * time.Millisecond)
+	if _, left, _ := a.Check(ctx, "mbx"); left != 0 {
+		t.Fatal("expired finding still trusted")
+	}
+	// Valkey unreachable: errors, never a skip.
+	c[0].Close()
+	if _, left, err := a.Check(ctx, "mbx"); err == nil || left != 0 {
+		t.Fatalf("down: %v %v", left, err)
+	}
+}
