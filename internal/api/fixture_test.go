@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,9 @@ import (
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/store"
+	"github.com/vettid/vettid-relay/internal/store/dynamo"
+	"github.com/vettid/vettid-relay/internal/testutil/ddblocal"
+	"github.com/vettid/vettid-relay/internal/testutil/fakes3"
 	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
@@ -38,7 +42,8 @@ type fixture struct {
 	t      *testing.T
 	cfg    config.Config
 	clk    *testClock
-	st     *store.Store
+	st     store.Backend
+	newSt  func() store.Backend // opens the backend on the fixture's state (again, after restart)
 	s      *Server
 	ts     *httptest.Server
 	reg    *metrics.Registry
@@ -65,6 +70,7 @@ func newFixtureLog(t *testing.T, mut func(*config.Config), logw io.Writer) *fixt
 	}
 	clk := &testClock{t: time.Now().UTC().Truncate(time.Second)}
 	f := &fixture{t: t, cfg: cfg, clk: clk, logw: logw, dbPath: filepath.Join(t.TempDir(), "relay.db")}
+	f.newSt = f.backend()
 	f.start()
 	t.Cleanup(f.stop)
 	return f
@@ -73,10 +79,7 @@ func newFixtureLog(t *testing.T, mut func(*config.Config), logw io.Writer) *fixt
 // start opens the store and serves a fresh relay instance on f.dbPath.
 func (f *fixture) start() {
 	f.t.Helper()
-	st, err := store.Open(context.Background(), f.dbPath, store.WithClock(f.clk.now))
-	if err != nil {
-		f.t.Fatal(err)
-	}
+	st := f.newSt()
 	f.st = st
 	f.reg = metrics.New()
 	f.s = New(f.cfg, st, slog.New(slog.NewJSONHandler(f.logw, &slog.HandlerOptions{Level: slog.LevelDebug})), f.reg, WithClock(f.clk.now))
@@ -95,6 +98,32 @@ func (f *fixture) stop() {
 	f.s.Close()
 	f.st.Close()
 	f.s = nil
+}
+
+// backend selects the store under test: SQLite on f.dbPath by default, or
+// with RELAY_TEST_API_STORE=dynamodb a DynamoDB table (DynamoDB Local) and a
+// fake S3 bucket, so the whole API suite — error table included — also runs
+// on the multi-process backend. A restart opens a new Store on the same
+// table, like a new relay process.
+func (f *fixture) backend() func() store.Backend {
+	if os.Getenv("RELAY_TEST_API_STORE") != "dynamodb" {
+		return func() store.Backend {
+			st, err := store.Open(context.Background(), f.dbPath, store.WithClock(f.clk.now))
+			if err != nil {
+				f.t.Fatal(err)
+			}
+			return st
+		}
+	}
+	db := ddblocal.Client(f.t)
+	table, s3 := ddblocal.Table(f.t, db), fakes3.New(f.t)
+	return func() store.Backend {
+		st, err := dynamo.New(dynamo.Config{Table: table, Bucket: "blobs", DB: db, S3: s3.Client(), Now: f.clk.now})
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		return st
+	}
 }
 
 // restart simulates a process restart on the same database file (in-memory

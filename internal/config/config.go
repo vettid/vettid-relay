@@ -20,9 +20,25 @@ type Config struct {
 	ListenAddr  string // RELAY_LISTEN_ADDR
 	MetricsAddr string // RELAY_METRICS_ADDR ("" disables)
 	BaseURL     string // RELAY_BASE_URL — exact-match `aud` for deposit tokens
-	DBPath      string // RELAY_DB_PATH
-	TrustProxy  bool   // RELAY_TRUST_PROXY
-	LogLevel    string // RELAY_LOG_LEVEL
+	DBPath      string // RELAY_DB_PATH (store "sqlite")
+	Store       string // RELAY_STORE: "sqlite" (default) or "dynamodb"
+
+	// Store "dynamodb" (several relay processes on one shared store).
+	DynamoTable    string // RELAY_DYNAMODB_TABLE
+	BlobBucket     string // RELAY_BLOB_BUCKET (blob bodies, when blobs are enabled)
+	DynamoEndpoint string // RELAY_DYNAMODB_ENDPOINT (development/tests only)
+	S3Endpoint     string // RELAY_S3_ENDPOINT (development/tests only; path-style)
+
+	// Valkey: shared replay cache, rate limits and wake-on-deposit.
+	// Required with store "dynamodb".
+	ValkeyAddr       string // RELAY_VALKEY_ADDR (host:port)
+	ValkeyTLS        bool   // RELAY_VALKEY_TLS
+	ValkeyIAMUser    string // RELAY_VALKEY_IAM_USER (ElastiCache IAM auth)
+	ValkeyCacheName  string // RELAY_VALKEY_CACHE_NAME (for the IAM token)
+	ValkeyServerless bool   // RELAY_VALKEY_SERVERLESS (IAM token resource type)
+	ValkeyPrefix     string // RELAY_VALKEY_PREFIX (key/channel namespace; relays sharing it share state)
+	TrustProxy       bool   // RELAY_TRUST_PROXY
+	LogLevel         string // RELAY_LOG_LEVEL
 
 	MaxPayloadBytes   int64         // RELAY_MAX_PAYLOAD_BYTES
 	MessageTTL        time.Duration // RELAY_MESSAGE_TTL
@@ -59,6 +75,11 @@ type Config struct {
 	ShutdownTimeout time.Duration // RELAY_SHUTDOWN_TIMEOUT
 }
 
+// MaxDynamoPayloadBytes bounds max_payload_bytes for the DynamoDB store: a
+// message item must stay under DynamoDB's 400 KB item limit with room for
+// its keys and attributes. The protocol default (262,144) fits easily.
+const MaxDynamoPayloadBytes = 380_000
+
 // Defaults returns the documented default configuration.
 func Defaults() Config {
 	return Config{
@@ -66,7 +87,11 @@ func Defaults() Config {
 		MetricsAddr: "127.0.0.1:9090",
 		BaseURL:     "http://localhost:8080",
 		DBPath:      "relay.db",
-		LogLevel:    "info",
+		Store:       "sqlite",
+
+		ValkeyServerless: true,
+		ValkeyPrefix:     "relay",
+		LogLevel:         "info",
 
 		MaxPayloadBytes:   262144,
 		MessageTTL:        14 * 24 * time.Hour,
@@ -173,6 +198,17 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	str("RELAY_METRICS_ADDR", &c.MetricsAddr)
 	str("RELAY_BASE_URL", &c.BaseURL)
 	str("RELAY_DB_PATH", &c.DBPath)
+	str("RELAY_STORE", &c.Store)
+	str("RELAY_DYNAMODB_TABLE", &c.DynamoTable)
+	str("RELAY_BLOB_BUCKET", &c.BlobBucket)
+	str("RELAY_DYNAMODB_ENDPOINT", &c.DynamoEndpoint)
+	str("RELAY_S3_ENDPOINT", &c.S3Endpoint)
+	str("RELAY_VALKEY_ADDR", &c.ValkeyAddr)
+	boolean("RELAY_VALKEY_TLS", &c.ValkeyTLS)
+	str("RELAY_VALKEY_IAM_USER", &c.ValkeyIAMUser)
+	str("RELAY_VALKEY_CACHE_NAME", &c.ValkeyCacheName)
+	boolean("RELAY_VALKEY_SERVERLESS", &c.ValkeyServerless)
+	str("RELAY_VALKEY_PREFIX", &c.ValkeyPrefix)
 	boolean("RELAY_TRUST_PROXY", &c.TrustProxy)
 	str("RELAY_LOG_LEVEL", &c.LogLevel)
 
@@ -221,8 +257,32 @@ func (c Config) Validate() error {
 	if c.ListenAddr == "" {
 		errs = append(errs, errors.New("RELAY_LISTEN_ADDR must not be empty"))
 	}
-	if c.DBPath == "" {
-		errs = append(errs, errors.New("RELAY_DB_PATH must not be empty"))
+	switch c.Store {
+	case "sqlite":
+		if c.DBPath == "" {
+			errs = append(errs, errors.New("RELAY_DB_PATH must not be empty"))
+		}
+	case "dynamodb":
+		if c.DynamoTable == "" {
+			errs = append(errs, errors.New("RELAY_DYNAMODB_TABLE is required with RELAY_STORE=dynamodb"))
+		}
+		if c.BlobsEnabled && c.BlobBucket == "" {
+			errs = append(errs, errors.New("RELAY_BLOB_BUCKET is required with RELAY_STORE=dynamodb when blobs are enabled"))
+		}
+		// Several processes share the store, so they must share replay
+		// detection, rate limits and wake-ups too.
+		if c.ValkeyAddr == "" {
+			errs = append(errs, errors.New("RELAY_VALKEY_ADDR is required with RELAY_STORE=dynamodb"))
+		}
+		// A message is one DynamoDB item (400 KB limit, ~1 KB attributes).
+		if c.MaxPayloadBytes > MaxDynamoPayloadBytes {
+			errs = append(errs, fmt.Errorf("RELAY_MAX_PAYLOAD_BYTES must be ≤ %d with RELAY_STORE=dynamodb", MaxDynamoPayloadBytes))
+		}
+	default:
+		errs = append(errs, errors.New(`RELAY_STORE must be "sqlite" or "dynamodb"`))
+	}
+	if c.ValkeyIAMUser != "" && (c.ValkeyCacheName == "" || !c.ValkeyTLS) {
+		errs = append(errs, errors.New("RELAY_VALKEY_IAM_USER needs RELAY_VALKEY_CACHE_NAME and RELAY_VALKEY_TLS=true"))
 	}
 	u, err := url.Parse(c.BaseURL)
 	switch {

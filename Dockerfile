@@ -18,7 +18,8 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
 COPY --from=build /out/relay /relay
-# /data is where the single SQLite file lives; mount persistent storage here.
+# /data is where the single SQLite file lives (RELAY_STORE=sqlite); mount
+# persistent storage here. Unused with RELAY_STORE=dynamodb.
 COPY --from=build --chown=65532:65532 /out/data /data
 USER 65532:65532
 ENV RELAY_LISTEN_ADDR=:8080 \

@@ -25,8 +25,8 @@ import (
 
 	"github.com/vettid/vettid-relay/internal/api"
 	"github.com/vettid/vettid-relay/internal/config"
+	"github.com/vettid/vettid-relay/internal/coord"
 	"github.com/vettid/vettid-relay/internal/metrics"
-	"github.com/vettid/vettid-relay/internal/store"
 	"github.com/vettid/vettid-relay/internal/sweep"
 )
 
@@ -124,26 +124,49 @@ func newLogger(level string) *slog.Logger {
 // closed once both listeners are accepting.
 func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- struct{}) error {
 
-	// Opening creates the database file in WAL mode before we listen, so the
-	// file exists by the time /healthz first returns 200 (a Litestream
-	// sidecar waits for that).
+	reg := metrics.New()
 	openCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	st, err := store.Open(openCtx, cfg.DBPath)
-	cancel()
+	defer cancel()
+	st, err := openStore(openCtx, cfg)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return fmt.Errorf("open store: %w", err)
 	}
 	defer func() {
 		if err := st.Close(); err != nil {
-			log.Error("close database", "err", err)
+			log.Error("close store", "err", err)
 		} else {
-			log.Info("database closed")
+			log.Info("store closed")
 		}
 	}()
 
-	reg := metrics.New()
-	srv := api.New(cfg, st, log, reg)
+	// Several relay processes on one shared store also share replay
+	// detection, rate limits and wake-on-deposit (internal/coord).
+	var opts []api.Option
+	var bus *coord.WakeBus
+	if cfg.ValkeyAddr != "" {
+		vc, err := openCoord(openCtx, cfg, reg)
+		if err != nil {
+			return err
+		}
+		defer vc.Close()
+		bus = vc.NewWakeBus(reg)
+		opts = append(opts,
+			api.WithReplayGuard(vc.ReplayGuard()),
+			api.WithRateLimiters(
+				vc.Limiter("ip", cfg.RateIPPerSec, cfg.RateIPBurst),
+				vc.Limiter("sender", cfg.RateSenderPerSec, cfg.RateSenderBurst),
+				vc.Limiter("claim", cfg.RateClaimPerSec, cfg.RateClaimBurst),
+			),
+			api.WithWakeBus(bus),
+		)
+	}
+
+	srv := api.New(cfg, st, log, reg, opts...)
 	defer srv.Close()
+	if bus != nil {
+		bus.Start(openCtx, srv)
+		defer bus.Stop()
+	}
 
 	sweepCtx, stopSweep := context.WithCancel(context.Background())
 	sweepDone := make(chan struct{})
@@ -182,7 +205,8 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 		close(ready)
 	}
 	log.Info("relay started", "listen", cfg.ListenAddr, "metrics", cfg.MetricsAddr,
-		"base_url", cfg.BaseURL, "trust_proxy", cfg.TrustProxy, "db", cfg.DBPath, "version", buildVersion())
+		"base_url", cfg.BaseURL, "trust_proxy", cfg.TrustProxy, "store", cfg.Store, "shared_coordination", cfg.ValkeyAddr != "",
+		"version", buildVersion())
 
 	var runErr error
 	select {
@@ -195,8 +219,8 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 	}
 
 	// Bounded drain: long-polls and WebSockets end first, then in-flight
-	// requests finish, then background work stops, then the DB closes
-	// (deferred above, after srv.Close).
+	// requests finish, then background work stops (wake bus, janitors),
+	// then the store closes (deferred above).
 	sctx, scancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer scancel()
 	if err := srv.Drain(sctx); err != nil {
