@@ -91,9 +91,11 @@ type Config struct {
 	Now func() time.Time // default time.Now
 
 	// MailboxCacheTTL caches live, un-rotated mailboxes (id → pubkey) in
-	// process. Pubkeys never change for an id, so the only staleness is a
-	// rotation's deletion time, which is always at least the rotation grace
-	// period away. Default 30 s; negative disables.
+	// process; every deposit and every owner request (each long-poll) looks
+	// its mailbox up. Pubkeys never change for an id, so the only staleness
+	// is a rotation's deletion time, which is a whole rotation grace period
+	// away: keep this well below the grace. Default 5 min; negative
+	// disables.
 	MailboxCacheTTL time.Duration
 	// PurgeDelay is how long after a rotated mailbox's deletion time Sweep
 	// purges it, so no request that passed the liveness check just before
@@ -133,7 +135,7 @@ func New(cfg Config) (*Store, error) {
 		cfg.Now = time.Now
 	}
 	if cfg.MailboxCacheTTL == 0 {
-		cfg.MailboxCacheTTL = 30 * time.Second
+		cfg.MailboxCacheTTL = 5 * time.Minute
 	}
 	if cfg.PurgeDelay == 0 {
 		cfg.PurgeDelay = 10 * time.Minute

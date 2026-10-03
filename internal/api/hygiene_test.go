@@ -94,3 +94,31 @@ func TestMetricsExposition(t *testing.T) {
 		t.Error("metrics leak mailbox ids")
 	}
 }
+
+// Long-polls that end empty (most traffic with always-on collectors) log at
+// debug; a collect that delivers logs at info.
+func TestEmptyCollectLogsAtDebug(t *testing.T) {
+	var logs syncBuf
+	f := newFixtureLog(t, nil, &logs)
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	f.collect(owner, "")
+	f.mustDeposit(owner, sender, f.mint(owner, sender, nil), []byte("x"))
+	f.collect(owner, "")
+	var levels []string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, `"route":"GET /v1/mailbox"`) {
+			switch {
+			case strings.Contains(line, `"level":"DEBUG"`) && strings.Contains(line, `"count":0`):
+				levels = append(levels, "debug-empty")
+			case strings.Contains(line, `"level":"INFO"`) && strings.Contains(line, `"count":1`):
+				levels = append(levels, "info-delivered")
+			default:
+				levels = append(levels, line)
+			}
+		}
+	}
+	if strings.Join(levels, ",") != "debug-empty,info-delivered" {
+		t.Fatalf("collect log levels: %v", levels)
+	}
+}

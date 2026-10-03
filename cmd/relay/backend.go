@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -42,7 +43,11 @@ func openStore(ctx context.Context, cfg config.Config) (store.Backend, error) {
 			}
 		})
 	}
-	st, err := dynamo.New(dynamo.Config{Table: cfg.DynamoTable, Bucket: cfg.BlobBucket, DB: db, S3: objects})
+	st, err := dynamo.New(dynamo.Config{
+		Table: cfg.DynamoTable, Bucket: cfg.BlobBucket, DB: db, S3: objects,
+		// A rotated-away mailbox must stop resolving when its grace ends.
+		MailboxCacheTTL: min(5*time.Minute, cfg.RotationGrace/2),
+	})
 	if err != nil {
 		return nil, err
 	}
