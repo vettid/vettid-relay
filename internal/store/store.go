@@ -337,6 +337,11 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 	now := s.now()
 	size := int64(len(payload))
 
+	// The mailbox may have passed its rotation deadline since the caller
+	// looked it up.
+	if _, err := s.mailbox(ctx, tx, mailbox, false); err != nil {
+		return Message{}, err
+	}
 	if lim.ConsumeJTI {
 		res, err := tx.ExecContext(ctx,
 			`INSERT INTO consumed_tokens(mailbox_id, jti, expires_at) VALUES(?,?,?)

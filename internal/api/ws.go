@@ -99,7 +99,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer ping.Stop()
 	for {
 		wake := s.hub.wait(mb.ID) // before leasing: no lost wakeups
-		msgs, err := s.st.Lease(ctx, mb.ID, wsBatch, s.cfg.VisibilityTimeout)
+		msgs, next, err := s.st.Collect(ctx, mb.ID, wsBatch, s.cfg.VisibilityTimeout)
 		if err != nil {
 			if ctx.Err() == nil {
 				s.log.Error("ws lease failed", "err", err)
@@ -117,12 +117,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			s.m.collected.Inc()
 		}
-		if len(msgs) == wsBatch {
-			continue // more may be waiting
+		if len(msgs) > 0 {
+			continue // more may be waiting; an empty Collect parks below
 		}
 		var leaseC <-chan time.Time
 		var leaseT *time.Timer
-		if next, ok, err := s.st.NextLeaseExpiry(ctx, mb.ID); err == nil && ok {
+		if !next.IsZero() {
 			leaseT = time.NewTimer(max0(next.Sub(s.now())) + 5*time.Millisecond)
 			leaseC = leaseT.C
 		}
@@ -130,7 +130,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-wake:
 		case <-leaseC:
-		case <-ping.C:
+		case <-ping.C: // also re-checks the store (covers a lost cross-process wake)
 			pctx, pcancel := context.WithTimeout(ctx, wsWriteTimeout)
 			err := conn.Ping(pctx)
 			pcancel()

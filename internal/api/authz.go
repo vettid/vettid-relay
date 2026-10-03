@@ -131,7 +131,7 @@ func (s *Server) checkReplay(sr auth.SignedRequest) *apiError {
 	case errors.Is(err, auth.ErrReplay):
 		return fail(CodeReplayDetected)
 	case errors.Is(err, auth.ErrReplayCacheFull):
-		s.log.Warn("replay cache full; shedding load")
+		s.log.Warn("replay cache full or unavailable; shedding load", "err", err)
 		return &apiError{code: CodeRateLimited, retryAfter: 5}
 	case err != nil:
 		return fail(CodeInternal)
