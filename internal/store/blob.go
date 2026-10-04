@@ -62,6 +62,9 @@ func (s *Store) PutBlob(ctx context.Context, p BlobPut, r io.Reader) (BlobInfo, 
 	}
 	defer tx.Rollback()
 	now := s.now()
+	if err := s.checkLive(ctx, tx, p.Mailbox, p.Limits); err != nil {
+		return BlobInfo{}, err
+	}
 	if p.Limits.MailboxMaxBytes > 0 {
 		var used int64
 		var err error

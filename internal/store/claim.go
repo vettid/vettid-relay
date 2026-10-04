@@ -33,6 +33,9 @@ func (s *Store) PutClaim(ctx context.Context, mailbox string, data []byte, ttl t
 	}
 	defer tx.Rollback()
 	now := s.now()
+	if err := s.checkLive(ctx, tx, mailbox, Limits{}); err != nil {
+		return "", time.Time{}, err
+	}
 	if maxStored > 0 {
 		used, err := storedBytes(ctx, tx, mailbox, now)
 		if err != nil {

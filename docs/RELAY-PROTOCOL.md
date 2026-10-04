@@ -1,6 +1,6 @@
 # VettID Relay Protocol
 
-**Version:** 0.4.0 (draft)
+**Version:** 0.5.0 (draft)
 **Status:** Pre-implementation draft for review
 
 ## 1. Purpose & design principles
@@ -101,9 +101,9 @@ signature = Ed25519-Sign(requester_private_key, digest)
   collide in the replay cache (e.g. a long-poll re-issued immediately, §6.2).
   Clients SHOULD therefore send fractional seconds (millisecond precision);
   relays MUST accept them.
-- For **owner routes** (collect, ack, denylist, rotate), the relay MUST verify
-  that `X-VettID-Key` equals the registered pubkey of the mailbox being operated
-  on.
+- For **owner routes** (collect, ack, denylist, rotate, delete), the relay
+  MUST verify that `X-VettID-Key` equals the registered pubkey of the mailbox
+  being operated on.
 - For **deposit**, `X-VettID-Key` MUST equal the `sub` of the presented deposit
   token (sender binding, §5.3) — except for one-shot open tokens (§5.6), where
   the signer becomes the depositor.
@@ -158,9 +158,10 @@ limit (`payload_too_large`, §8.5), then verify, in order:
 3. `iss` == `{mailbox_id}` → else `token_invalid`
 4. `aud` == this relay's configured base URL → else `token_invalid`
 5. `iat` ≤ now < `exp` → else `token_expired`
-6. `jti` not in mailbox denylist AND `sub` not in mailbox denylist
-   → else `token_revoked`; for open tokens (§5.6), `jti` not already consumed
-   → else `token_used`
+6. `jti` not in mailbox denylist AND `sub` not in mailbox denylist AND, if
+   the mailbox id was deleted before (§6.10), `iat` ≥ its tokens-not-before
+   time → else `token_revoked`; for open tokens (§5.6), `jti` not already
+   consumed → else `token_used`
 7. Request signature (§4.1) verifies AND `X-VettID-Key` == token `sub`
    (open tokens: the signature alone) → else `signature_invalid`
 8. Quota counters (token quota if present, mailbox quota) not exceeded
@@ -303,7 +304,8 @@ GET /v1/mailbox?wait=25&max=32       (owner-signed)
   `visibility_timeout_seconds`.
 - If none are available, the relay parks the request up to `wait` seconds
   (cap 25), returning early if a deposit arrives; on timeout returns
-  `{ "messages": [] }`.
+  `{ "messages": [] }`. If the mailbox is deleted meanwhile (§6.10), the
+  parked request ends at once with `404 mailbox_unknown`.
 - **Delivery is at-least-once.** A message not acked within its lease reappears
   in later collects. Receivers MUST deduplicate by `msg_id`.
 
@@ -315,7 +317,9 @@ GET /v1/mailbox/ws                   (owner-signed at upgrade)
 
 Server frames: `{ "msg_id", "deposited_at", "sender", "jti", "payload" }` — same
 lease semantics. Client frames: `{ "ack": "<msg_id>" }`. WebSocket support is
-OPTIONAL for relays and clients; long-poll is the mandatory baseline.
+OPTIONAL for relays and clients; long-poll is the mandatory baseline. When the
+mailbox is deleted (§6.10) the relay closes the session with close code
+**4404** and reason `mailbox_unknown`.
 
 ### 6.5 Ack
 
@@ -347,6 +351,9 @@ a grace period (relay config, default 7 days, during which both collect).
 Because mailbox_id is key-derived, rotation changes the address; owners are
 responsible for re-issuing deposit tokens and notifying connections over E2E
 channels. Tokens issued under the old key die with it — this is a feature.
+Deleting the successor (§6.10) also deletes an old mailbox still in its grace
+period; deleting the old mailbox (signed by the old key) ends only its own
+grace.
 
 ### 6.8 Blob transfer (files up to relay blob limit)
 
@@ -448,6 +455,57 @@ DELETE /v1/claim/{claim_id}          (signed by the creating key)
   is lost, the claim is already gone. Recover by asking the owner for a new
   claim.
 
+### 6.10 Mailbox deletion (0.5.0)
+
+```
+DELETE /v1/mailbox                   (owner-signed, §4.1; no body)
+→ 204
+```
+
+The owner deletes its mailbox — the one whose id derives from
+`X-VettID-Key` — and everything in it. The request has no body (a body is
+`bad_request`); the signature over `DELETE` and the path `/v1/mailbox` is the
+whole authorization, so a signed ack (`DELETE /v1/mailbox/{msg_id}`) can never
+be replayed as a deletion.
+
+- **What is deleted:** the registration, every message (leased or not), the
+  denylist, token quota counters and consumed open-token records, every blob
+  deposited to it (§6.8) and every claim it created (§6.9). Every mailbox
+  rotated into this one and still in its grace period (§6.7) is deleted with
+  it (recursively), so tokens issued under an earlier key stop working too.
+- **Afterwards** the mailbox id behaves as never registered: deposits and blob
+  uploads get `mailbox_unknown` (§5.3 step 1), owner routes get
+  `mailbox_unknown`, claims it created are `claim_unknown`. A relay MUST
+  refuse deposits, blob uploads and claim creation from the moment it answers
+  `204`, on every server instance that shares the mailbox. A collector parked
+  on the mailbox gets `mailbox_unknown` (§6.3); a WebSocket session is closed
+  with 4404 (§6.4). A multi-instance relay MAY let other instances answer
+  owner requests of the deleted key briefly (at most a few minutes) as for an
+  empty mailbox.
+- **Idempotent:** `204` whether or not the mailbox existed — never
+  registered, already deleted, or past its rotation grace. Only the key's
+  holder can call it, so the answer reveals nothing.
+- **Re-registration.** The key MAY register again (§6.1, `201`): it gets a
+  fresh, empty mailbox at the same id. Because the denylist and the
+  consumed-token records went with the old mailbox, the relay keeps a
+  **tombstone** for the id: its **tokens-not-before** time is the deletion
+  time plus the 90-second freshness window (§4.1; it covers an owner clock
+  running ahead of the relay's). Every token with `iat` before it is refused
+  with `token_revoked` (§5.3 step 6), whatever its `exp`, so no token minted
+  before the deletion — and no revocation or one-shot use the deletion
+  erased — can become valid again. The tombstone is kept until every such
+  token has expired: at least `max(max_token_lifetime_seconds,
+  open_token_max_lifetime_seconds)` after the tokens-not-before time (the
+  same bound as denylist entries, §5.5). An owner that re-registers a deleted
+  key MUST mint new tokens with `iat` at least 90 seconds after the deletion
+  (and SHOULD NOT backdate them across it, §5.2). Registering a new key is
+  simpler and RECOMMENDED: the tombstone then never matters.
+- **Rotation.** Rotating into a deleted key's id (§6.7) is a re-registration:
+  the successor starts empty and carries the tombstone's tokens-not-before.
+- **Timing.** Deletion is immediate; nothing waits for the message TTL. Clients
+  SHOULD treat a lost response as unknown and repeat the request (it is
+  idempotent and retryable on `429`/`5xx`, §7.2).
+
 ## 7. Errors, limits, versioning
 
 ### 7.1 Error body
@@ -466,8 +524,8 @@ Canonical codes and their HTTP statuses:
 | `replay_detected` | 401 | (key, signature) already seen |
 | `token_invalid` | 401 | token malformed, bad signature, wrong `iss`/`aud`/`scope`, lifetime too long |
 | `token_expired` | 401 | outside `iat`..`exp` |
-| `token_revoked` | 403 | `jti` or `sub` on the owner's denylist |
-| `mailbox_unknown` | 404 | no such mailbox (or not yours — indistinguishable) |
+| `token_revoked` | 403 | `jti` or `sub` on the owner's denylist, or `iat` before a deleted mailbox's tokens-not-before (§6.10) |
+| `mailbox_unknown` | 404 | no such mailbox — never registered, rotated away or deleted (§6.10) — or not yours (indistinguishable) |
 | `blob_unknown` | 404 | no such blob for this owner |
 | `claim_unknown` | 404 | no such claim (unknown, expired or already fetched) |
 | `not_found` | 404 | no such route |
@@ -522,6 +580,11 @@ prefix change. This document carries a semver and a changelog (§10).
    memory exhaustion; blob storage MUST be capped per mailbox; and blob
    metadata (filename, MIME type) MUST only ever appear inside E2E-encrypted
    message payloads, never in relay-visible requests, storage, or logs.
+9. **Deletion** (§6.10) is the owner's alone and erases content at once. The
+   tombstone it leaves holds only the mailbox id and two times; it exists so
+   that deleting a mailbox can never revive a token the owner revoked or a
+   one-shot token already used. A stolen relay key can delete its mailbox —
+   an availability event like any other use of a stolen owner key.
 
 ## 9. Test vectors
 
@@ -619,6 +682,15 @@ Properties:
 The push gateway API is specified separately.
 
 ## 10. Changelog
+
+- **0.5.0** — owner-signed mailbox deletion, `DELETE /v1/mailbox` (§6.10):
+  deletes the registration, messages, denylist, quota and open-token records,
+  blobs and the claims it created, and predecessors still in their rotation
+  grace; idempotent; parked collectors end with `mailbox_unknown`, WebSocket
+  sessions close with 4404 (§6.3, §6.4). A re-registered key gets a fresh
+  mailbox whose tokens must have `iat` at or after the deletion's
+  tokens-not-before time (§5.3 step 6, `token_revoked`), kept as a tombstone
+  for the maximum token lifetime. No new error codes. Additive for clients.
 
 - **0.4.0** — collect results carry the deposit token's `jti` (§6.3, §6.4) so
   owners can distinguish a sender's tokens (VAULT-MESSAGING §6.6); `iat`

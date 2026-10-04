@@ -137,6 +137,12 @@ type waker struct {
 
 func (w *waker) Wake(mb string) { w.mu.Lock(); w.got = append(w.got, mb); w.mu.Unlock(); w.ch <- mb }
 func (w *waker) WakeAll()       { w.mu.Lock(); w.all++; w.mu.Unlock() }
+func (w *waker) MailboxGone(mb string) {
+	w.mu.Lock()
+	w.got = append(w.got, "gone:"+mb)
+	w.mu.Unlock()
+	w.ch <- "gone:" + mb
+}
 
 func TestWakeAcrossProcesses(t *testing.T) {
 	cs := open(t, 2)
@@ -163,6 +169,16 @@ func TestWakeAcrossProcesses(t *testing.T) {
 	case mb := <-wa.ch:
 		t.Fatalf("publisher woke itself for %s", mb)
 	case <-time.After(200 * time.Millisecond):
+	}
+	// A deletion signal (0.5.0) reaches the other process as such.
+	ba.PublishGone("mbx2")
+	select {
+	case mb := <-wb.ch:
+		if mb != "gone:mbx2" {
+			t.Fatalf("deletion signal arrived as %q", mb)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no deletion signal on the other process")
 	}
 	wb.mu.Lock()
 	defer wb.mu.Unlock()

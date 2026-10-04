@@ -13,6 +13,7 @@ type hub struct {
 
 type hubEntry struct {
 	ch         chan struct{} // closed (and replaced) on deposit
+	gone       chan struct{} // closed (and replaced) when the mailbox is deleted
 	collectors int
 }
 
@@ -24,7 +25,7 @@ func (h *hub) acquire(mailbox string, max int) bool {
 	defer h.mu.Unlock()
 	e, ok := h.boxes[mailbox]
 	if !ok {
-		e = &hubEntry{ch: make(chan struct{})}
+		e = &hubEntry{ch: make(chan struct{}), gone: make(chan struct{})}
 		h.boxes[mailbox] = e
 	}
 	if e.collectors >= max {
@@ -63,6 +64,31 @@ func (h *hub) wait(mailbox string) <-chan struct{} {
 	closed := make(chan struct{})
 	close(closed)
 	return closed
+}
+
+// goneCh returns a channel closed when mailbox is deleted. Only valid
+// while the caller holds a collector slot; collectors take it right after
+// acquire and then re-check the mailbox, so no deletion is missed.
+func (h *hub) goneCh(mailbox string) <-chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if e, ok := h.boxes[mailbox]; ok {
+		return e.gone
+	}
+	closed := make(chan struct{})
+	close(closed)
+	return closed
+}
+
+// kill ends every collector of a deleted mailbox. Collectors that register
+// later (a new registration of the key) get a fresh channel.
+func (h *hub) kill(mailbox string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if e, ok := h.boxes[mailbox]; ok {
+		close(e.gone)
+		e.gone = make(chan struct{})
+	}
 }
 
 // notify wakes every collector parked on mailbox.

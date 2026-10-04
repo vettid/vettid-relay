@@ -38,6 +38,15 @@ type WakeBus interface {
 	Publish(mailbox string)
 }
 
+// GoneBus is implemented by a WakeBus that also tells other processes
+// about deleted mailboxes (they call Server.MailboxGone). Like wake
+// signals, a lost one only delays: other processes stop resolving the
+// mailbox when their cache entry expires, and the store refuses writes to
+// it from the start.
+type GoneBus interface {
+	PublishGone(mailbox string)
+}
+
 // EmptyHints lets collectors skip the store query for mailboxes known to be
 // empty (internal/coord.EmptyHints documents the invariant). The API keeps
 // its side of the contract: Bump after every committed deposit and before

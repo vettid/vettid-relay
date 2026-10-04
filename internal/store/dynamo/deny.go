@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -49,17 +50,22 @@ func (s *Store) AddDenylist(ctx context.Context, mailbox string, entries []store
 			q.room("deny", fresh, maxEntries)
 			q.vals[":n"], q.vals[":one"] = avN(fresh), avN(1)
 			_, err := s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-				TableName:                 &s.cfg.Table,
-				Key:                       key(mbPK(mailbox), skStats),
-				UpdateExpression:          aws.String("ADD deny :n, v :one"),
-				ConditionExpression:       q.expr(),
-				ExpressionAttributeValues: q.vals,
+				TableName:                           &s.cfg.Table,
+				Key:                                 key(mbPK(mailbox), skStats),
+				UpdateExpression:                    aws.String("ADD deny :n, v :one"),
+				ConditionExpression:                 q.expr(),
+				ExpressionAttributeValues:           q.vals,
+				ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 			})
 			if err == nil {
 				break
 			}
-			if !isCCF(err) {
+			var ccf *types.ConditionalCheckFailedException
+			if !errors.As(err, &ccf) {
 				return err
+			}
+			if err := deadOrRevoked(ccf.Item, now, time.Time{}); err != nil {
+				return err // deleted meanwhile (another process's cache was stale)
 			}
 			if !reconciled {
 				reconciled = true

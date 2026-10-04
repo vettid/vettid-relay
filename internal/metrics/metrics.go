@@ -62,6 +62,9 @@ func (c Counter) Inc() { c.v.Add(1) }
 // Add adds n (n ≥ 0).
 func (c Counter) Add(n int64) { c.v.Add(n) }
 
+// Value returns the current count.
+func (c Counter) Value() int64 { return c.v.Load() }
+
 // Gauge is a value that can go up and down.
 type Gauge struct{ v *atomic.Int64 }
 

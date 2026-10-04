@@ -18,7 +18,13 @@ import (
 type Waker interface {
 	Wake(mailbox string)
 	WakeAll()
+	// MailboxGone is called for a mailbox another process deleted.
+	MailboxGone(mailbox string)
 }
+
+// goneSuffix marks a deletion signal: "<process>|<mailbox>|gone". A
+// process from before protocol 0.5.0 reads it as a wake for a mailbox id
+// that does not exist, which is harmless (rolling deploys).
 
 // WakeBus carries wake-on-deposit signals between relay processes on one
 // sharded pub/sub channel. Every process receives every signal and wakes the
@@ -80,6 +86,13 @@ func (b *WakeBus) Publish(mailbox string) {
 	}
 }
 
+// PublishGone implements api.GoneBus: other processes drop the mailbox
+// from their caches and end its parked collectors. Never blocks; a dropped
+// signal is counted.
+func (b *WakeBus) PublishGone(mailbox string) { b.Publish(mailbox + goneSuffix) }
+
+const goneSuffix = "|gone"
+
 // Start subscribes and starts publishing; it returns once the first
 // subscription is confirmed or ctx ends (the bus keeps retrying either way).
 func (b *WakeBus) Start(ctx context.Context, w Waker) {
@@ -123,6 +136,10 @@ func (b *WakeBus) subscribeLoop(ctx context.Context, first func()) {
 				return
 			}
 			b.received.Inc()
+			if id, gone := strings.CutSuffix(mailbox, goneSuffix); gone {
+				b.w.MailboxGone(id)
+				return
+			}
 			b.w.Wake(mailbox)
 		})
 		b.up.Store(false)

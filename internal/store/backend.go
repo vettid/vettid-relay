@@ -33,6 +33,17 @@ type Backend interface {
 	// mailbox for deletion at deleteAfter (never later than an existing
 	// schedule).
 	Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) error
+	// DeleteMailbox deletes mailbox id (registered with pub) and everything
+	// it holds — messages, leases, denylist, token counters, consumed open
+	// tokens, blobs (bodies included) and the claims it created — together
+	// with every predecessor rotated into it, and returns the ids deleted
+	// (none if id is not registered with pub: deletion is idempotent).
+	// Deposits, blob puts and claim puts fail with ErrNotFound from the
+	// moment it returns, on every process sharing the backend. Each id
+	// keeps a tombstone until keepUntil: if its key registers again, the
+	// new mailbox's TokensNotBefore is notBefore, so no token minted
+	// before the deletion becomes valid again.
+	DeleteMailbox(ctx context.Context, id string, pub []byte, notBefore, keepUntil time.Time) (deleted []string, err error)
 
 	AddDenylist(ctx context.Context, mailbox string, entries []DenyEntry, expiresAt time.Time, maxEntries int64) error
 	IsDenied(ctx context.Context, mailbox, jti, sub string) (bool, error)

@@ -13,6 +13,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -461,6 +462,95 @@ func TestMultiProcessRateLimitShared(t *testing.T) {
 	}
 	if retryAfter < 1 {
 		t.Fatalf("retry_after %d", retryAfter)
+	}
+}
+
+// Mailbox deletion (protocol 0.5.0, §6.10) across processes: deleted on A,
+// the mailbox is gone on B at once — deposits and blob uploads refused even
+// though B has it cached, B's parked long-poll and WebSocket ended, B's
+// collects refused — and after a re-registration on B, a token minted
+// before the deletion is refused on A.
+func TestMultiProcessMailboxDelete(t *testing.T) {
+	cl := newCluster(t)
+	a, b := cl.start(), cl.start()
+	ctx := context.Background()
+	vault, app := principal(t, a.url), principal(t, b.url)
+	if _, err := vault.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := vault.MintToken(app.PublicKeyB64(), multiAud, client.TokenOptions{TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vb := as(vault, b.url)
+	// B caches the mailbox (deposit and owner lookups) and holds content.
+	id, err := app.Deposit(ctx, vault.MailboxID(), tok, []byte("before"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, err := vb.Collect(ctx, 0, 10); err != nil || len(m) != 1 || m[0].MsgID != id {
+		t.Fatalf("%+v %v", m, err)
+	}
+	if err := vb.Ack(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	parked := make(chan error, 1)
+	go func() { _, err := vb.Collect(ctx, 25*time.Second, 10); parked <- err }()
+	h := http.Header{}
+	auth.SetHeaders(h, vault.Key, "GET", "/v1/mailbox/ws", time.Now(), auth.BodyHash(nil))
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(wctx, "ws"+b.url[len("http"):]+"/v1/mailbox/ws", &websocket.DialOptions{HTTPHeader: h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	time.Sleep(300 * time.Millisecond)
+
+	start := time.Now()
+	if err := vault.DeleteMailbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-parked:
+		if !client.IsCode(err, "mailbox_unknown") {
+			t.Fatalf("parked long-poll on B: %v", err)
+		}
+		t.Logf("delete on A → long-poll on B ended: %v", time.Since(start))
+	case <-time.After(5 * time.Second):
+		t.Fatal("long-poll on B not ended by the deletion on A")
+	}
+	_, _, err = conn.Read(wctx)
+	var ce websocket.CloseError
+	if !errors.As(err, &ce) || ce.Code != 4404 {
+		t.Fatalf("WebSocket on B after delete: %v", err)
+	}
+	if _, err := app.Deposit(ctx, vault.MailboxID(), tok, []byte("late")); !client.IsCode(err, "mailbox_unknown") {
+		t.Fatalf("deposit on B: %v", err)
+	}
+	if _, _, err := app.PutBlob(ctx, vault.MailboxID(), tok, []byte("blob")); !client.IsCode(err, "mailbox_unknown") {
+		t.Fatalf("blob on B: %v", err)
+	}
+	if _, err := vb.Collect(ctx, 0, 10); !client.IsCode(err, "mailbox_unknown") {
+		t.Fatalf("collect on B: %v", err)
+	}
+	if err := vb.DeleteMailbox(ctx); err != nil { // idempotent, on either process
+		t.Fatal(err)
+	}
+
+	// Re-registered (on B): fresh and empty; the old token stays refused.
+	if reg, err := vb.Register(ctx); err != nil || !reg.Created {
+		t.Fatalf("re-register: %+v %v", reg, err)
+	}
+	if m, err := vault.Collect(ctx, 0, 10); err != nil || len(m) != 0 {
+		t.Fatalf("re-registered mailbox: %+v %v", m, err)
+	}
+	if _, err := as(app, a.url).Deposit(ctx, vault.MailboxID(), tok, []byte("old token")); !client.IsCode(err, "token_revoked") {
+		t.Fatalf("pre-deletion token on A: %v", err)
+	}
+	if n := metric(t, a, "relay_mailbox_deletions_total"); n != 1 {
+		t.Fatalf("relay_mailbox_deletions_total on A = %d", n)
 	}
 }
 

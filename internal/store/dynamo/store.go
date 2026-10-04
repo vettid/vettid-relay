@@ -7,8 +7,8 @@
 // # Table layout (one table, pk/sk strings, TTL attribute "ttl_s")
 //
 //	pk            sk               what
-//	MB#<mailbox>  A                mailbox: pub, created, [delete_after, successor, gpk/gsk]
-//	MB#<mailbox>  S                counters: msgs, bytes, blob_bytes, deny; last_id; v; dead_at; rec_*
+//	MB#<mailbox>  A                mailbox: pub, created, [delete_after, successor, preds, deleted, nb, gpk/gsk]
+//	MB#<mailbox>  S                counters: msgs, bytes, blob_bytes, deny; last_id; v; dead_at; nb; rec_*
 //	MB#<mailbox>  M#<ulid>         message: sz, dep, exp, sender, jti, payload (binary)
 //	MB#<mailbox>  L#<ulid>         lease of that message: lease_until
 //	MB#<mailbox>  D#<kind>#<value> denylist entry: exp
@@ -21,6 +21,19 @@
 // The sparse GSI "due" (gpk = "due", gsk = delete_after ms) lists rotated
 // mailboxes so Sweep can purge them after their grace period. Attribute
 // names avoid DynamoDB reserved words (size, data, ttl, until, stored, ...).
+//
+// # Deletion (protocol 0.5.0, §6.10)
+//
+// A deleted mailbox keeps two items as its tombstone: A with `deleted` (the
+// mailbox never resolves again until its key re-registers), `nb` (tokens
+// issued before it are refused after a re-registration) and gsk = the
+// tombstone's expiry, so Sweep purges it like a rotated mailbox once every
+// token minted before the deletion has expired; and S with dead_at = 0 and
+// the same nb, so that a write on another process whose mailbox cache is
+// stale still fails in its transaction. Everything else in the partition
+// is deleted right away. A re-registration revives both items (keeping
+// nb); Rotate keeps preds, the mailboxes rotated into this one, so a
+// deletion can follow them (SQLite uses successor_id).
 //
 // # Consistency
 //
@@ -299,7 +312,19 @@ func parseMailbox(it item) store.Mailbox {
 		t := fromMS(d)
 		mb.DeleteAfter = &t
 	}
+	if _, ok := it["deleted"]; ok {
+		// A tombstone is dead on every clock (the zero time is long past).
+		mb.DeleteAfter = &time.Time{}
+	}
+	if nb, ok := getN(it, "nb"); ok {
+		mb.TokensNotBefore = fromMS(nb)
+	}
 	return mb
+}
+
+// dead reports a mailbox past its rotation grace or deleted.
+func dead(mb store.Mailbox, now time.Time) bool {
+	return mb.DeleteAfter != nil && !now.Before(*mb.DeleteAfter)
 }
 
 func (s *Store) getMailbox(ctx context.Context, id string) (store.Mailbox, bool, error) {
@@ -314,6 +339,10 @@ func (s *Store) getMailbox(ctx context.Context, id string) (store.Mailbox, bool,
 	}
 	return parseMailbox(out.Item), true, nil
 }
+
+// Forget drops mailboxes from this process's cache (another process
+// deleted them: api.Server.MailboxGone).
+func (s *Store) Forget(ids ...string) { s.forget(ids...) }
 
 func (s *Store) forget(ids ...string) {
 	s.cacheMu.Lock()
@@ -351,9 +380,52 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, erro
 		if subtle.ConstantTimeCompare(mb.PubKey, pub) != 1 {
 			return false, fmt.Errorf("store: mailbox id collision")
 		}
-		return false, nil
+		if !dead(mb, s.now()) {
+			return false, nil
+		}
+		// Deleted, or past its rotation grace and not purged yet: the key
+		// starts a fresh, empty mailbox.
+		revived, err := s.revive(ctx, id, pub)
+		if err != nil || revived {
+			return revived, err
+		}
 	}
 	return false, errors.New("dynamo: register: mailbox keeps disappearing")
+}
+
+// revive turns a dead mailbox item back into a fresh, empty, live mailbox:
+// its contents are purged first, then A and S are reset in one
+// transaction that requires the mailbox to be still dead (false: it
+// changed meanwhile, look again). nb stays: tokens minted before a
+// deletion remain refused.
+func (s *Store) revive(ctx context.Context, id string, pub []byte) (bool, error) {
+	defer s.forget(id)
+	if _, err := s.purgeContents(ctx, id); err != nil {
+		return false, err
+	}
+	now := s.now()
+	_, err := s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Update: &types.Update{
+			TableName:                 &s.cfg.Table,
+			Key:                       key(mbPK(id), skAccount),
+			UpdateExpression:          aws.String("SET created = :now REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
+			ConditionExpression:       aws.String("pub = :p AND (attribute_exists(deleted) OR delete_after <= :now)"),
+			ExpressionAttributeValues: item{":p": avB(pub), ":now": avN(ms(now))},
+		}},
+		{Update: &types.Update{
+			TableName:                 &s.cfg.Table,
+			Key:                       key(mbPK(id), skStats),
+			UpdateExpression:          aws.String("SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z, v = if_not_exists(v, :z) + :one REMOVE dead_at"),
+			ExpressionAttributeValues: item{":z": avN(0), ":one": avN(1)},
+		}},
+	}})
+	if err == nil {
+		return true, nil
+	}
+	if r := txReasons(err); r != nil && (reasonCode(r, 0) == "ConditionalCheckFailed" || isConflict(r)) {
+		return false, nil
+	}
+	return false, err
 }
 
 // Mailbox implements store.Backend.
@@ -371,7 +443,7 @@ func (s *Store) Mailbox(ctx context.Context, id string) (store.Mailbox, error) {
 	if err != nil {
 		return store.Mailbox{}, err
 	}
-	if !ok || (mb.DeleteAfter != nil && !now.Before(*mb.DeleteAfter)) {
+	if !ok || dead(mb, now) {
 		return store.Mailbox{}, store.ErrNotFound
 	}
 	if s.cfg.MailboxCacheTTL > 0 && mb.DeleteAfter == nil {
@@ -397,18 +469,27 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 		if err != nil {
 			return err
 		}
-		if !ok || (old.DeleteAfter != nil && !now.Before(*old.DeleteAfter)) {
+		if !ok || dead(old, now) {
 			return store.ErrNotFound
 		}
+		// A successor id that was deleted before starts empty (its
+		// contents are normally purged already).
+		if nm, ok, err := s.getMailbox(ctx, newID); err != nil {
+			return err
+		} else if ok && dead(nm, now) {
+			if _, err := s.purgeContents(ctx, newID); err != nil {
+				return err
+			}
+		}
 		da := deleteAfter
-		oldCond := "pub = :oldpub AND attribute_not_exists(delete_after)"
+		oldCond := "pub = :oldpub AND attribute_not_exists(delete_after) AND attribute_not_exists(deleted)"
 		vals := item{":oldpub": avB(old.PubKey), ":da": avN(ms(da)), ":new": avS(newID), ":due": avS(dueValue)}
 		if old.DeleteAfter != nil {
 			if old.DeleteAfter.Before(da) {
 				da = *old.DeleteAfter
 				vals[":da"] = avN(ms(da))
 			}
-			oldCond = "pub = :oldpub AND delete_after = :prev"
+			oldCond = "pub = :oldpub AND delete_after = :prev AND attribute_not_exists(deleted)"
 			vals[":prev"] = avN(ms(*old.DeleteAfter))
 		}
 		_, err = s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
@@ -422,10 +503,10 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			{Update: &types.Update{
 				TableName:           &s.cfg.Table,
 				Key:                 key(mbPK(newID), skAccount),
-				UpdateExpression:    aws.String("SET pub = if_not_exists(pub, :p), created = if_not_exists(created, :now) REMOVE delete_after, gpk, gsk"),
+				UpdateExpression:    aws.String("SET pub = if_not_exists(pub, :p), created = if_not_exists(created, :now) ADD preds :old REMOVE delete_after, deleted, gpk, gsk"),
 				ConditionExpression: aws.String("attribute_not_exists(pk) OR pub = :p"),
 				ExpressionAttributeValues: item{
-					":p": avB(newPub), ":now": avN(ms(now)),
+					":p": avB(newPub), ":now": avN(ms(now)), ":old": &types.AttributeValueMemberSS{Value: []string{oldID}},
 				},
 			}},
 			{Update: &types.Update{

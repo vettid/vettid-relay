@@ -51,34 +51,11 @@ func (s *Store) Sweep(ctx context.Context) (store.SweepStats, error) {
 }
 
 // purge deletes everything in a mailbox's partition, then (conditionally,
-// in case it was revived as a rotation successor meanwhile) the mailbox.
+// in case it was revived as a rotation successor or re-registered
+// meanwhile) the mailbox.
 func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs int64, purged bool, err error) {
-	var keys []item
-	err = s.queryAll(ctx, &dynamodb.QueryInput{
-		KeyConditionExpression:    aws.String("pk = :pk"),
-		ExpressionAttributeValues: item{":pk": avS(mbPK(mailbox))},
-		ProjectionExpression:      aws.String("pk, sk"),
-	}, func(it item) error {
-		sk := getS(it, "sk")
-		switch {
-		case sk == skAccount:
-			return nil // last
-		case strings.HasPrefix(sk, "M#"):
-			msgs++
-		case strings.HasPrefix(sk, "C#"):
-			keys = append(keys, key(claimPK(sk[2:]), "CL"))
-		case strings.HasPrefix(sk, "B#") && s.cfg.S3 != nil:
-			if _, err := s.cfg.S3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.cfg.Bucket, Key: aws.String(blobKey(mailbox, sk[2:]))}); err != nil {
-				return err
-			}
-		}
-		keys = append(keys, key(mbPK(mailbox), sk))
-		return nil
-	})
+	msgs, err = s.purgeItems(ctx, mailbox, func(sk string) bool { return sk != skAccount })
 	if err != nil {
-		return 0, false, err
-	}
-	if err := s.batchDelete(ctx, keys); err != nil {
 		return 0, false, err
 	}
 	_, err = s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
@@ -92,6 +69,45 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 	}
 	s.forget(mailbox)
 	return msgs, err == nil, err
+}
+
+// purgeContents deletes what a mailbox holds — messages, leases, denylist,
+// token counters, consumed open tokens, blobs (with their bodies) and the
+// claims it created — and keeps the A and S items (a deletion's
+// tombstone).
+func (s *Store) purgeContents(ctx context.Context, mailbox string) (msgs int64, err error) {
+	return s.purgeItems(ctx, mailbox, func(sk string) bool { return sk != skAccount && sk != skStats })
+}
+
+// purgeItems deletes the partition's items for which del(sk) holds, with
+// their blob bodies and claim items. It is idempotent.
+func (s *Store) purgeItems(ctx context.Context, mailbox string, del func(sk string) bool) (msgs int64, err error) {
+	var keys []item
+	err = s.queryAll(ctx, &dynamodb.QueryInput{
+		KeyConditionExpression:    aws.String("pk = :pk"),
+		ExpressionAttributeValues: item{":pk": avS(mbPK(mailbox))},
+		ProjectionExpression:      aws.String("pk, sk"),
+	}, func(it item) error {
+		sk := getS(it, "sk")
+		switch {
+		case !del(sk):
+			return nil
+		case strings.HasPrefix(sk, "M#"):
+			msgs++
+		case strings.HasPrefix(sk, "C#"):
+			keys = append(keys, key(claimPK(sk[2:]), "CL"))
+		case strings.HasPrefix(sk, "B#") && s.cfg.S3 != nil:
+			if _, err := s.cfg.S3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.cfg.Bucket, Key: aws.String(blobKey(mailbox, sk[2:]))}); err != nil {
+				return err
+			}
+		}
+		keys = append(keys, key(mbPK(mailbox), sk))
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return msgs, s.batchDelete(ctx, keys)
 }
 
 func (s *Store) batchDelete(ctx context.Context, keys []item) error {

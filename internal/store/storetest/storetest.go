@@ -100,6 +100,12 @@ func Run(t *testing.T, h Harness) {
 		{"TakeClaimConcurrent", testTakeClaimConcurrent},
 		{"ConcurrentCollectorsNeverShareALease", testConcurrentCollect},
 		{"LargePayload", testLargePayload},
+		{"DeleteMailbox", testDeleteMailbox},
+		{"DeleteMailboxReRegister", testDeleteReRegister},
+		{"DeleteMailboxRotation", testDeleteRotation},
+		{"DeleteMailboxAcrossProcesses", testDeleteAcrossProcesses},
+		{"DeleteMailboxTombstoneExpires", testDeleteTombstoneExpires},
+		{"RegisterAfterRotationGrace", testRegisterAfterGrace},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, h) })
@@ -743,5 +749,269 @@ func testLargePayload(t *testing.T, h Harness) {
 	got, _, err := s.Collect(ctx, "a", 100, time.Minute)
 	if err != nil || len(got) != 1 || !bytes.Equal(got[0].Payload, p) {
 		t.Fatalf("large payload: %d %v", len(got), err)
+	}
+}
+
+// ------------------------------------------------------- mailbox deletion
+
+// deleteTimes are the tombstone times a deletion at now uses (the API
+// passes now+freshness and that plus the denylist retention).
+func deleteTimes(c *Clock) (notBefore, keepUntil time.Time) {
+	nb := c.Now().Add(90 * time.Second)
+	return nb, nb.Add(30 * 24 * time.Hour)
+}
+
+// Deletion removes everything the mailbox holds and refuses every later
+// write; it is idempotent and needs the registered key.
+func testDeleteMailbox(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	mustRegister(t, s, "b", 2)
+	exp := c.Now().Add(time.Hour)
+	if _, err := s.Deposit(ctx, "a", "s", []byte("m"), time.Hour, store.Limits{TokenJTI: "t1", TokenExpires: exp, TokenQuotaMsgs: i64(10)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Deposit(ctx, "a", "s", []byte("o"), time.Hour, store.Limits{TokenJTI: "open", TokenExpires: exp, ConsumeJTI: true}); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 3, TTL: time.Hour}, bytes.NewReader([]byte("abc")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, _, err := s.PutClaim(ctx, "a", []byte("c"), time.Hour, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDenylist(ctx, "a", []store.DenyEntry{{Kind: "jti", Value: "J"}}, exp, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Deposit(ctx, "b", "s", []byte("keep"), time.Hour, store.Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	nb, keep := deleteTimes(c)
+	if ids, err := s.DeleteMailbox(ctx, "a", key(9), nb, keep); err != nil || len(ids) != 0 {
+		t.Fatalf("delete with another key: %v %v", ids, err)
+	}
+	if _, err := s.Mailbox(ctx, "a"); err != nil {
+		t.Fatal("a delete with another key must not delete:", err)
+	}
+	ids, err := s.DeleteMailbox(ctx, "a", key(1), nb, keep)
+	if err != nil || len(ids) != 1 || ids[0] != "a" {
+		t.Fatalf("delete: %v %v", ids, err)
+	}
+	if _, err := s.Mailbox(ctx, "a"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted mailbox resolves: %v", err)
+	}
+	if _, err := s.Deposit(ctx, "a", "s", []byte("late"), time.Hour, store.Limits{}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deposit after delete: %v", err)
+	}
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 1, TTL: time.Hour}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("blob put after delete: %v", err)
+	}
+	if _, _, err := s.PutClaim(ctx, "a", []byte("c"), time.Hour, 0); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("claim put after delete: %v", err)
+	}
+	if err := s.AddDenylist(ctx, "a", []store.DenyEntry{{Kind: "jti", Value: "K"}}, exp, 10); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("denylist after delete: %v", err)
+	}
+	if _, _, err := s.OpenBlob(ctx, "a", blob.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("blob after delete: %v", err)
+	}
+	if _, err := s.TakeClaim(ctx, claim); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("claim after delete: %v", err)
+	}
+	if got, _, _ := s.Collect(ctx, "a", 10, time.Minute); len(got) != 0 {
+		t.Fatalf("deleted mailbox kept %d messages", len(got))
+	}
+	if got, _ := s.IsDenied(ctx, "a", "J", ""); got {
+		t.Fatal("denylist survived the deletion")
+	}
+	if got, _ := s.IsConsumed(ctx, "a", "open"); got {
+		t.Fatal("consumed open token survived the deletion")
+	}
+	// Idempotent; other mailboxes untouched.
+	if ids, err := s.DeleteMailbox(ctx, "a", key(1), nb, keep); err != nil || len(ids) != 0 {
+		t.Fatalf("repeat delete: %v %v", ids, err)
+	}
+	if ids, err := s.DeleteMailbox(ctx, "never", key(7), nb, keep); err != nil || len(ids) != 0 {
+		t.Fatalf("delete of an unregistered key: %v %v", ids, err)
+	}
+	if got, _, _ := s.Collect(ctx, "b", 10, time.Minute); len(got) != 1 {
+		t.Fatal("another mailbox lost its message")
+	}
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Re-registering a deleted key starts a fresh, empty mailbox, and tokens
+// issued before the deletion stay refused (ErrRevoked) — the denylist and
+// usage records that would have refused them are gone.
+func testDeleteReRegister(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	oldIat := c.Now().Add(-time.Minute)
+	exp := c.Now().Add(24 * time.Hour)
+	for i := 0; i < 3; i++ {
+		if _, err := s.Deposit(ctx, "a", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "q", TokenIssuedAt: oldIat, TokenExpires: exp, TokenQuotaMsgs: i64(3)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nb, keep := deleteTimes(c)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), nb, keep); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Minute)
+	created, err := s.Register(ctx, "a", key(1))
+	if err != nil || !created {
+		t.Fatalf("re-register: %v %v", created, err)
+	}
+	mb, err := s.Mailbox(ctx, "a")
+	if err != nil || !mb.TokensNotBefore.Equal(nb.Truncate(time.Millisecond)) {
+		t.Fatalf("TokensNotBefore %v (want %v), %v", mb.TokensNotBefore, nb, err)
+	}
+	if created, err := s.Register(ctx, "a", key(1)); err != nil || created {
+		t.Fatalf("second re-register: %v %v", created, err)
+	}
+	if got, _, _ := s.Collect(ctx, "a", 10, time.Minute); len(got) != 0 {
+		t.Fatalf("re-registered mailbox has %d old messages", len(got))
+	}
+	old := store.Limits{TokenJTI: "q", TokenIssuedAt: oldIat, TokenExpires: exp, TokenQuotaMsgs: i64(3)}
+	if _, err := s.Deposit(ctx, "a", "s", []byte("old token"), time.Hour, old); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("token from before the deletion: %v", err)
+	}
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 1, TTL: time.Hour, Limits: old}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("blob with a token from before the deletion: %v", err)
+	}
+	fresh := store.Limits{TokenJTI: "q", TokenIssuedAt: nb, TokenExpires: exp, TokenQuotaMsgs: i64(3), MailboxMaxMsgs: 3}
+	for i := 0; i < 3; i++ { // counters (token usage, mailbox count) restarted
+		if _, err := s.Deposit(ctx, "a", "s", []byte("new"), time.Hour, fresh); err != nil {
+			t.Fatalf("fresh token, deposit %d: %v", i, err)
+		}
+	}
+}
+
+// Deleting a rotation successor deletes the predecessors still in their
+// grace period; deleting a predecessor ends only its own grace.
+func testDeleteRotation(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	nb, keep := deleteTimes(c)
+	mustRegister(t, s, "o1", 1)
+	if err := s.Rotate(ctx, "o1", "n1", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "n1", "n2", key(3), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Deposit(ctx, "o1", "s", []byte("x"), time.Hour, store.Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := s.DeleteMailbox(ctx, "n2", key(3), nb, keep)
+	if err != nil || len(ids) != 3 {
+		t.Fatalf("delete the chain's head: %v %v", ids, err)
+	}
+	for _, id := range []string{"o1", "n1", "n2"} {
+		if _, err := s.Mailbox(ctx, id); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("%s survived: %v", id, err)
+		}
+		if _, err := s.Deposit(ctx, id, "s", []byte("late"), time.Hour, store.Limits{}); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("deposit into %s: %v", id, err)
+		}
+	}
+
+	mustRegister(t, s, "o2", 4)
+	if err := s.Rotate(ctx, "o2", "n3", key(5), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	ids, err = s.DeleteMailbox(ctx, "o2", key(4), nb, keep)
+	if err != nil || len(ids) != 1 || ids[0] != "o2" {
+		t.Fatalf("delete the predecessor: %v %v", ids, err)
+	}
+	if _, err := s.Mailbox(ctx, "n3"); err != nil {
+		t.Fatal("the successor must survive its predecessor's deletion:", err)
+	}
+	// A rotation back onto a deleted key revives it with its TokensNotBefore.
+	if err := s.Rotate(ctx, "n3", "o2", key(4), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if mb, err := s.Mailbox(ctx, "o2"); err != nil || mb.TokensNotBefore.IsZero() {
+		t.Fatalf("rotated onto a deleted key: %+v %v", mb, err)
+	}
+}
+
+// Two processes: a deletion on one is binding on the other at once, even
+// where the other still has the mailbox cached; so is TokensNotBefore
+// after a re-registration.
+func testDeleteAcrossProcesses(t *testing.T, h Harness) {
+	a, b, c := h.pair(t)
+	mustRegister(t, a, "m", 1)
+	if _, err := b.Mailbox(ctx, "m"); err != nil { // b caches it
+		t.Fatal(err)
+	}
+	iat := c.Now().Add(-time.Minute)
+	nb, keep := deleteTimes(c)
+	if _, err := a.DeleteMailbox(ctx, "m", key(1), nb, keep); err != nil {
+		t.Fatal(err)
+	}
+	lim := store.Limits{TokenJTI: "t", TokenIssuedAt: iat, TokenExpires: c.Now().Add(time.Hour)}
+	if _, err := b.Deposit(ctx, "m", "s", []byte("x"), time.Hour, lim); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deposit on the other process: %v", err)
+	}
+	if _, err := b.PutBlob(ctx, store.BlobPut{Mailbox: "m", SenderSub: "s", Size: 1, TTL: time.Hour, Limits: lim}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("blob on the other process: %v", err)
+	}
+	if _, err := a.Register(ctx, "m", key(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Deposit(ctx, "m", "s", []byte("x"), time.Hour, lim); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("old token on the other process after re-registration: %v", err)
+	}
+}
+
+// After the tombstone's lifetime (every token minted before the deletion
+// has expired) a sweep forgets the deletion.
+func testDeleteTombstoneExpires(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	nb, keep := deleteTimes(c)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), nb, keep); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(keep.Sub(c.Now()) + h.SweepGrace + time.Minute)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Register(ctx, "a", key(1)); err != nil {
+		t.Fatal(err)
+	}
+	if mb, err := s.Mailbox(ctx, "a"); err != nil || !mb.TokensNotBefore.IsZero() {
+		t.Fatalf("after the tombstone expired: %+v %v", mb, err)
+	}
+}
+
+// A key whose mailbox passed its rotation grace (not yet swept) registers
+// a fresh, empty mailbox.
+func testRegisterAfterGrace(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "old", 1)
+	if _, err := s.Deposit(ctx, "old", "s", []byte("x"), 30*24*time.Hour, store.Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(2 * time.Minute)
+	created, err := s.Register(ctx, "old", key(1))
+	if err != nil || !created {
+		t.Fatalf("register after grace: %v %v", created, err)
+	}
+	if _, err := s.Mailbox(ctx, "old"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := s.Collect(ctx, "old", 10, time.Minute); len(got) != 0 {
+		t.Fatalf("fresh mailbox has %d old messages", len(got))
+	}
+	if _, err := s.Mailbox(ctx, "new"); err != nil {
+		t.Fatal("successor must survive", err)
 	}
 }

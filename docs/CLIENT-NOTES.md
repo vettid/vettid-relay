@@ -166,7 +166,7 @@ uses two 0.3 features.
 | `409 token_used` | The one-shot open token was already used. Ask the owner for a new invitation. |
 | `claim_unknown` | The claim expired or was already fetched (single fetch). Get a fresh claim id. |
 | `payload_too_large` | Use the claim-check blob flow (§7) or split at the E2E layer. |
-| `mailbox_unknown` | Wrong address, the mailbox isn't registered, or it was rotated away. Re-resolve over E2E. |
+| `mailbox_unknown` | Wrong address, the mailbox isn't registered, it was rotated away, or its owner deleted it. Re-resolve over E2E. For your own collect, it means your mailbox no longer exists. |
 
 Never retry 4xx errors other than 429 unchanged. Never automatically retry
 a claim `GET`: the first response may have consumed the claim.
@@ -205,7 +205,24 @@ a claim `GET`: the first response may have consumed the claim.
 4. Mint new tokens under the new key, announce the new address over E2E,
    and stop using old tokens. They die with the old mailbox.
 
-## 9. Things clients must never do
+## 9. Deleting your mailbox (relay ≥ 0.5.0)
+
+1. Send `DELETE /v1/mailbox`, owner-signed, with no body. The answer is
+   always `204`, also if the mailbox was already gone, so a lost response
+   is simply repeated (`relayclient.DeleteMailbox`).
+2. Everything goes at once: messages, denylist, blobs, the claims you
+   created, and older mailboxes you rotated away from that are still in
+   their grace period. Deposits get `mailbox_unknown`, and your own
+   long-poll or WebSocket ends (`mailbox_unknown`, close code 4404).
+3. You don't need to revoke tokens first: they can't deposit into a
+   mailbox that doesn't exist. Collect anything you still need before
+   deleting.
+4. Prefer a new key over registering the deleted one again. If you do
+   register it again, the mailbox starts empty and the relay refuses every
+   token whose `iat` is before the deletion time plus 90 seconds, so mint
+   fresh tokens no earlier than that.
+
+## 10. Things clients must never do
 
 - Never send plaintext payloads. Everything you deposit is already E2E
   ciphertext.

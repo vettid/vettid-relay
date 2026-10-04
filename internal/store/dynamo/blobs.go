@@ -30,12 +30,15 @@ var errBlobsDisabled = errors.New("dynamo: blob storage not configured")
 // chargeStored runs a transaction that adds delta to the mailbox's
 // blob+claim byte counter (within maxStored) together with extra items,
 // recomputing the counter once if the cap appears exceeded. extraQuota
-// lists indexes of extra items whose condition failure means ErrQuota.
-func (s *Store) chargeStored(ctx context.Context, mailbox string, delta, maxStored int64, extra []types.TransactWriteItem, extraQuota ...int) error {
+// lists indexes of extra items whose condition failure means ErrQuota. A
+// non-zero iat is the token's issue time (ErrRevoked before the mailbox's
+// TokensNotBefore).
+func (s *Store) chargeStored(ctx context.Context, mailbox string, delta, maxStored int64, iat time.Time, extra []types.TransactWriteItem, extraQuota ...int) error {
 	reconciled := false
 	for attempt := 0; ; attempt++ {
 		now := s.now()
 		q := newQuotaCond(now)
+		q.issuedAt(iat)
 		q.room("blob_bytes", delta, maxStored)
 		q.vals[":d"], q.vals[":one"] = avN(delta), avN(1)
 		items := append([]types.TransactWriteItem{{Update: &types.Update{
@@ -60,8 +63,8 @@ func (s *Store) chargeStored(ctx context.Context, mailbox string, delta, maxStor
 			}
 		}
 		if reasonCode(r, 0) == "ConditionalCheckFailed" {
-			if d, ok := getN(r[0].Item, "dead_at"); ok && d <= ms(now) {
-				return store.ErrNotFound
+			if err := deadOrRevoked(r[0].Item, now, iat); err != nil {
+				return err
 			}
 			if !reconciled {
 				reconciled = true
@@ -113,7 +116,7 @@ func (s *Store) PutBlob(ctx context.Context, p store.BlobPut, r io.Reader) (stor
 		quotaIdx = append(quotaIdx, len(extra))
 		extra = append(extra, types.TransactWriteItem{Update: u})
 	}
-	if err := s.chargeStored(ctx, p.Mailbox, p.Size, p.Limits.MailboxMaxBytes, extra, quotaIdx...); err != nil {
+	if err := s.chargeStored(ctx, p.Mailbox, p.Size, p.Limits.MailboxMaxBytes, p.Limits.TokenIssuedAt, extra, quotaIdx...); err != nil {
 		return store.BlobInfo{}, err
 	}
 	_, err = s.cfg.S3.PutObject(ctx, &s3.PutObjectInput{
@@ -203,7 +206,7 @@ func (s *Store) PutClaim(ctx context.Context, mailbox string, data []byte, ttl t
 			},
 		}},
 	}
-	if err := s.chargeStored(ctx, mailbox, size, maxStored, extra); err != nil {
+	if err := s.chargeStored(ctx, mailbox, size, maxStored, time.Time{}, extra); err != nil {
 		return "", time.Time{}, err
 	}
 	return id, exp, nil

@@ -198,7 +198,10 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))
 		return
-	case errors.Is(err, store.ErrNotFound): // mailbox reached its deletion time mid-request
+	case errors.Is(err, store.ErrRevoked): // the mailbox was deleted and re-registered mid-request
+		s.writeError(w, fail(CodeTokenRevoked))
+		return
+	case errors.Is(err, store.ErrNotFound): // mailbox reached its deletion time, or was deleted, mid-request
 		s.writeError(w, fail(CodeMailboxUnknown))
 		return
 	case err != nil:
@@ -225,7 +228,7 @@ func senderRateKey(da *depositAuth) string {
 }
 
 func (s *Server) limitsFor(da *depositAuth, blob bool) store.Limits {
-	l := store.Limits{TokenJTI: da.claims.Jti, TokenExpires: da.claims.Exp, ConsumeJTI: da.claims.Open()}
+	l := store.Limits{TokenJTI: da.claims.Jti, TokenIssuedAt: da.claims.Iat, TokenExpires: da.claims.Exp, ConsumeJTI: da.claims.Open()}
 	if blob {
 		l.MailboxMaxBytes = s.cfg.MailboxMaxBlobBytes
 	} else {
@@ -293,6 +296,11 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.hub.release(mb.ID)
+	gone := s.hub.goneCh(mb.ID)
+	if !s.stillRegistered(r.Context(), mb.ID) {
+		s.writeError(w, fail(CodeMailboxUnknown)) // deleted since authorization
+		return
+	}
 
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
@@ -335,6 +343,9 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-wake:
 		case <-leaseC:
+		case <-gone: // the owner deleted the mailbox (§6.10): terminal
+			s.writeError(w, fail(CodeMailboxUnknown))
+			done = true
 		case <-deadline.C:
 			s.respondMessages(w, nil)
 			done = true
@@ -470,6 +481,9 @@ func (s *Server) handleDenylist(w http.ResponseWriter, r *http.Request) {
 	switch err := s.st.AddDenylist(r.Context(), mb.ID, entries, exp, s.cfg.MailboxMaxDenylist); {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))
+		return
+	case errors.Is(err, store.ErrNotFound): // deleted mid-request
+		s.writeError(w, fail(CodeMailboxUnknown))
 		return
 	case err != nil:
 		s.log.Error("denylist update failed", "err", err)

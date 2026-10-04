@@ -7,7 +7,7 @@ import (
 )
 
 // schemaVersion is bumped with every migration appended to migrations.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // migrations[i] upgrades the schema from version i to i+1.
 //
@@ -96,6 +96,19 @@ CREATE INDEX idx_claims_expiry  ON claims(expires_at);
 	// with, returned on collect (§6.3). Rows from earlier versions have ''.
 	`
 ALTER TABLE messages ADD COLUMN token_jti TEXT NOT NULL DEFAULT '';
+`,
+	// v4 (protocol 0.5.0): tombstones of deleted mailboxes (§6.10). Not
+	// tied to mailboxes by a foreign key: a tombstone outlives its mailbox
+	// row and applies to a later registration of the same key, whose
+	// tokens must have iat >= not_before. Kept until every token minted
+	// before the deletion has expired.
+	`
+CREATE TABLE tombstones (
+  mailbox_id TEXT PRIMARY KEY,
+  not_before INTEGER NOT NULL,   -- tokens with iat before this are refused
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX idx_tombstones_expiry ON tombstones(expires_at);
 `,
 }
 

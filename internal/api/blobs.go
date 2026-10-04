@@ -97,6 +97,12 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))
 		return
+	case errors.Is(err, store.ErrRevoked):
+		s.writeError(w, fail(CodeTokenRevoked))
+		return
+	case errors.Is(err, store.ErrNotFound): // deleted mid-request
+		s.writeError(w, fail(CodeMailboxUnknown))
+		return
 	case err != nil:
 		s.log.Error("blob put failed", "err", err)
 		s.writeError(w, fail(CodeInternal))

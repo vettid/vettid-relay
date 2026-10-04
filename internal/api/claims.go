@@ -60,6 +60,9 @@ func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))
 		return
+	case errors.Is(err, store.ErrNotFound): // deleted mid-request
+		s.writeError(w, fail(CodeMailboxUnknown))
+		return
 	case err != nil:
 		s.log.Error("claim put failed", "err", err)
 		s.writeError(w, fail(CodeInternal))
