@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/store"
 	auth "github.com/vettid/vettid-relay/relayauth"
 )
@@ -430,8 +431,19 @@ func (s *Server) ack(ctx context.Context, mailbox, msgID string) *apiError {
 // every token it could match has iat ≤ now and a lifetime bounded by the
 // configured caps (sender-bound or open), so it expires within the larger
 // cap; a margin covers the freshness window.
-func (s *Server) denylistRetention() time.Duration {
-	return max(s.cfg.MaxTokenLifetime, s.cfg.OpenTokenMaxLifetime) + auth.FreshnessWindow + time.Minute
+func (s *Server) denylistRetention() time.Duration { return denylistRetention(s.cfg) }
+
+func denylistRetention(cfg config.Config) time.Duration {
+	return max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime) + auth.FreshnessWindow + time.Minute
+}
+
+// TombstonePolicy is the tombstone a mailbox leaves when it ends (§6.10;
+// §6.7 for one removed at the end of its rotation grace): tokens issued
+// before the end plus the freshness window are refused if its key
+// registers again, for the denylist retention after that. The stores take
+// it for the mailboxes they remove themselves.
+func TombstonePolicy(cfg config.Config) store.TombstonePolicy {
+	return store.TombstonePolicy{Margin: auth.FreshnessWindow, Retention: denylistRetention(cfg)}
 }
 
 // POST /v1/mailbox/denylist (spec §5.5)

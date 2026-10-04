@@ -117,6 +117,10 @@ type Config struct {
 	// ReconcileInterval bounds counter recomputation per mailbox and kind.
 	// Default 1 min.
 	ReconcileInterval time.Duration
+	// Tombstones is the tombstone policy for rotated-away mailboxes
+	// removed at the end of their grace (default
+	// store.DefaultTombstonePolicy).
+	Tombstones store.TombstonePolicy
 }
 
 // Store implements store.Backend.
@@ -384,8 +388,13 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, erro
 			return false, nil
 		}
 		// Deleted, or past its rotation grace and not purged yet: the key
-		// starts a fresh, empty mailbox.
-		revived, err := s.revive(ctx, id, pub)
+		// starts a fresh, empty mailbox. A rotated-away one is removed now:
+		// its tokens get the tombstone it would have got from the sweep.
+		var nb time.Time
+		if !mb.DeleteAfter.IsZero() { // not a deletion tombstone (parseMailbox)
+			nb, _ = s.cfg.Tombstones.Times(s.now())
+		}
+		revived, err := s.revive(ctx, id, pub, nb)
 		if err != nil || revived {
 			return revived, err
 		}
@@ -397,26 +406,33 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, erro
 // its contents are purged first, then A and S are reset in one
 // transaction that requires the mailbox to be still dead (false: it
 // changed meanwhile, look again). nb stays: tokens minted before a
-// deletion remain refused.
-func (s *Store) revive(ctx context.Context, id string, pub []byte) (bool, error) {
+// deletion remain refused. A non-zero setNB (a rotated-away mailbox
+// removed now) sets it.
+func (s *Store) revive(ctx context.Context, id string, pub []byte, setNB time.Time) (bool, error) {
 	defer s.forget(id)
 	if _, err := s.purgeContents(ctx, id); err != nil {
 		return false, err
 	}
 	now := s.now()
+	setA, setS := "SET created = :now", "SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z, v = if_not_exists(v, :z) + :one"
+	valsA, valsS := item{":p": avB(pub), ":now": avN(ms(now))}, item{":z": avN(0), ":one": avN(1)}
+	if !setNB.IsZero() {
+		setA, setS = setA+", nb = :nb", setS+", nb = :nb"
+		valsA[":nb"], valsS[":nb"] = avN(ms(setNB)), avN(ms(setNB))
+	}
 	_, err := s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName:                 &s.cfg.Table,
 			Key:                       key(mbPK(id), skAccount),
-			UpdateExpression:          aws.String("SET created = :now REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
+			UpdateExpression:          aws.String(setA + " REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
 			ConditionExpression:       aws.String("pub = :p AND (attribute_exists(deleted) OR delete_after <= :now)"),
-			ExpressionAttributeValues: item{":p": avB(pub), ":now": avN(ms(now))},
+			ExpressionAttributeValues: valsA,
 		}},
 		{Update: &types.Update{
 			TableName:                 &s.cfg.Table,
 			Key:                       key(mbPK(id), skStats),
-			UpdateExpression:          aws.String("SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z, v = if_not_exists(v, :z) + :one REMOVE dead_at"),
-			ExpressionAttributeValues: item{":z": avN(0), ":one": avN(1)},
+			UpdateExpression:          aws.String(setS + " REMOVE dead_at"),
+			ExpressionAttributeValues: valsS,
 		}},
 	}})
 	if err == nil {

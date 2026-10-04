@@ -165,3 +165,29 @@ func TestHealthzProtocolVersion(t *testing.T) {
 		t.Fatalf("healthz %d %s", code, b)
 	}
 }
+
+// A rotated-away mailbox removed at the end of its grace leaves the same
+// tombstone (§6.7): re-registering the old key gives a fresh mailbox in
+// which tokens issued before the removal are refused, although their
+// revocations are gone.
+func TestRotatedMailboxTombstone(t *testing.T) {
+	f := newFixture(t, nil)
+	owner, next, sender := newPrincipal(1), newPrincipal(4), newPrincipal(2)
+	f.register(owner)
+	tok := f.mint(owner, sender, func(c *auth.Claims) { c.Exp = c.Iat.Add(30 * 24 * time.Hour) })
+	f.revoke(owner, "sub", sender.b64)
+	proof := ed25519.Sign(next.priv, []byte(owner.mbx))
+	body, _ := json.Marshal(map[string]any{"new_pubkey": next.b64, "new_key_proof": proof})
+	if code, b := f.do(req{method: "POST", path: "/v1/mailbox/rotate", body: body, signer: &owner}); code != http.StatusOK {
+		t.Fatalf("rotate: %d %s", code, b)
+	}
+	f.clk.add(f.cfg.RotationGrace + 11*time.Minute) // past the grace and any purge delay
+	if _, err := f.st.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.register(owner)
+	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("old")), signer: &sender, token: tok}, 403, CodeTokenRevoked)
+	f.clk.add(2 * time.Minute)
+	fresh := f.mint(owner, sender, func(c *auth.Claims) { c.Iat = f.clk.now(); c.Exp = c.Iat.Add(time.Hour); c.Jti = "fresh" })
+	f.mustDeposit(owner, sender, fresh, []byte("new"))
+}

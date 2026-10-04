@@ -192,7 +192,10 @@ The relay MUST retain each denylist entry at least until the latest possible
 expiry of any token it could match; entries MAY then be garbage-collected.
 Issuers SHOULD bound token lifetimes (§5.2) precisely so that denylists stay
 small. A `sub` entry also blocks tokens minted for that sender *after* the
-revocation, until the entry expires.
+revocation, until the entry expires. A denylist ends with its mailbox
+(deleted, §6.10, or removed at the end of its rotation grace, §6.7); the
+tombstone the mailbox leaves keeps every token minted before then refused
+if its key ever registers again, so no revocation is undone that way.
 
 ### 5.6 One-shot open tokens (first contact)
 
@@ -351,6 +354,11 @@ a grace period (relay config, default 7 days, during which both collect).
 Because mailbox_id is key-derived, rotation changes the address; owners are
 responsible for re-issuing deposit tokens and notifying connections over E2E
 channels. Tokens issued under the old key die with it — this is a feature.
+When the relay removes the old mailbox at the end of the grace period it
+leaves the same tombstone as a deletion (§6.10), with the removal time in
+place of the deletion time: if the old key registers again, tokens issued
+before the removal time plus 90 seconds are refused (`token_revoked`), so
+the old mailbox's revocations and used one-shot tokens cannot come back.
 Deleting the successor (§6.10) also deletes an old mailbox still in its grace
 period; deleting the old mailbox (signed by the old key) ends only its own
 grace.
@@ -499,7 +507,9 @@ be replayed as a deletion.
   same bound as denylist entries, §5.5). An owner that re-registers a deleted
   key MUST mint new tokens with `iat` at least 90 seconds after the deletion
   (and SHOULD NOT backdate them across it, §5.2). Registering a new key is
-  simpler and RECOMMENDED: the tombstone then never matters.
+  simpler and RECOMMENDED: the tombstone then never matters. A mailbox
+  removed at the end of its rotation grace leaves the same tombstone, timed
+  from its removal (§6.7).
 - **Rotation.** Rotating into a deleted key's id (§6.7) is a re-registration:
   the successor starts empty and carries the tombstone's tokens-not-before.
 - **Timing.** Deletion is immediate; nothing waits for the message TTL. Clients
@@ -690,7 +700,10 @@ The push gateway API is specified separately.
   sessions close with 4404 (§6.3, §6.4). A re-registered key gets a fresh
   mailbox whose tokens must have `iat` at or after the deletion's
   tokens-not-before time (§5.3 step 6, `token_revoked`), kept as a tombstone
-  for the maximum token lifetime. No new error codes. Additive for clients.
+  for the maximum token lifetime. A rotated-away mailbox removed at the end
+  of its grace leaves the same tombstone, timed from its removal (§5.5,
+  §6.7), so re-registering an old key cannot revive its revoked or used
+  tokens either. No new error codes. Additive for clients.
 
 - **0.4.0** — collect results carry the deposit token's `jti` (§6.3, §6.4) so
   owners can distinguish a sender's tokens (VAULT-MESSAGING §6.6); `iat`

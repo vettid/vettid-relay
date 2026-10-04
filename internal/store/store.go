@@ -48,10 +48,16 @@ type Store struct {
 
 	idMu    sync.Mutex
 	entropy io.Reader
+
+	tomb TombstonePolicy
 }
 
 // Option configures a Store.
 type Option func(*Store)
+
+// WithTombstones sets the tombstone policy for rotated-away mailboxes
+// removed at the end of their grace (default DefaultTombstonePolicy).
+func WithTombstones(p TombstonePolicy) Option { return func(s *Store) { s.tomb = p } }
 
 // WithClock overrides the clock (tests).
 func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = now } }
@@ -174,7 +180,11 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (created bo
 	case mb.DeleteAfter == nil || now.Before(*mb.DeleteAfter):
 		return false, nil // live: idempotent
 	default:
-		// Past its rotation grace: purge it (ON DELETE CASCADE) first.
+		// Past its rotation grace: tombstone it and purge it (ON DELETE
+		// CASCADE) first, as the sweeper would have.
+		if err := s.tombstoneRotated(ctx, tx, now, `mailbox_id=?`, id); err != nil {
+			return false, err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM mailboxes WHERE mailbox_id=?`, id); err != nil {
 			return false, err
 		}
@@ -259,6 +269,18 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 		return err
 	}
 	return tx.Commit()
+}
+
+// tombstoneRotated writes (or extends) the tombstone of every mailbox row
+// matching where, removed at now.
+func (s *Store) tombstoneRotated(ctx context.Context, tx *sql.Tx, now time.Time, where string, arg any) error {
+	nb, keep := s.tomb.Times(now)
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO tombstones(mailbox_id, not_before, expires_at)
+		 SELECT mailbox_id, ?, ? FROM mailboxes WHERE `+where+`
+		 ON CONFLICT(mailbox_id) DO UPDATE SET not_before=MAX(not_before, excluded.not_before),
+		   expires_at=MAX(expires_at, excluded.expires_at)`, ms(nb), ms(keep), arg)
+	return err
 }
 
 // ----------------------------------------------------------------- denylist
@@ -534,6 +556,11 @@ func (s *Store) Sweep(ctx context.Context) (SweepStats, error) {
 		return st, err
 	}
 	defer tx.Rollback()
+	// Rotated-away mailboxes past their grace leave a tombstone (§6.7,
+	// §6.10) before they go.
+	if err := s.tombstoneRotated(ctx, tx, s.now(), `delete_after IS NOT NULL AND delete_after<=?`, ms(s.now())); err != nil {
+		return SweepStats{}, err
+	}
 	now := ms(s.now())
 	steps := []struct {
 		dst *int64

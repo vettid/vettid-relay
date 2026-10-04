@@ -106,6 +106,8 @@ func Run(t *testing.T, h Harness) {
 		{"DeleteMailboxAcrossProcesses", testDeleteAcrossProcesses},
 		{"DeleteMailboxTombstoneExpires", testDeleteTombstoneExpires},
 		{"RegisterAfterRotationGrace", testRegisterAfterGrace},
+		{"RotatedMailboxLeavesTombstone", testRotatedTombstone},
+		{"RotatedMailboxTombstoneAcrossProcesses", testRotatedTombstoneAcrossProcesses},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, h) })
@@ -1000,18 +1002,96 @@ func testRegisterAfterGrace(t *testing.T, h Harness) {
 	if err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
+	oldIat := c.Now().Add(-time.Minute)
 	c.Add(2 * time.Minute)
+	at := c.Now()
 	created, err := s.Register(ctx, "old", key(1))
 	if err != nil || !created {
 		t.Fatalf("register after grace: %v %v", created, err)
 	}
-	if _, err := s.Mailbox(ctx, "old"); err != nil {
-		t.Fatal(err)
+	// The registration removed the rotated mailbox, as a sweep would have:
+	// same tombstone, at the time of the registration.
+	if mb, err := s.Mailbox(ctx, "old"); err != nil || !mb.TokensNotBefore.Equal(at.Add(90*time.Second)) {
+		t.Fatalf("TokensNotBefore %+v, %v", mb.TokensNotBefore, err)
+	}
+	if _, err := s.Deposit(ctx, "old", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "t", TokenIssuedAt: oldIat, TokenExpires: at.Add(time.Hour)}); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("pre-rotation token after re-registration: %v", err)
 	}
 	if got, _, _ := s.Collect(ctx, "old", 10, time.Minute); len(got) != 0 {
 		t.Fatalf("fresh mailbox has %d old messages", len(got))
 	}
 	if _, err := s.Mailbox(ctx, "new"); err != nil {
 		t.Fatal("successor must survive", err)
+	}
+}
+
+// A rotated-away mailbox removed at the end of its grace (§6.7) leaves the
+// same tombstone as a deletion (§6.10), from the time of its removal: if
+// its key registers again, tokens issued under it before then — whose
+// revocations went with the mailbox — stay refused.
+func testRotatedTombstone(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "old", 1)
+	oldIat := c.Now().Add(-time.Minute)
+	exp := c.Now().Add(30 * 24 * time.Hour)
+	if err := s.AddDenylist(ctx, "old", []store.DenyEntry{{Kind: "jti", Value: "revoked"}}, exp, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Minute + h.SweepGrace)
+	removed := c.Now()
+	if st, err := s.Sweep(ctx); err != nil || st.Mailboxes != 1 {
+		t.Fatalf("sweep: %+v %v", st, err)
+	}
+	c.Add(time.Hour)
+	if created, err := s.Register(ctx, "old", key(1)); err != nil || !created {
+		t.Fatalf("re-register: %v %v", created, err)
+	}
+	mb, err := s.Mailbox(ctx, "old")
+	if err != nil || !mb.TokensNotBefore.Equal(removed.Add(90*time.Second)) {
+		t.Fatalf("TokensNotBefore %v (removed %v), %v", mb.TokensNotBefore, removed, err)
+	}
+	if got, _ := s.IsDenied(ctx, "old", "revoked", ""); got {
+		t.Fatal("the old denylist survived")
+	}
+	old := store.Limits{TokenJTI: "revoked", TokenIssuedAt: oldIat, TokenExpires: exp}
+	if _, err := s.Deposit(ctx, "old", "s", []byte("x"), time.Hour, old); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("revoked pre-rotation token after re-registration: %v", err)
+	}
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "old", SenderSub: "s", Size: 1, TTL: time.Hour, Limits: old}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("blob with a pre-rotation token: %v", err)
+	}
+	fresh := store.Limits{TokenJTI: "fresh", TokenIssuedAt: removed.Add(90 * time.Second), TokenExpires: exp}
+	if _, err := s.Deposit(ctx, "old", "s", []byte("x"), time.Hour, fresh); err != nil {
+		t.Fatalf("token issued after the tombstone's not-before: %v", err)
+	}
+	if _, err := s.Mailbox(ctx, "new"); err != nil {
+		t.Fatal("successor must survive", err)
+	}
+}
+
+// The same across two processes: the sweep runs on one, the key registers
+// again on the other, an old token is refused on either.
+func testRotatedTombstoneAcrossProcesses(t *testing.T, h Harness) {
+	a, b, c := h.pair(t)
+	mustRegister(t, a, "old", 1)
+	oldIat := c.Now().Add(-time.Minute)
+	if err := a.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Minute + h.SweepGrace)
+	if _, err := a.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Register(ctx, "old", key(1)); err != nil {
+		t.Fatal(err)
+	}
+	old := store.Limits{TokenJTI: "t", TokenIssuedAt: oldIat, TokenExpires: c.Now().Add(time.Hour)}
+	for i, s := range []store.Backend{a, b} {
+		if _, err := s.Deposit(ctx, "old", "s", []byte("x"), time.Hour, old); !errors.Is(err, store.ErrRevoked) {
+			t.Fatalf("process %d: pre-rotation token: %v", i, err)
+		}
 	}
 }

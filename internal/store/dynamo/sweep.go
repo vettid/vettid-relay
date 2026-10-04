@@ -20,8 +20,9 @@ import (
 // blob bodies. What TTL cannot do is cascade: Sweep purges rotated mailboxes
 // whose grace period ended at least PurgeDelay ago — every item in the
 // mailbox, its blob bodies and its claims — the way the SQLite store's
-// ON DELETE CASCADE does. Any number of processes may sweep concurrently;
-// purging is idempotent.
+// ON DELETE CASCADE does, and leaves a tombstone (§6.7, §6.10: the A and S
+// items, as a deletion does) that it purges in turn when it expires. Any
+// number of processes may sweep concurrently; purging is idempotent.
 func (s *Store) Sweep(ctx context.Context) (store.SweepStats, error) {
 	var st store.SweepStats
 	cutoff := ms(s.now().Add(-s.cfg.PurgeDelay))
@@ -50,10 +51,24 @@ func (s *Store) Sweep(ctx context.Context) (store.SweepStats, error) {
 	return st, nil
 }
 
-// purge deletes everything in a mailbox's partition, then (conditionally,
-// in case it was revived as a rotation successor or re-registered
-// meanwhile) the mailbox.
+// purge removes a due mailbox. A rotated-away one is emptied and turned
+// into a tombstone; an expired tombstone is deleted with its whole
+// partition. Both steps are conditional on the mailbox still being due
+// (it may have been revived as a rotation successor or re-registered).
 func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs int64, purged bool, err error) {
+	out, err := s.cfg.DB.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &s.cfg.Table, Key: key(mbPK(mailbox), skAccount), ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	it := out.Item
+	if len(it) == 0 || getS(it, "gpk") != dueValue || getN0(it, "gsk") > cutoff {
+		return 0, false, nil
+	}
+	if _, tomb := it["deleted"]; !tomb {
+		return s.retire(ctx, mailbox, it, cutoff)
+	}
 	msgs, err = s.purgeItems(ctx, mailbox, func(sk string) bool { return sk != skAccount })
 	if err != nil {
 		return 0, false, err
@@ -68,6 +83,40 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 		return msgs, false, nil
 	}
 	s.forget(mailbox)
+	return msgs, err == nil, err
+}
+
+// retire tombstones a rotated-away mailbox at the end of its grace: its
+// contents go, and if its key registers again, tokens issued before now +
+// margin are refused (the tombstone keeps the counters item dead
+// meanwhile, so a stale cache cannot write either).
+func (s *Store) retire(ctx context.Context, mailbox string, it item, cutoff int64) (int64, bool, error) {
+	defer s.forget(mailbox)
+	msgs, err := s.purgeContents(ctx, mailbox)
+	if err != nil {
+		return 0, false, err
+	}
+	nb, keep := s.cfg.Tombstones.Times(s.now())
+	nbv := max(ms(nb), getN0(it, "nb"))
+	_, err = s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Update: &types.Update{
+			TableName:           &s.cfg.Table,
+			Key:                 key(mbPK(mailbox), skAccount),
+			UpdateExpression:    aws.String("SET deleted = :now, nb = :nb, gsk = :keep REMOVE preds"),
+			ConditionExpression: aws.String("gpk = :due AND gsk <= :cut AND attribute_not_exists(deleted)"),
+			ExpressionAttributeValues: item{":now": avN(ms(s.now())), ":nb": avN(nbv), ":keep": avN(ms(keep)),
+				":due": avS(dueValue), ":cut": avN(cutoff)},
+		}},
+		{Update: &types.Update{
+			TableName:                 &s.cfg.Table,
+			Key:                       key(mbPK(mailbox), skStats),
+			UpdateExpression:          aws.String("SET dead_at = :zero, nb = :nb, msgs = :zero, bytes = :zero, blob_bytes = :zero, deny = :zero"),
+			ExpressionAttributeValues: item{":zero": avN(0), ":nb": avN(nbv)},
+		}},
+	}})
+	if r := txReasons(err); r != nil {
+		return msgs, false, nil // revived or retired meanwhile; the next sweep looks again
+	}
 	return msgs, err == nil, err
 }
 

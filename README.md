@@ -230,8 +230,8 @@ other process sees, refuses or is woken by.
   other processes without errors.
 - **Sweeper.** Each process sweeps; the only work left for it is purging
   rotated mailboxes 10 minutes after their grace period (the cascade
-  SQLite does with foreign keys) and deleted mailboxes' tombstones when
-  they expire. Purges are idempotent.
+  SQLite does with foreign keys), leaving a tombstone like a deletion's,
+  and tombstones when they expire. Purges are idempotent.
 - **Mailbox deletion** (§6.10). One transaction marks the mailbox item
   deleted and the counters item dead (and records the tokens-not-before
   time on both); from then on every deposit, blob upload, claim creation
@@ -338,10 +338,13 @@ implementation chooses as follows:
   tokens-not-before time (deletion + 90 s) and an expiry of that time plus
   the denylist retention. With SQLite they are a table without a foreign
   key to the mailbox; with DynamoDB, the mailbox and counters items.
-- **Registering a key past its rotation grace** (not yet swept) starts a
-  fresh, empty mailbox (`201`), as after the sweep. (Before 0.5.0 it
-  answered `200` for a mailbox that no longer resolved.) A rotated-away
-  mailbox removed by the sweeper leaves no tombstone.
+- **Rotated-away mailboxes leave tombstones** (§6.7): the sweeper (or a
+  re-registration of the old key, whichever removes the mailbox first)
+  writes the deletion tombstone with the removal time, so tokens issued
+  under the old registration stay refused. Registering a key past its
+  rotation grace starts a fresh, empty mailbox (`201`). (Before 0.5.0 it
+  answered `200` for a mailbox that no longer resolved, and a swept
+  mailbox's key could register again with its old tokens valid.)
 - **Open tokens and blobs.** One-shot open tokens are refused for
   `PUT /v1/blob` with `token_invalid`. §5.6 grants "exactly one deposit".
   §6.8 says blob authorization is "identical to deposit", but letting a

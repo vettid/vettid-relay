@@ -72,6 +72,35 @@ type Backend interface {
 
 var _ Backend = (*Store)(nil)
 
+// TombstonePolicy is how a mailbox that ends without an explicit deletion
+// — a rotated-away mailbox removed at the end of its grace (§6.7) — is
+// tombstoned like a deleted one (§6.10): tokens issued before the removal
+// time plus Margin are refused if its key registers again, and the
+// tombstone is kept for Retention after that.
+type TombstonePolicy struct {
+	Margin    time.Duration // the freshness window (90 s)
+	Retention time.Duration // the denylist retention (max token lifetime + margins)
+}
+
+// DefaultTombstonePolicy matches the relay's default limits (400-day
+// token lifetime). The relay passes its configured policy
+// (api.TombstonePolicy).
+var DefaultTombstonePolicy = TombstonePolicy{Margin: 90 * time.Second, Retention: 400*24*time.Hour + 90*time.Second + time.Minute}
+
+func (p TombstonePolicy) orDefault() TombstonePolicy {
+	if p.Margin <= 0 || p.Retention <= 0 {
+		return DefaultTombstonePolicy
+	}
+	return p
+}
+
+// Times returns the tombstone's not-before and expiry for a removal at now.
+func (p TombstonePolicy) Times(now time.Time) (notBefore, keepUntil time.Time) {
+	p = p.orDefault()
+	nb := now.Add(p.Margin)
+	return nb, nb.Add(p.Retention)
+}
+
 // Collect implements Backend for SQLite: Lease, and when nothing was leased,
 // the next lease expiry.
 func (s *Store) Collect(ctx context.Context, mailbox string, max int, visibility time.Duration) ([]Message, time.Time, error) {

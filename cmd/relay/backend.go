@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/vettid/vettid-relay/internal/api"
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/coord"
 	"github.com/vettid/vettid-relay/internal/metrics"
@@ -21,7 +22,7 @@ import (
 // in WAL mode before the relay listens; DynamoDB is checked with one read.
 func openStore(ctx context.Context, cfg config.Config) (store.Backend, error) {
 	if cfg.Store != "dynamodb" {
-		return store.Open(ctx, cfg.DBPath)
+		return store.Open(ctx, cfg.DBPath, store.WithTombstones(api.TombstonePolicy(cfg)))
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
@@ -47,6 +48,7 @@ func openStore(ctx context.Context, cfg config.Config) (store.Backend, error) {
 		Table: cfg.DynamoTable, Bucket: cfg.BlobBucket, DB: db, S3: objects,
 		// A rotated-away mailbox must stop resolving when its grace ends.
 		MailboxCacheTTL: min(5*time.Minute, cfg.RotationGrace/2),
+		Tombstones:      api.TombstonePolicy(cfg),
 	})
 	if err != nil {
 		return nil, err
