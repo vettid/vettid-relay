@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/store"
 	auth "github.com/vettid/vettid-relay/relayauth"
 )
@@ -198,7 +199,10 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))
 		return
-	case errors.Is(err, store.ErrNotFound): // mailbox reached its deletion time mid-request
+	case errors.Is(err, store.ErrRevoked): // the mailbox was deleted and re-registered mid-request
+		s.writeError(w, fail(CodeTokenRevoked))
+		return
+	case errors.Is(err, store.ErrNotFound): // mailbox reached its deletion time, or was deleted, mid-request
 		s.writeError(w, fail(CodeMailboxUnknown))
 		return
 	case err != nil:
@@ -225,7 +229,7 @@ func senderRateKey(da *depositAuth) string {
 }
 
 func (s *Server) limitsFor(da *depositAuth, blob bool) store.Limits {
-	l := store.Limits{TokenJTI: da.claims.Jti, TokenExpires: da.claims.Exp, ConsumeJTI: da.claims.Open()}
+	l := store.Limits{TokenJTI: da.claims.Jti, TokenIssuedAt: da.claims.Iat, TokenExpires: da.claims.Exp, ConsumeJTI: da.claims.Open()}
 	if blob {
 		l.MailboxMaxBytes = s.cfg.MailboxMaxBlobBytes
 	} else {
@@ -293,6 +297,11 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.hub.release(mb.ID)
+	gone := s.hub.goneCh(mb.ID)
+	if !s.stillRegistered(r.Context(), mb.ID) {
+		s.writeError(w, fail(CodeMailboxUnknown)) // deleted since authorization
+		return
+	}
 
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
@@ -335,6 +344,9 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-wake:
 		case <-leaseC:
+		case <-gone: // the owner deleted the mailbox (§6.10): terminal
+			s.writeError(w, fail(CodeMailboxUnknown))
+			done = true
 		case <-deadline.C:
 			s.respondMessages(w, nil)
 			done = true
@@ -419,8 +431,19 @@ func (s *Server) ack(ctx context.Context, mailbox, msgID string) *apiError {
 // every token it could match has iat ≤ now and a lifetime bounded by the
 // configured caps (sender-bound or open), so it expires within the larger
 // cap; a margin covers the freshness window.
-func (s *Server) denylistRetention() time.Duration {
-	return max(s.cfg.MaxTokenLifetime, s.cfg.OpenTokenMaxLifetime) + auth.FreshnessWindow + time.Minute
+func (s *Server) denylistRetention() time.Duration { return denylistRetention(s.cfg) }
+
+func denylistRetention(cfg config.Config) time.Duration {
+	return max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime) + auth.FreshnessWindow + time.Minute
+}
+
+// TombstonePolicy is the tombstone a mailbox leaves when it ends (§6.10;
+// §6.7 for one removed at the end of its rotation grace): tokens issued
+// before the end plus the freshness window are refused if its key
+// registers again, for the denylist retention after that. The stores take
+// it for the mailboxes they remove themselves.
+func TombstonePolicy(cfg config.Config) store.TombstonePolicy {
+	return store.TombstonePolicy{Margin: auth.FreshnessWindow, Retention: denylistRetention(cfg)}
 }
 
 // POST /v1/mailbox/denylist (spec §5.5)
@@ -470,6 +493,9 @@ func (s *Server) handleDenylist(w http.ResponseWriter, r *http.Request) {
 	switch err := s.st.AddDenylist(r.Context(), mb.ID, entries, exp, s.cfg.MailboxMaxDenylist); {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))
+		return
+	case errors.Is(err, store.ErrNotFound): // deleted mid-request
+		s.writeError(w, fail(CodeMailboxUnknown))
 		return
 	case err != nil:
 		s.log.Error("denylist update failed", "err", err)

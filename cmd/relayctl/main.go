@@ -45,6 +45,8 @@ commands:
   deposit  -key SENDER -to MAILBOX -token TOKEN (-data TEXT | -file PATH | stdin)
   collect  -key OWNER [-wait 25] [-max 32] [-ack] [-follow]
   revoke   -key OWNER (-jti ID | -sub PUBKEY_B64)
+  delete-mailbox -key OWNER -confirm MAILBOX_ID
+                                             delete the key's mailbox and everything in it
   blob-put -key SENDER -to MAILBOX -token TOKEN -file PATH
   blob-get -key OWNER -id BLOB_ID [-out PATH] [-delete]
   smoke                                      full end-to-end check with two throwaway keys
@@ -92,6 +94,7 @@ func dispatch(ctx context.Context, url, cmd string, args []string) error {
 	follow := fs.Bool("follow", false, "keep collecting")
 	id := fs.String("id", "", "blob id")
 	del := fs.Bool("delete", false, "delete the blob after fetching")
+	confirm := fs.String("confirm", "", "the mailbox id being deleted (delete-mailbox)")
 	fs.Parse(args)
 
 	load := func() (*client.Client, error) {
@@ -259,6 +262,19 @@ func dispatch(ctx context.Context, url, cmd string, args []string) error {
 			return errors.New("-jti or -sub is required")
 		}
 		return c.Revoke(ctx, r...)
+	case "delete-mailbox":
+		c, err := load()
+		if err != nil {
+			return err
+		}
+		if *confirm != c.MailboxID() {
+			return fmt.Errorf("refusing to delete: -confirm must be the key's mailbox id (%s)", c.MailboxID())
+		}
+		if err := c.DeleteMailbox(ctx); err != nil {
+			return err
+		}
+		fmt.Printf("deleted %s\n", c.MailboxID())
+		return nil
 	case "blob-put":
 		c, err := load()
 		if err != nil {
@@ -341,7 +357,8 @@ func preview(b []byte) string {
 }
 
 // smoke runs register → mint → long-poll deposit/collect (latency) → ack →
-// blob put/get/delete → revoke → rejected deposit, with throwaway keys.
+// blob put/get/delete → revoke → rejected deposit → mailbox delete, with
+// throwaway keys (deleted again at the end on relays ≥ 0.5.0).
 // NOTE: payloads here are plaintext test strings; real clients deposit only
 // end-to-end ciphertext.
 func smoke(ctx context.Context, url string) error {
@@ -468,6 +485,49 @@ func smoke(ctx context.Context, url string) error {
 		err = errors.New("deposit accepted after revocation")
 	}
 	if err := step("revoked deposit rejected", err); err != nil {
+		return err
+	}
+	// Mailbox deletion (0.5.0): a parked collect ends with mailbox_unknown,
+	// later deposits are refused, and the throwaway keys leave nothing
+	// behind. A relay before 0.5.0 has no such route (not_found): skipped.
+	parked := make(chan error, 1)
+	go func() { _, err := owner.Collect(ctx, 25*time.Second, 10); parked <- err }()
+	time.Sleep(500 * time.Millisecond) // let the collect park
+	err = owner.DeleteMailbox(ctx)
+	if client.IsCode(err, "not_found") {
+		<-parked
+		fmt.Println("skip mailbox delete (relay < 0.5.0)")
+		fmt.Println("smoke test passed")
+		return nil
+	}
+	if err := step("delete mailbox", err); err != nil {
+		return err
+	}
+	perr := <-parked
+	if client.IsCode(perr, "mailbox_unknown") {
+		perr = nil
+	} else if perr == nil {
+		perr = errors.New("parked collect not ended by the deletion")
+	}
+	if err := step("parked collect ended (mailbox_unknown)", perr); err != nil {
+		return err
+	}
+	fresh, err := owner.MintToken(stranger.PublicKeyB64(), url, client.TokenOptions{TTL: time.Hour})
+	if err == nil {
+		_, err = stranger.Deposit(ctx, reg.MailboxID, fresh, []byte("must fail"))
+		if client.IsCode(err, "mailbox_unknown") {
+			err = nil
+		} else if err == nil {
+			err = errors.New("deposit accepted after deletion")
+		}
+	}
+	if err := step("deposit after delete rejected", err); err != nil {
+		return err
+	}
+	if err := step("delete is idempotent", owner.DeleteMailbox(ctx)); err != nil {
+		return err
+	}
+	if err := step("delete sender mailbox", sender.DeleteMailbox(ctx)); err != nil {
 		return err
 	}
 	fmt.Println("smoke test passed")

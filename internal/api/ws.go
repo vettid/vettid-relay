@@ -37,6 +37,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.hub.release(mb.ID)
+	gone := s.hub.goneCh(mb.ID)
+	if !s.stillRegistered(r.Context(), mb.ID) {
+		s.writeError(w, fail(CodeMailboxUnknown)) // deleted since authorization
+		return
+	}
 	if !s.beginStream() { // shutting down: tell the client to come back
 		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
 		return
@@ -138,6 +143,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			err := conn.Ping(pctx)
 			pcancel()
 			stop = err != nil
+		case <-gone: // the owner deleted the mailbox (§6.10)
+			conn.Close(wsStatusMailboxUnknown, CodeMailboxUnknown)
+			stop = true
 		case <-ctx.Done():
 			stop = true
 		}

@@ -7,7 +7,7 @@ keys to payload content: a compromised relay can drop or delay messages, but
 can't read or forge them.
 
 - **Protocol:** [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md)
-  (**v0.4.0**, reported by `relay -version` and `/healthz`). This repository
+  (**v0.5.0**, reported by `relay -version` and `/healthz`). This repository
   implements all of it:
   - registration
   - deposit tokens (PASETO v4.public, sender-bound), plus one-shot open
@@ -15,6 +15,7 @@ can't read or forge them.
   - deposit, and long-poll and WebSocket collect with the depositor's
     `sender` key
   - ack, denylist revocation and key rotation
+  - owner-signed mailbox deletion with re-registration tombstones (§6.10)
   - the optional blob transfer (§6.8)
   - single-fetch claims for bootstrap bundles (§6.9)
 
@@ -45,12 +46,18 @@ it mints a token, deposits a message, collects it by long-poll (and reports
 the wake latency), and acks it. It then uploads, fetches and deletes a 1 MiB
 blob. Next it runs first contact: it leaves a claim, a stranger fetches it
 exactly once, the stranger deposits once with a one-shot open token, and
-the collect shows the stranger as `sender`. Finally it revokes the sender
-and checks that the next deposit is rejected.
+the collect shows the stranger as `sender`. It revokes the sender and
+checks that the next deposit is rejected. Finally (relay ≥ 0.5.0) it
+deletes the owner's mailbox while a long-poll is parked on it, checks that
+the long-poll ends with `mailbox_unknown` and a fresh token's deposit is
+refused, and deletes the sender's mailbox too, so a smoke run against a live
+relay leaves only the stranger's unregistered key behind. Against an older
+relay the deletion steps are skipped.
 
 Other `relayctl` commands run each step by hand: `keygen`, `register`,
 `mint`, `mint-open`, `deposit`, `collect`, `revoke`, `blob-put`,
-`blob-get`, `claim-put` and `claim-get`. Run `relayctl` with no arguments
+`blob-get`, `claim-put`, `claim-get` and `delete-mailbox` (which takes
+`-confirm <mailbox id>` as a guard). Run `relayctl` with no arguments
 for usage.
 
 ## Container
@@ -223,7 +230,21 @@ other process sees, refuses or is woken by.
   other processes without errors.
 - **Sweeper.** Each process sweeps; the only work left for it is purging
   rotated mailboxes 10 minutes after their grace period (the cascade
-  SQLite does with foreign keys). Purges are idempotent.
+  SQLite does with foreign keys), leaving a tombstone like a deletion's,
+  and tombstones when they expire. Purges are idempotent.
+- **Mailbox deletion** (§6.10). One transaction marks the mailbox item
+  deleted and the counters item dead (and records the tokens-not-before
+  time on both); from then on every deposit, blob upload, claim creation
+  and denylist write on any process fails its transaction condition, even
+  where that process still has the mailbox cached. The process that took
+  the request then deletes the partition's contents (blob bodies and the
+  mailbox's claims included), bumps the mailbox's empty-hint version and
+  publishes a deletion signal on the wake bus: other processes drop the
+  mailbox from their cache and end its parked collectors at once (a lost
+  signal only delays this until the cache entry expires, ≤ 5 min; their
+  collects then see an empty mailbox). The two tombstone items are purged
+  by the sweeper when the tombstone expires. Rotation adds the old id to
+  the successor's `preds` so a deletion can follow the chain.
 
 ## API summary
 
@@ -236,6 +257,7 @@ other process sees, refuses or is woken by.
 | `DELETE /v1/mailbox/{msg_id}` | owner | always `204`, including for another mailbox's message (a no-op) |
 | `POST /v1/mailbox/denylist` | owner | `204` |
 | `POST /v1/mailbox/rotate` | owner (current key) | `200 {mailbox_id}` |
+| `DELETE /v1/mailbox` | owner, no body | always `204` (idempotent): the mailbox, its contents and rotated predecessors are deleted |
 | `PUT /v1/blob/{mailbox_id}` | deposit token + signed by `sub` | `201 {blob_id, expires_at}` |
 | `GET /v1/blob/{blob_id}` | owner of the recipient mailbox | `200 application/octet-stream` |
 | `DELETE /v1/blob/{blob_id}` | owner | `204` (idempotent) |
@@ -312,6 +334,17 @@ implementation chooses as follows:
 - **Denylist retention** (§5.5) is the time of revocation, plus the larger
   of `RELAY_MAX_TOKEN_LIFETIME` and `RELAY_OPEN_TOKEN_MAX_LIFETIME`, plus
   the freshness window.
+- **Deletion tombstones** (§6.10) keep the mailbox id, the
+  tokens-not-before time (deletion + 90 s) and an expiry of that time plus
+  the denylist retention. With SQLite they are a table without a foreign
+  key to the mailbox; with DynamoDB, the mailbox and counters items.
+- **Rotated-away mailboxes leave tombstones** (§6.7): the sweeper (or a
+  re-registration of the old key, whichever removes the mailbox first)
+  writes the deletion tombstone with the removal time, so tokens issued
+  under the old registration stay refused. Registering a key past its
+  rotation grace starts a fresh, empty mailbox (`201`). (Before 0.5.0 it
+  answered `200` for a mailbox that no longer resolved, and a swept
+  mailbox's key could register again with its old tokens valid.)
 - **Open tokens and blobs.** One-shot open tokens are refused for
   `PUT /v1/blob` with `token_invalid`. §5.6 grants "exactly one deposit".
   §6.8 says blob authorization is "identical to deposit", but letting a

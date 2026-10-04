@@ -40,6 +40,30 @@ func (q *quotaCond) room(attr string, delta, max int64) {
 	q.vals[ph] = avN(max - delta)
 }
 
+// issuedAt requires a token issued at iat to be no older than the
+// mailbox's TokensNotBefore (nb on the counters item, set when a deletion
+// tombstoned the id, §6.10). Zero iat: no token, no condition.
+func (q *quotaCond) issuedAt(iat time.Time) {
+	if iat.IsZero() {
+		return
+	}
+	q.parts = append(q.parts, "(attribute_not_exists(nb) OR nb <= :iat)")
+	q.vals[":iat"] = avN(ms(iat))
+}
+
+// deadOrRevoked explains a failed counters condition from the item's old
+// image: ErrNotFound for a dead mailbox (rotated past its grace, or
+// deleted), ErrRevoked for a token issued before nb; nil otherwise.
+func deadOrRevoked(old item, now, iat time.Time) error {
+	if d, ok := getN(old, "dead_at"); ok && d <= ms(now) {
+		return store.ErrNotFound
+	}
+	if nb, ok := getN(old, "nb"); ok && !iat.IsZero() && ms(iat) < nb {
+		return store.ErrRevoked
+	}
+	return nil
+}
+
 func (q *quotaCond) expr() *string { return aws.String(strings.Join(q.parts, " AND ")) }
 
 // tokenCharge is the token-usage update for a deposit or blob (nil without a
@@ -98,6 +122,7 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 		now := s.now()
 		id := s.newID(now, after)
 		q := newQuotaCond(now)
+		q.issuedAt(lim.TokenIssuedAt)
 		q.parts = append(q.parts, "(attribute_not_exists(last_id) OR last_id < :id)")
 		q.vals[":id"] = avS(id)
 		q.room("msgs", 1, lim.MailboxMaxMsgs)
@@ -156,8 +181,8 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 			return store.Message{}, store.ErrQuota
 		case reasonCode(r, 0) == ccf:
 			old := r[0].Item
-			if d, ok := getN(old, "dead_at"); ok && d <= ms(now) {
-				return store.Message{}, store.ErrNotFound
+			if err := deadOrRevoked(old, now, lim.TokenIssuedAt); err != nil {
+				return store.Message{}, err
 			}
 			if last := getS(old, "last_id"); last >= id {
 				after = last // lost the ordering race: retry with a later ULID

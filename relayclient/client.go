@@ -306,6 +306,16 @@ func (c *Client) Ack(ctx context.Context, msgID string) error {
 	return err
 }
 
+// DeleteMailbox deletes this principal's mailbox and everything in it
+// (protocol ≥ 0.5.0, §6.10): messages, denylist, blobs and the claims it
+// created. Afterwards deposits get mailbox_unknown. Idempotent: deleting a
+// mailbox that does not exist succeeds. A relay older than 0.5.0 answers
+// not_found (no such route).
+func (c *Client) DeleteMailbox(ctx context.Context) error {
+	_, err := c.doJSON(ctx, request{method: "DELETE", path: "/v1/mailbox"}, nil)
+	return err
+}
+
 // Revocation is one denylist entry.
 type Revocation struct {
 	Kind  string `json:"kind"` // "jti" or "sub"

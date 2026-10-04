@@ -30,7 +30,8 @@ jobs:
   shared-backend:
     # The multi-process backend (hosting option B): DynamoDB conformance,
     # Valkey coordination, the whole API suite on DynamoDB, and the
-    # two-process e2e (wake, open token, claim, replay, shared rate limit).
+    # two-process e2e (wake, open token, claim, replay, shared rate limit,
+    # mailbox deletion).
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:

@@ -73,6 +73,12 @@ func (s *Server) authorizeDepositToken(ctx context.Context, r *http.Request, mai
 	if denied {
 		return nil, fail(CodeTokenRevoked)
 	}
+	// 6a. (0.5.0, §6.10) A token issued before this mailbox id was deleted
+	// predates the current registration of its key. (The store re-checks
+	// atomically with the write.)
+	if claims.Iat.Before(mb.TokensNotBefore) {
+		return nil, fail(CodeTokenRevoked)
+	}
 	// 6b. One-shot open tokens (§5.6): not already consumed. (Consumption is
 	// recorded atomically with the deposit, which re-checks under the write
 	// lock; this early check just avoids work for an obviously used token.)

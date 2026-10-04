@@ -17,7 +17,7 @@ import (
 )
 
 // ProtocolVersion is the docs/RELAY-PROTOCOL.md version this relay implements.
-const ProtocolVersion = "0.4.0"
+const ProtocolVersion = "0.5.0"
 
 // Server is the relay API.
 type Server struct {
@@ -62,6 +62,7 @@ type serverMetrics struct {
 	acks          metrics.Counter
 	revocations   metrics.Counter
 	rotations     metrics.Counter
+	deletions     metrics.Counter
 	parked        metrics.Gauge
 	wsSessions    metrics.Gauge
 	blobPuts      metrics.Counter
@@ -87,6 +88,7 @@ func newServerMetrics(reg *metrics.Registry) *serverMetrics {
 		acks:          reg.Counter("relay_acks_total", "Messages acknowledged and deleted."),
 		revocations:   reg.Counter("relay_denylist_entries_total", "Denylist entries added."),
 		rotations:     reg.Counter("relay_rotations_total", "Mailbox key rotations."),
+		deletions:     reg.Counter("relay_mailbox_deletions_total", "Mailboxes deleted by their owners (rotated predecessors included)."),
 		parked:        reg.Gauge("relay_parked_collectors", "Long-poll requests currently parked waiting for a deposit."),
 		wsSessions:    reg.Gauge("relay_ws_sessions", "Open WebSocket collect sessions."),
 		blobPuts:      reg.Counter("relay_blob_puts_total", "Blobs uploaded."),
@@ -171,6 +173,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/mailbox/{msg_id}", s.handleAck)
 	s.mux.HandleFunc("POST /v1/mailbox/denylist", s.handleDenylist)
 	s.mux.HandleFunc("POST /v1/mailbox/rotate", s.handleRotate)
+	s.mux.HandleFunc("DELETE /v1/mailbox", s.handleDeleteMailbox)
 	s.mux.HandleFunc("PUT /v1/claim", s.handleClaimPut)
 	s.mux.HandleFunc("PUT /v1/claim/ttl/{ttl_seconds}", s.handleClaimPut)
 	s.mux.HandleFunc("GET /v1/claim/{claim_id}", s.handleClaimGet)

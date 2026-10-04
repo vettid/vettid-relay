@@ -35,6 +35,9 @@ var (
 	ErrQuota = errors.New("store: quota exceeded")
 	// ErrTokenUsed is returned when a one-shot token was already consumed.
 	ErrTokenUsed = errors.New("store: token already used")
+	// ErrRevoked is returned when a token was issued before the mailbox's
+	// TokensNotBefore (it predates a deletion of the mailbox, §6.10).
+	ErrRevoked = errors.New("store: token predates the mailbox")
 )
 
 // Store is the SQLite-backed relay store.
@@ -45,10 +48,16 @@ type Store struct {
 
 	idMu    sync.Mutex
 	entropy io.Reader
+
+	tomb TombstonePolicy
 }
 
 // Option configures a Store.
 type Option func(*Store)
+
+// WithTombstones sets the tombstone policy for rotated-away mailboxes
+// removed at the end of their grace (default DefaultTombstonePolicy).
+func WithTombstones(p TombstonePolicy) Option { return func(s *Store) { s.tomb = p } }
 
 // WithClock overrides the clock (tests).
 func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = now } }
@@ -140,30 +149,51 @@ type Mailbox struct {
 	PubKey      []byte
 	CreatedAt   time.Time
 	DeleteAfter *time.Time // set when rotated away
+	// TokensNotBefore is set when this id was deleted before (§6.10):
+	// tokens issued before it predate the deletion and are refused. Zero
+	// when there is no such deletion on record.
+	TokensNotBefore time.Time
 }
 
 // Register creates the mailbox if absent. created is false when it already
 // existed with the same key (idempotent re-registration).
+//
+// A mailbox whose rotation grace has ended but which the sweeper has not
+// removed yet is gone: registering its key again starts a fresh, empty
+// mailbox (created is true), as after the sweep. A deleted mailbox (§6.10)
+// has no row; its tombstone gives the new mailbox its TokensNotBefore.
 func (s *Store) Register(ctx context.Context, id string, pub []byte) (created bool, err error) {
-	res, err := s.w.ExecContext(ctx,
-		`INSERT INTO mailboxes(mailbox_id, pubkey, created_at) VALUES(?,?,?)
-		 ON CONFLICT(mailbox_id) DO NOTHING`, id, pub, ms(s.now()))
+	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected()
-	if n == 1 {
-		return true, nil
-	}
-	mb, err := s.mailbox(ctx, s.w, id, true)
-	if err != nil {
+	defer tx.Rollback()
+	now := s.now()
+	mb, err := s.mailbox(ctx, tx, id, true)
+	switch {
+	case errors.Is(err, ErrNotFound):
+	case err != nil:
 		return false, err
-	}
-	if subtle.ConstantTimeCompare(mb.PubKey, pub) != 1 {
+	case subtle.ConstantTimeCompare(mb.PubKey, pub) != 1:
 		// 130-bit truncated hash collision; treat as a conflict.
 		return false, fmt.Errorf("store: mailbox id collision")
+	case mb.DeleteAfter == nil || now.Before(*mb.DeleteAfter):
+		return false, nil // live: idempotent
+	default:
+		// Past its rotation grace: tombstone it and purge it (ON DELETE
+		// CASCADE) first, as the sweeper would have.
+		if err := s.tombstoneRotated(ctx, tx, now, `mailbox_id=?`, id); err != nil {
+			return false, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM mailboxes WHERE mailbox_id=?`, id); err != nil {
+			return false, err
+		}
 	}
-	return false, nil
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO mailboxes(mailbox_id, pubkey, created_at) VALUES(?,?,?)`, id, pub, ms(now)); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // Mailbox returns a live mailbox (not past its rotation grace period).
@@ -178,10 +208,12 @@ type querier interface {
 func (s *Store) mailbox(ctx context.Context, q querier, id string, includeDead bool) (Mailbox, error) {
 	var mb Mailbox
 	var created int64
-	var del sql.NullInt64
+	var del, nb sql.NullInt64
 	err := q.QueryRowContext(ctx,
-		`SELECT mailbox_id, pubkey, created_at, delete_after FROM mailboxes WHERE mailbox_id=?`, id).
-		Scan(&mb.ID, &mb.PubKey, &created, &del)
+		`SELECT m.mailbox_id, m.pubkey, m.created_at, m.delete_after, t.not_before
+		 FROM mailboxes m LEFT JOIN tombstones t ON t.mailbox_id = m.mailbox_id
+		 WHERE m.mailbox_id=?`, id).
+		Scan(&mb.ID, &mb.PubKey, &created, &del, &nb)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Mailbox{}, ErrNotFound
 	}
@@ -189,6 +221,9 @@ func (s *Store) mailbox(ctx context.Context, q querier, id string, includeDead b
 		return Mailbox{}, err
 	}
 	mb.CreatedAt = fromMS(created)
+	if nb.Valid {
+		mb.TokensNotBefore = fromMS(nb.Int64)
+	}
 	if del.Valid {
 		t := fromMS(del.Int64)
 		if !includeDead && !s.now().Before(t) {
@@ -236,6 +271,18 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 	return tx.Commit()
 }
 
+// tombstoneRotated writes (or extends) the tombstone of every mailbox row
+// matching where, removed at now.
+func (s *Store) tombstoneRotated(ctx context.Context, tx *sql.Tx, now time.Time, where string, arg any) error {
+	nb, keep := s.tomb.Times(now)
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO tombstones(mailbox_id, not_before, expires_at)
+		 SELECT mailbox_id, ?, ? FROM mailboxes WHERE `+where+`
+		 ON CONFLICT(mailbox_id) DO UPDATE SET not_before=MAX(not_before, excluded.not_before),
+		   expires_at=MAX(expires_at, excluded.expires_at)`, ms(nb), ms(keep), arg)
+	return err
+}
+
 // ----------------------------------------------------------------- denylist
 
 // DenyEntry is one revocation (kind "jti" or "sub").
@@ -252,6 +299,9 @@ func (s *Store) AddDenylist(ctx context.Context, mailbox string, entries []DenyE
 		return err
 	}
 	defer tx.Rollback()
+	if err := s.checkLive(ctx, tx, mailbox, Limits{}); err != nil {
+		return err
+	}
 	for _, e := range entries {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO denylist(mailbox_id, kind, value, expires_at) VALUES(?,?,?,?)
@@ -297,6 +347,19 @@ func (s *Store) IsConsumed(ctx context.Context, mailbox, jti string) (bool, erro
 
 // ---------------------------------------------------------------- messages
 
+// checkLive fails with ErrNotFound unless mailbox is live, and with
+// ErrRevoked if the token predates the mailbox's TokensNotBefore.
+func (s *Store) checkLive(ctx context.Context, q querier, mailbox string, lim Limits) error {
+	mb, err := s.mailbox(ctx, q, mailbox, false)
+	if err != nil {
+		return err
+	}
+	if !lim.TokenIssuedAt.IsZero() && lim.TokenIssuedAt.Before(mb.TokensNotBefore) {
+		return ErrRevoked
+	}
+	return nil
+}
+
 // Limits are the quota limits applied atomically with a deposit or blob put.
 // Zero/negative mailbox limits mean "unlimited". Token quota fields are nil
 // when the token carries no quota.
@@ -305,6 +368,7 @@ type Limits struct {
 	MailboxMaxBytes int64 // messages: payload bytes; blobs: blob bytes
 
 	TokenJTI        string
+	TokenIssuedAt   time.Time // the token's iat: refused (ErrRevoked) before the mailbox's TokensNotBefore
 	TokenExpires    time.Time
 	TokenQuotaMsgs  *int64
 	TokenQuotaBytes *int64
@@ -337,9 +401,9 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 	now := s.now()
 	size := int64(len(payload))
 
-	// The mailbox may have passed its rotation deadline since the caller
-	// looked it up.
-	if _, err := s.mailbox(ctx, tx, mailbox, false); err != nil {
+	// The mailbox may have passed its rotation deadline, or been deleted,
+	// since the caller looked it up.
+	if err := s.checkLive(ctx, tx, mailbox, lim); err != nil {
 		return Message{}, err
 	}
 	if lim.ConsumeJTI {
@@ -479,7 +543,7 @@ func (s *Store) Ack(ctx context.Context, mailbox, msgID string) (bool, error) {
 
 // SweepStats counts what one sweep pass removed.
 type SweepStats struct {
-	Messages, Leases, Denylist, Blobs, TokenUsage, Mailboxes, ConsumedTokens, Claims int64
+	Messages, Leases, Denylist, Blobs, TokenUsage, Mailboxes, ConsumedTokens, Claims, Tombstones int64
 }
 
 // Sweep deletes expired messages, blobs, denylist rows, token counters and
@@ -492,6 +556,11 @@ func (s *Store) Sweep(ctx context.Context) (SweepStats, error) {
 		return st, err
 	}
 	defer tx.Rollback()
+	// Rotated-away mailboxes past their grace leave a tombstone (§6.7,
+	// §6.10) before they go.
+	if err := s.tombstoneRotated(ctx, tx, s.now(), `delete_after IS NOT NULL AND delete_after<=?`, ms(s.now())); err != nil {
+		return SweepStats{}, err
+	}
 	now := ms(s.now())
 	steps := []struct {
 		dst *int64
@@ -506,6 +575,7 @@ func (s *Store) Sweep(ctx context.Context) (SweepStats, error) {
 		{&st.TokenUsage, `DELETE FROM token_usage WHERE expires_at<=?`},
 		{&st.ConsumedTokens, `DELETE FROM consumed_tokens WHERE expires_at<=?`},
 		{&st.Claims, `DELETE FROM claims WHERE expires_at<=?`},
+		{&st.Tombstones, `DELETE FROM tombstones WHERE expires_at<=?`},
 	}
 	for _, step := range steps {
 		res, err := tx.ExecContext(ctx, step.sql, now)
