@@ -67,6 +67,15 @@ type Config struct {
 	RateSenderBurst  int     // RELAY_RATE_SENDER_BURST
 	RateClaimPerSec  float64 // RELAY_RATE_CLAIM_GET_RPS
 	RateClaimBurst   int     // RELAY_RATE_CLAIM_GET_BURST
+	RateWebPerSec    float64 // RELAY_RATE_WEB_RPS (everything outside /v1/ and /healthz)
+	RateWebBurst     int     // RELAY_RATE_WEB_BURST
+
+	// Web endpoints (spec §6.11): /.well-known/assetlinks.json names the
+	// Android app allowed to open this relay's /connect links. An empty
+	// fingerprint list (RELAY_ANDROID_CERT_SHA256 set to "") turns
+	// assetlinks.json off (404).
+	AndroidPackage          string   // RELAY_ANDROID_PACKAGE
+	AndroidCertFingerprints []string // RELAY_ANDROID_CERT_SHA256 (comma-separated)
 
 	MaxCollectorsPerMailbox int // RELAY_MAX_COLLECTORS_PER_MAILBOX
 	ReplayCacheMax          int // RELAY_REPLAY_CACHE_MAX
@@ -85,6 +94,20 @@ type Config struct {
 // message item must stay under DynamoDB's 400 KB item limit with room for
 // its keys and attributes. The protocol default (262,144) fits easily.
 const MaxDynamoPayloadBytes = 380_000
+
+// DefaultAndroidPackage is the VettID Android app.
+const DefaultAndroidPackage = "com.vettid.app"
+
+// DefaultAndroidCertFingerprints are the SHA-256 fingerprints of the
+// certificates that sign the official VettID Android app, so that every
+// relay, self-hosted ones included, lets the official app open its links.
+var DefaultAndroidCertFingerprints = []string{
+	// Production upload key.
+	"31:A1:96:13:AA:10:F2:09:E0:89:45:F9:47:F9:4F:7C:E3:E6:E5:AC:34:24:57:FF:99:69:A6:79:86:92:8E:65",
+	// Staging signers (staging builds also use relay.vettid.org).
+	"BD:83:A0:75:3F:AA:6A:F6:F8:D8:1B:9F:76:A0:4A:C1:A4:99:EA:6C:7F:46:C6:F1:11:3D:4B:57:87:EC:B2:C4",
+	"2F:ED:27:B7:27:46:79:7A:93:1F:D4:14:FF:3D:AC:4C:D9:69:FA:0C:2F:F3:62:09:AE:05:36:5F:58:00:14:F2",
+}
 
 // Defaults returns the documented default configuration.
 func Defaults() Config {
@@ -126,6 +149,11 @@ func Defaults() Config {
 		RateSenderBurst:  20,
 		RateClaimPerSec:  1,
 		RateClaimBurst:   10,
+		RateWebPerSec:    2,
+		RateWebBurst:     20,
+
+		AndroidPackage:          DefaultAndroidPackage,
+		AndroidCertFingerprints: append([]string(nil), DefaultAndroidCertFingerprints...),
 
 		MaxCollectorsPerMailbox: 4,
 		ReplayCacheMax:          1_000_000,
@@ -247,6 +275,18 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	integer("RELAY_RATE_SENDER_BURST", &c.RateSenderBurst)
 	f64("RELAY_RATE_CLAIM_GET_RPS", &c.RateClaimPerSec)
 	integer("RELAY_RATE_CLAIM_GET_BURST", &c.RateClaimBurst)
+	f64("RELAY_RATE_WEB_RPS", &c.RateWebPerSec)
+	integer("RELAY_RATE_WEB_BURST", &c.RateWebBurst)
+
+	str("RELAY_ANDROID_PACKAGE", &c.AndroidPackage)
+	if v, ok := lookup("RELAY_ANDROID_CERT_SHA256"); ok {
+		fps, err := ParseCertFingerprints(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("RELAY_ANDROID_CERT_SHA256: %w", err))
+		} else {
+			c.AndroidCertFingerprints = fps
+		}
+	}
 
 	integer("RELAY_MAX_COLLECTORS_PER_MAILBOX", &c.MaxCollectorsPerMailbox)
 	integer("RELAY_REPLAY_CACHE_MAX", &c.ReplayCacheMax)
@@ -320,8 +360,17 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("RELAY_MAX_BLOB_BYTES must be > 0 when blobs are enabled"))
 	}
 	if c.MaxConcurrentBlobTransfers <= 0 || c.MaxCollectorsPerMailbox <= 0 || c.ReplayCacheMax <= 0 ||
-		c.RateIPBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 {
+		c.RateIPBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 || c.RateWebBurst <= 0 {
 		errs = append(errs, errors.New("concurrency, burst and cache limits must be > 0"))
+	}
+	if len(c.AndroidCertFingerprints) > 0 && !validAndroidPackage(c.AndroidPackage) {
+		errs = append(errs, errors.New("RELAY_ANDROID_PACKAGE must be an Android package name like com.vettid.app"))
+	}
+	for _, fp := range c.AndroidCertFingerprints {
+		if n, err := ParseCertFingerprints(fp); err != nil || len(n) != 1 || n[0] != fp {
+			errs = append(errs, errors.New("RELAY_ANDROID_CERT_SHA256: fingerprints must be uppercase colon-separated SHA-256"))
+			break
+		}
 	}
 	switch strings.ToLower(c.LogLevel) {
 	case "debug", "info", "warn", "error":
@@ -342,4 +391,92 @@ func (c Config) HealthcheckURL() (string, error) {
 		port = "80"
 	}
 	return "http://127.0.0.1:" + port + "/healthz", nil
+}
+
+// maxCertFingerprints bounds RELAY_ANDROID_CERT_SHA256.
+const maxCertFingerprints = 32
+
+// ParseCertFingerprints parses a comma-separated list of SHA-256 certificate
+// fingerprints, each either colon-separated ("31:A1:…") or plain hex
+// ("31a1…"), in any case, and returns them in the uppercase colon form that
+// Digital Asset Links uses, in order, without duplicates. Blank entries are
+// skipped; an empty or blank list is valid and yields none.
+func ParseCertFingerprints(s string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, item := range strings.Split(s, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		hex := item
+		if strings.Contains(item, ":") {
+			parts := strings.Split(item, ":")
+			if len(parts) != 32 {
+				return nil, errors.New("want 32 colon-separated bytes per fingerprint")
+			}
+			for _, p := range parts {
+				if len(p) != 2 {
+					return nil, errors.New("want 32 colon-separated bytes per fingerprint")
+				}
+			}
+			hex = strings.Join(parts, "")
+		}
+		if len(hex) != 64 {
+			return nil, errors.New("want a SHA-256 fingerprint (64 hex digits)")
+		}
+		var b strings.Builder
+		for i := 0; i < 64; i++ {
+			ch := hex[i]
+			switch {
+			case ch >= '0' && ch <= '9', ch >= 'A' && ch <= 'F':
+			case ch >= 'a' && ch <= 'f':
+				ch -= 'a' - 'A'
+			default:
+				return nil, errors.New("fingerprints are hexadecimal")
+			}
+			if i > 0 && i%2 == 0 {
+				b.WriteByte(':')
+			}
+			b.WriteByte(ch)
+		}
+		fp := b.String()
+		if !seen[fp] {
+			seen[fp] = true
+			out = append(out, fp)
+		}
+		if len(out) > maxCertFingerprints {
+			return nil, fmt.Errorf("at most %d fingerprints", maxCertFingerprints)
+		}
+	}
+	return out, nil
+}
+
+// validAndroidPackage reports whether s is a valid Android application id:
+// at least two dot-separated segments, each a letter followed by letters,
+// digits or underscores.
+func validAndroidPackage(s string) bool {
+	if len(s) == 0 || len(s) > 255 {
+		return false
+	}
+	segs := strings.Split(s, ".")
+	if len(segs) < 2 {
+		return false
+	}
+	for _, seg := range segs {
+		if seg == "" {
+			return false
+		}
+		for i := 0; i < len(seg); i++ {
+			ch := seg[i]
+			letter := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+			if i == 0 && !letter {
+				return false
+			}
+			if !letter && !(ch >= '0' && ch <= '9') && ch != '_' {
+				return false
+			}
+		}
+	}
+	return true
 }

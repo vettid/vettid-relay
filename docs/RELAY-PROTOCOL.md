@@ -1,6 +1,6 @@
 # VettID Relay Protocol
 
-**Version:** 0.5.0 (draft)
+**Version:** 0.6.0 (draft)
 **Status:** Pre-implementation draft for review
 
 ## 1. Purpose & design principles
@@ -229,7 +229,7 @@ fixed sender.
 
 ## 6. Endpoints
 
-Base path `/v1`. All bodies are `application/json` unless noted. Payloads are
+Base path `/v1`, except the web endpoints (§6.11). All bodies are `application/json` unless noted. Payloads are
 base64-encoded opaque bytes; the relay MUST NOT parse, transform, or log them.
 
 ### 6.1 Register mailbox
@@ -516,6 +516,146 @@ be replayed as a deletion.
   SHOULD treat a lost response as unknown and repeat the request (it is
   idempotent and retryable on `429`/`5xx`, §7.2).
 
+### 6.11 Web endpoints (0.6.0)
+
+Outside `/v1`, every relay serves a few fixed documents, built into the relay
+software, so that invitation links work on any relay — VettID's, a
+self-hosted one or a home appliance — with nothing from vettid.org
+(VAULT-MESSAGING §6.4, "Invitation URL"):
+
+| Path | `Content-Type` | Content |
+|---|---|---|
+| `/connect` | `text/html; charset=utf-8` | the invitation landing page |
+| `/.well-known/assetlinks.json` | `application/json` | Android Digital Asset Links for the VettID app |
+| `/robots.txt` | `text/plain; charset=utf-8` | `User-agent: *`, `Allow: /.well-known/`, `Disallow: /` |
+| `/.well-known/apple-app-site-association` | — | reserved for iOS universal links; not served yet (the ordinary `404`) |
+
+An invitation URL is `<relay>/connect#<link>`. The payload is the URL
+fragment, which browsers never send, so the relay never receives it. The
+rules below keep the page from leaking it, and make probing these paths
+(scanners request them within minutes of a URL appearing in public) cheap
+for the relay and uninformative for the prober.
+
+**Fixed responses.** These rules are normative for every path in the table.
+
+1. **Same bytes for every request.** Each document is fixed for the life of
+   the relay process: the same status, body and headers for every request,
+   except `Date`. Nothing in a response depends on the request — not the
+   query string (ignored), the path's spelling, request headers, cookies or
+   the client's address. A relay MUST NOT set cookies or `Vary`.
+2. **Exact paths, no redirects.** Only the exact paths above are served.
+   Every other spelling — `/connect/`, `/connect/x`, `/Connect`,
+   percent-encoded forms, `//connect`, dot segments — gets the relay's
+   ordinary `404` `not_found` (§7.1), byte-for-byte the response to any
+   other unknown path. A relay MUST NOT redirect (no `301`/`308` to a
+   cleaned or slash-appended path); this holds for every relay path,
+   `/v1` included.
+3. **Methods.** `GET` and `HEAD`. `HEAD` returns the `GET` headers without
+   the body. Any other method gets `405` with `Allow: GET, HEAD` and an empty
+   body, and nothing else about the request.
+4. **Caching.** `Cache-Control: public, max-age=86400, immutable` and a
+   strong `ETag` derived from the body. A matching `If-None-Match` gets
+   `304`. No `Last-Modified`; `Range` is ignored (the whole body is sent).
+5. **Headers** on every `200`, `304` and `405` from these paths:
+   - `Content-Security-Policy`: for `/connect`, `default-src 'none';
+     script-src 'sha256-…'; style-src 'sha256-…'; img-src 'none';
+     base-uri 'none'; form-action 'none'; frame-ancestors 'none'` — the page
+     has exactly one inline `<style>` and one inline `<script>`, each allowed
+     by its hash, and nothing else may load. For the other documents,
+     `default-src 'none'; frame-ancestors 'none'; base-uri 'none';
+     form-action 'none'; sandbox`.
+   - `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+     `Referrer-Policy: no-referrer`.
+   - `Permissions-Policy` denying every powerful feature (`camera=()`,
+     `microphone=()`, `geolocation=()`, …). `clipboard-write` keeps its
+     default (the page's own origin) for the copy button.
+   - `Cross-Origin-Opener-Policy: same-origin`,
+     `Cross-Origin-Resource-Policy: same-origin`.
+   - `X-Robots-Tag: noindex, nofollow`.
+   - `Strict-Transport-Security: max-age=31536000` when the relay's public
+     base URL is `https`, whether the relay or a proxy in front of it
+     terminates TLS. Browsers ignore it over plain HTTP.
+
+**The `/connect` page.**
+
+- One static page, the same for every relay running a given version of the
+  relay software. It says to open the link in the VettID app and, without
+  script, how: copy the whole address, including everything after the `#`,
+  and paste it in the app.
+- It MUST make no network requests: no subresources of any kind (scripts,
+  styles, fonts, images — an inline SVG logo at most), no third-party
+  content, no analytics. It suppresses the browser's default favicon fetch
+  (`<link rel="icon" href="data:,">`). Links the reader may follow are
+  allowed; they carry no referrer.
+- It MUST NOT send the fragment anywhere. Its inline script MAY read the
+  fragment locally only to build an "Open in VettID" link
+  `vettid://connect#<link>` and a copy button that copies
+  `<origin>/connect#<link>`. Before using the fragment it MUST check that it
+  is base64url (`[A-Za-z0-9_-]`, bounded length), and it MUST NOT insert it
+  as markup, store it (cookies, web storage) or navigate on its own.
+- The page does not interpret the payload; the app does, and the payload,
+  not the host, decides the relay (VAULT-MESSAGING §6.4).
+
+**`/.well-known/assetlinks.json`.** A Digital Asset Links statement list
+letting the VettID Android app handle the relay's links:
+
+```json
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.vettid.app",
+      "sha256_cert_fingerprints": ["31:A1:96:13:…:8E:65", "…"]
+    }
+  }
+]
+```
+
+- Fingerprints are the SHA-256 of the app's signing certificates in
+  uppercase, colon-separated hex.
+- The relay software's **built-in default** names the official VettID app,
+  so a self-hosted relay serves the official app's keys with no
+  configuration. For this version the default is the production upload key
+  `31:A1:96:13:AA:10:F2:09:E0:89:45:F9:47:F9:4F:7C:E3:E6:E5:AC:34:24:57:FF:99:69:A6:79:86:92:8E:65`
+  and the two staging signers
+  `BD:83:A0:75:3F:AA:6A:F6:F8:D8:1B:9F:76:A0:4A:C1:A4:99:EA:6C:7F:46:C6:F1:11:3D:4B:57:87:EC:B2:C4`
+  and
+  `2F:ED:27:B7:27:46:79:7A:93:1F:D4:14:FF:3D:AC:4C:D9:69:FA:0C:2F:F3:62:09:AE:05:36:5F:58:00:14:F2`
+  (staging builds also use `relay.vettid.org`). The Play app-signing key
+  will be added when it exists.
+- Operators MAY replace the package name and the list (for example for a
+  fork of the app). An empty list turns the document off: it gets the
+  ordinary `404`.
+- Android verifies an App Link only for hosts the app declares; the official
+  app declares `relay.vettid.org`. On any other relay the document is
+  harmless, and the page's `vettid:` link opens the app instead.
+
+**Rate limits.** A relay SHOULD rate-limit these paths, and every other path
+outside `/v1` except its health check, per client address (the IPv4 address
+or the IPv6 /64), with a budget **separate** from the `/v1` limits (§7.2), so
+that scanning can never use up the budget of mailbox traffic. The limiter
+SHOULD be local to the relay process (no shared-store round trip), so
+scanner bursts stay cheap. Over the limit: `429` `rate_limited` with
+`retry_after` (§7.1, §7.2) and `Cache-Control: no-store`.
+
+**Logging.** Nothing about these requests that could identify an invitation
+or a visitor is logged. The fragment never reaches the relay; in addition, a
+relay MUST NOT log the query string, the raw path of an unmatched request,
+`Referer` or any other request header, or the client's address for these
+paths. It MAY log the route (`/connect`, or a fixed word for unmatched
+paths), status, sizes and duration. Operators SHOULD apply the same rules to
+any proxy or load balancer in front of the relay.
+
+**Configuration (informative).** The reference relay (vettid-relay) reads:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `assetlinks.json` |
+| `RELAY_ANDROID_CERT_SHA256` | the official app's keys (above) | comma-separated fingerprints, colon form or plain hex in any case; set but empty turns `assetlinks.json` off |
+| `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | the per-address web bucket, per relay process |
+| `RELAY_BASE_URL` | — | `https` turns on `Strict-Transport-Security` |
+
 ## 7. Errors, limits, versioning
 
 ### 7.1 Error body
@@ -550,7 +690,8 @@ Canonical codes and their HTTP statuses:
 Limits are relay policy, not protocol constants. The protocol contract: a
 relay signalling overload MUST use `429` + `rate_limited` and SHOULD include
 `retry_after`. Clients MUST honor `retry_after` and MUST implement exponential
-backoff with jitter on `429` and `5xx`.
+backoff with jitter on `429` and `5xx`. The web endpoints (§6.11) are limited
+with a separate budget.
 
 ### 7.3 Versioning
 
@@ -595,6 +736,14 @@ prefix change. This document carries a semver and a changelog (§10).
    that deleting a mailbox can never revive a token the owner revoked or a
    one-shot token already used. A stolen relay key can delete its mailbox —
    an availability event like any other use of a stolen owner key.
+10. **Web endpoints** (§6.11) are public and unauthenticated by design. Their
+    responses are constant, so probing them reveals only that a relay runs
+    at the host, which its API reveals anyway; they hold no invitation
+    state, so they are no oracle for invitations (claims stay behind
+    `/v1/claim` and its own limits, §6.9). The invitation payload travels
+    only in the URL fragment and never reaches the relay; the page's CSP
+    forbids every request, so even a defect in its script could not send
+    the fragment anywhere.
 
 ## 9. Test vectors
 
@@ -692,6 +841,16 @@ Properties:
 The push gateway API is specified separately.
 
 ## 10. Changelog
+
+- **0.6.0** — web endpoints (§6.11): `/connect` (the invitation landing page
+  of VAULT-MESSAGING §6.4), `/.well-known/assetlinks.json` (the VettID
+  Android app's signing keys, configurable, the official app's by default),
+  `/robots.txt`; `apple-app-site-association` reserved. Fixed responses
+  (same bytes for every request, exact paths, `GET`/`HEAD` only, cacheable
+  with a strong `ETag`), security headers, a per-address rate limit separate
+  from the API's, and logging rules. Relays no longer redirect non-canonical
+  paths; they get the ordinary `404` (§6.11). No `/v1` changes; additive for
+  clients.
 
 - **0.5.0** — owner-signed mailbox deletion, `DELETE /v1/mailbox` (§6.10):
   deletes the registration, messages, denylist, quota and open-token records,

@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,7 +18,7 @@ import (
 )
 
 // ProtocolVersion is the docs/RELAY-PROTOCOL.md version this relay implements.
-const ProtocolVersion = "0.5.0"
+const ProtocolVersion = "0.6.0"
 
 // Server is the relay API.
 type Server struct {
@@ -42,6 +43,10 @@ type Server struct {
 	ipLimit    RateLimiter // per source IP (IPv4 / IPv6 /64), before any parsing
 	subLimit   RateLimiter // per sender key, after token parse
 	claimLimit RateLimiter // unauthenticated claim GETs, per IPv4 / IPv6 /64
+	webLimit   RateLimiter // everything outside /v1/ and /healthz, per IPv4 / IPv6 /64 (always in-process)
+
+	web  *webDocs // /connect, /.well-known/assetlinks.json, /robots.txt (§6.11)
+	hsts bool     // public base URL is https: send Strict-Transport-Security
 
 	hub       *hub
 	bus       WakeBus       // cross-process wake-on-deposit (nil: single process)
@@ -133,7 +138,14 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		ipLimit:    ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
 		subLimit:   ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
 		claimLimit: ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
+		webLimit:   ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
+		hsts:       strings.HasPrefix(cfg.BaseURL, "https://"),
 	}
+	web, err := newWebDocs(cfg.AndroidPackage, cfg.AndroidCertFingerprints, s.hsts)
+	if err != nil {
+		panic("relay web documents: " + err.Error()) // the embedded page is malformed: a build defect
+	}
+	s.web = web
 	s.drainCtx, s.drainCancel = context.WithCancel(context.Background())
 	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
 	for _, o := range opts {
@@ -155,7 +167,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
 			c.Sweep(now)
 		}
-		for _, l := range []RateLimiter{s.ipLimit, s.subLimit, s.claimLimit} {
+		for _, l := range []RateLimiter{s.ipLimit, s.subLimit, s.claimLimit, s.webLimit} {
 			if p, ok := l.(interface{ Prune(time.Time) }); ok {
 				p.Prune(now)
 			}
@@ -183,13 +195,20 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("GET /v1/blob/{blob_id}", s.handleBlobGet)
 		s.mux.HandleFunc("DELETE /v1/blob/{blob_id}", s.handleBlobDelete)
 	}
+	s.webRoutes()
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { s.writeError(w, fail(CodeNotFound)) })
 }
 
 // Handler returns the public HTTP handler with the middleware chain.
 func (s *Server) Handler() http.Handler {
-	return withSecurityHeaders(s.withAccessLog(s.withIPRateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return withSecurityHeaders(s.hsts, s.withAccessLog(s.withIPRateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.m.requests.Inc()
+		if r.Method != http.MethodConnect && !canonicalPath(r.URL.Path) {
+			// ServeMux would redirect to the cleaned path; the relay
+			// answers every non-canonical path with the ordinary 404.
+			s.writeError(w, fail(CodeNotFound))
+			return
+		}
 		s.mux.ServeHTTP(w, r)
 	}))))
 }
