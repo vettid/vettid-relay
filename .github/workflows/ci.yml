@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -32,7 +32,7 @@ jobs:
     # Valkey coordination, the whole API suite on DynamoDB, and the
     # two-process e2e (wake, open token, claim, replay, shared rate limit,
     # mailbox deletion).
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     services:
       dynamodb:
@@ -56,7 +56,7 @@ jobs:
   gitleaks:
     # Pinned binary over the FULL history (the gitleaks-action fails on a
     # branch's first push, where there is no "before" commit).
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,7 +70,7 @@ jobs:
         run: ./gitleaks git --redact --verbose .
 
   image:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: [test]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -88,7 +88,7 @@ jobs:
     # main only: publish a multi-arch image to GHCR. Deployments pin the
     # resulting digest (never a tag), so a push here deploys nothing by itself.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: [test, shared-backend, gitleaks]
     permissions:
       contents: read
