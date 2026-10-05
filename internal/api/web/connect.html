@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark">
+<title>VettID invitation</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--ground:#0b0b12;--surface:#14142a;--border:#26263e;--ink-hi:#f7f7fa;--ink:#c9c9d6;--mute:#aaaaaa;--gold:#ffc125;--gold-hover:#ffd25a;--on-gold:#101018}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;background:var(--ground);color:var(--ink);font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:34rem;margin:0 auto;padding:3rem 1rem 2rem}
+.brand{display:flex;align-items:center;gap:.6rem;color:var(--ink-hi);font-weight:700;font-size:1.15rem;letter-spacing:.01em;margin-bottom:2rem}
+.brand svg{width:1.75rem;height:1.75rem;flex:none}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.5rem 1.25rem}
+h1{color:var(--ink-hi);font-size:1.5rem;line-height:1.25;margin:0 0 .75rem}
+p{margin:.75rem 0}
+ol{margin:.75rem 0;padding-left:1.25rem}
+li{margin:.35rem 0}
+strong{color:var(--ink-hi)}
+code{font-family:"SF Mono",Consolas,monospace;font-size:.92em;color:var(--ink-hi)}
+.actions{display:flex;flex-wrap:wrap;gap:.75rem;margin:1.25rem 0 .5rem}
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:2.75rem;padding:.6rem 1.2rem;border-radius:10px;font:inherit;font-weight:600;text-decoration:none;cursor:pointer;border:1px solid var(--gold)}
+.primary{background:var(--gold);color:var(--on-gold)}
+.primary:hover,.primary:focus-visible{background:var(--gold-hover)}
+.secondary{background:transparent;color:var(--gold)}
+.secondary:hover,.secondary:focus-visible{background:rgba(255,193,37,.08)}
+.btn:focus-visible{outline:2px solid var(--ink-hi);outline-offset:2px}
+.status{min-height:1.5rem;color:var(--mute);font-size:.9rem;margin:.25rem 0 0}
+.field{width:100%;margin-top:.75rem;padding:.6rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--ground);color:var(--ink-hi);font:.85rem/1.4 "SF Mono",Consolas,monospace}
+.note{color:var(--mute);font-size:.88rem;border-top:1px solid var(--border);margin-top:1.5rem;padding-top:1rem}
+.warn{color:var(--gold)}
+a{color:var(--gold)}
+</style>
+</head>
+<body>
+<main>
+<div class="brand"><svg viewBox="-43 0 350 350" aria-hidden="true" focusable="false"><g fill="#ffc125"><path d="M8 0 L47 0 Q55 0 55 8 L55 54 L104 54 L104 8 Q104 0 112 0 L151 0 Q159 0 159 8 L159 54 L208 54 L208 8 Q208 0 216 0 L255 0 Q263 0 263 8 L263 76 Q263 86 254 90 L240 96 L23 96 L9 90 Q0 86 0 76 L0 8 Q0 0 8 0 Z"/><path d="M31 112 Q31 108 35 108 L229 108 Q233 108 233 112 L257 330 Q258 344 245 344 L19 344 Q6 344 7 330 Z"/></g><g fill="#101018"><circle cx="132" cy="190" r="29"/><path d="M119 204 L104 282 Q102 292 112 292 L152 292 Q162 292 160 282 L145 204 Z"/></g></svg>VettID</div>
+<div class="card">
+<h1>Open this link in the VettID app</h1>
+<p>This is a VettID connection invitation. If VettID is installed, the link usually opens the app by itself.</p>
+<div id="js-actions" hidden>
+<div class="actions">
+<a id="open" class="btn primary" href="vettid://connect">Open in VettID</a>
+<button id="copy" class="btn secondary" type="button">Copy invitation</button>
+</div>
+<p id="status" class="status" role="status" aria-live="polite"></p>
+<input id="field" class="field" type="text" readonly hidden aria-label="Invitation link">
+</div>
+<p id="js-missing" class="warn" hidden>This address has no invitation in it. Ask the sender for the whole link, including everything after the <code>#</code>.</p>
+<p>If the app did not open:</p>
+<ol>
+<li>Copy the <strong>whole</strong> address of this page from the address bar, including everything after the <code>#</code>.</li>
+<li>Open the VettID app and paste it where it asks for an invitation.</li>
+</ol>
+<p class="note">The invitation is the part of the address after the <code>#</code>. Browsers never send that part to a server, and this page makes no network requests. Nothing happens until you confirm in the app. Don't have VettID yet? See <a href="https://vettid.org" rel="noreferrer noopener">vettid.org</a>.</p>
+</div>
+</main>
+<script>
+(function () {
+  "use strict";
+  var url = "";
+  var actions = document.getElementById("js-actions");
+  var missing = document.getElementById("js-missing");
+  var open = document.getElementById("open");
+  var status = document.getElementById("status");
+  var field = document.getElementById("field");
+  function render() {
+    var link = location.hash.slice(1);
+    var ok = /^[A-Za-z0-9_-]{16,8192}$/.test(link);
+    url = ok ? location.origin + "/connect#" + link : "";
+    open.href = ok ? "vettid://connect#" + link : "vettid://connect";
+    actions.hidden = !ok;
+    missing.hidden = ok;
+    status.textContent = "";
+    field.value = "";
+    field.hidden = true;
+  }
+  function fallback() {
+    field.value = url;
+    field.hidden = false;
+    field.focus();
+    field.select();
+    var copied = false;
+    try { copied = document.execCommand("copy"); } catch (e) { copied = false; }
+    status.textContent = copied ? "Copied. Paste it in the VettID app." : "Copy the link below and paste it in the VettID app.";
+  }
+  document.getElementById("copy").addEventListener("click", function () {
+    if (!url) { return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(function () {
+        status.textContent = "Copied. Paste it in the VettID app.";
+      }, fallback);
+    } else {
+      fallback();
+    }
+  });
+  window.addEventListener("hashchange", render);
+  render();
+})();
+</script>
+</body>
+</html>

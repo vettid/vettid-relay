@@ -7,7 +7,7 @@ keys to payload content: a compromised relay can drop or delay messages, but
 can't read or forge them.
 
 - **Protocol:** [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md)
-  (**v0.5.0**, reported by `relay -version` and `/healthz`). This repository
+  (**v0.6.0**, reported by `relay -version` and `/healthz`). This repository
   implements all of it:
   - registration
   - deposit tokens (PASETO v4.public, sender-bound), plus one-shot open
@@ -126,6 +126,9 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `20` / `40` | Per-source-IP token bucket on `/v1/*`, applied before any parsing. The key is the IPv4 address or the IPv6 /64. |
 | `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits and blob uploads. It's keyed by token `sub`, or by `jti` for open tokens. |
 | `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
+| `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | Per-source-IP bucket for the web endpoints (§6.11) and every other path outside `/v1/` except `/healthz`. It's separate from the API bucket, so scanners never use up mailbox traffic's budget, and always in-process (per relay process, no Valkey round trip). |
+| `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
+| `RELAY_ANDROID_CERT_SHA256` | the official VettID app's signing keys | Comma-separated SHA-256 certificate fingerprints for `assetlinks.json`, colon-separated or plain hex, any case (served in uppercase colon form). The built-in default (`config.DefaultAndroidCertFingerprints`: the production upload key and the two staging signers) lets a self-hosted relay open links in the official app with no configuration. Set but empty turns `assetlinks.json` off (404). |
 | `RELAY_MAX_COLLECTORS_PER_MAILBOX` | `4` | Concurrent long-polls plus WebSockets per mailbox. |
 | `RELAY_REPLAY_CACHE_MAX` | `1000000` | Replay-cache capacity. When it's full, requests are shed with `rate_limited` and no live entries are evicted. |
 | `RELAY_SWEEP_INTERVAL` | `60s` | TTL sweeper period. The first pass is jittered. |
@@ -173,7 +176,22 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
   has the route *pattern* (never the raw path, which contains ids), status,
   error code, sizes, duration and, where relevant, the `msg_id` or
   `blob_id`. Payloads, blob bytes, tokens, signatures, public keys, mailbox
-  ids and client IPs are never logged. A test enforces this.
+  ids and client IPs are never logged. A test enforces this. For the web
+  endpoints the line has the route (`/connect`,
+  `/.well-known/assetlinks.json`, or `unmatched` for every other path),
+  never the query, the raw path or `Referer`.
+- **Web endpoints** (spec §6.11). `/connect`, `/.well-known/assetlinks.json`
+  and `/robots.txt` are fixed documents built at startup (the page is
+  embedded with `go:embed` from `internal/api/web/`), the same bytes for
+  every request: query ignored, `GET`/`HEAD` only (`405` otherwise),
+  `Cache-Control: public, max-age=86400, immutable` with a strong `ETag`.
+  The page's CSP allows its one inline style and script by SHA-256 hash,
+  computed from the embedded page at startup and checked by a test, so
+  editing `connect.html` needs no hash bookkeeping. Exact paths only: any
+  other spelling is the ordinary `404`, and the relay never redirects
+  (non-canonical paths are `404` everywhere). `Strict-Transport-Security`
+  is sent when `RELAY_BASE_URL` is `https`, including behind a
+  TLS-terminating proxy.
 
 ## Multi-process hosting
 
@@ -265,6 +283,9 @@ other process sees, refuses or is woken by.
 | `GET /v1/claim/{claim_id}` | none (rate-limited) | `200 application/octet-stream`. Single fetch: the claim is deleted. |
 | `DELETE /v1/claim/{claim_id}` | the creating key | `204` (idempotent) |
 | `GET /healthz` | none | `200` when the DB is reachable and not draining, else `503` |
+| `GET /connect` | none (web bucket) | `200 text/html`: the invitation landing page (§6.11). Invitation URLs are `<relay>/connect#<link>`; the fragment never reaches the relay. |
+| `GET /.well-known/assetlinks.json` | none (web bucket) | `200 application/json`: Android App Links statement for the VettID app |
+| `GET /robots.txt` | none (web bucket) | `200 text/plain` |
 
 Error bodies are `{"code", "message", "retry_after"?}`. HTTP statuses follow
 the spec's §7.1 table exactly, and a test parses the table from the spec to

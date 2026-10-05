@@ -112,13 +112,19 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 	})
 }
 
-// withSecurityHeaders sets conservative response headers.
-func withSecurityHeaders(next http.Handler) http.Handler {
+// withSecurityHeaders sets conservative response headers. The web
+// documents (web.go) replace them with their own fuller set.
+func withSecurityHeaders(hsts bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("X-Robots-Tag", "noindex, nofollow")
+		if hsts {
+			h.Set("Strict-Transport-Security", hstsValue)
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -160,13 +166,23 @@ func rateKey(a netip.Addr) string {
 	return p.String()
 }
 
-// withIPRateLimit applies the per-source-IP token bucket to every /v1/
-// request before anything else (headers, tokens, bodies) is examined
-// (spec §8.5). /healthz is exempt so load-balancer probes never starve.
+// withIPRateLimit applies a per-source-IP token bucket before anything else
+// (headers, tokens, bodies) is examined (spec §8.5): the API bucket to /v1/,
+// and a separate, always in-process web bucket to everything else (/connect,
+// /.well-known/, /robots.txt and every unknown path), so scanners spend
+// their own budget and never the mailbox traffic's (§6.11). /healthz is
+// exempt so load-balancer probes never starve.
 func (s *Server) withIPRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/v1/") {
-			if ok, wait := s.ipLimit.Allow(rateKey(clientIP(r, s.cfg.TrustProxy)), s.now()); !ok {
+		var l RateLimiter
+		switch {
+		case isAPIPath(r.URL.Path):
+			l = s.ipLimit
+		case r.URL.Path != "/healthz":
+			l = s.webLimit
+		}
+		if l != nil {
+			if ok, wait := l.Allow(rateKey(clientIP(r, s.cfg.TrustProxy)), s.now()); !ok {
 				s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)})
 				return
 			}
