@@ -44,6 +44,7 @@ type Server struct {
 	addrLimit   RateLimiter       // flood guard on /v1/, per network, before any parsing
 	fails       *ratelimit.Debt   // failed authentications per network (always in-process)
 	known       *ratelimit.Recent // network|key pairs that authenticated recently (always in-process)
+	keyFails    *ratelimit.Debt   // refused deposits per known sender key (always in-process)
 	keyLimit    RateLimiter       // per authenticated key
 	subLimit    RateLimiter       // per sender key, on deposits and blob uploads
 	regLimit    RateLimiter       // new mailboxes per network
@@ -147,6 +148,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		addrLimit:  ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
 		fails:      ratelimit.NewDebt(cfg.RateAuthFailPerSec, cfg.RateAuthFailBurst, cfg.AuthFailMaxPenalty, 200_000),
 		known:      ratelimit.NewRecent(knownKeyTTL, maxKnownKeys),
+		keyFails:   ratelimit.NewDebt(cfg.RateKeyFailPerSec, cfg.RateKeyFailBurst, cfg.AuthFailMaxPenalty, 200_000),
 		keyLimit:   ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, 200_000),
 		subLimit:   ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
 		regLimit:   ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, 200_000),
@@ -181,7 +183,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
 			c.Sweep(now)
 		}
-		for _, l := range []any{s.addrLimit, s.fails, s.known, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
+		for _, l := range []any{s.addrLimit, s.fails, s.known, s.keyFails, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
 			if p, ok := l.(interface{ Prune(time.Time) }); ok {
 				p.Prune(now)
 			}

@@ -42,7 +42,7 @@ func TestAuthorizeDepositOrder(t *testing.T) {
 
 	// Happy path through step 7.
 	r := f.depositReq(owner, sender, good, body)
-	da, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil)
+	da, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil, nil)
 	if e != nil {
 		t.Fatalf("steps 1-6: %v", e)
 	}
@@ -57,27 +57,27 @@ func TestAuthorizeDepositOrder(t *testing.T) {
 	// Step 1 precedes everything: unknown mailbox wins over a bad token.
 	for _, tok := range []string{"", "garbage", good} {
 		r := f.depositReq(other, sender, tok, body)
-		if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, other.mbx, nil); code(e) != CodeMailboxUnknown {
+		if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, other.mbx, nil, nil); code(e) != CodeMailboxUnknown {
 			t.Fatalf("unknown mailbox with token %q: %v", tok, code(e))
 		}
 	}
-	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, "NOT-A-MAILBOX", nil); code(e) != CodeMailboxUnknown {
+	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, "NOT-A-MAILBOX", nil, nil); code(e) != CodeMailboxUnknown {
 		t.Fatal("malformed mailbox id")
 	}
 
 	// Step 2: token signed by someone other than the mailbox owner.
 	forged := f.mint(other, sender, func(c *auth.Claims) { c.Iss = owner.mbx })
-	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), f.depositReq(owner, sender, forged, body), owner.mbx, nil); code(e) != CodeTokenInvalid {
+	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), f.depositReq(owner, sender, forged, body), owner.mbx, nil, nil); code(e) != CodeTokenInvalid {
 		t.Fatalf("forged: %v", code(e))
 	}
 	// Missing / wrong scheme.
 	r = f.depositReq(owner, sender, "", body)
 	r.Header.Set("Authorization", "Bearer "+good)
-	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil); code(e) != CodeTokenInvalid {
+	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil, nil); code(e) != CodeTokenInvalid {
 		t.Fatalf("wrong scheme: %v", code(e))
 	}
 	r.Header.Set("Authorization", "vettid-deposit "+good) // scheme is case-insensitive
-	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil); e != nil {
+	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil, nil); e != nil {
 		t.Fatalf("lowercase scheme: %v", code(e))
 	}
 
@@ -87,13 +87,13 @@ func TestAuthorizeDepositOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	r = f.depositReq(owner, other, revoked, body) // signed by the wrong key too
-	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil); code(e) != CodeTokenRevoked {
+	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil, nil); code(e) != CodeTokenRevoked {
 		t.Fatalf("revoked jti: %v", code(e))
 	}
 
 	// Step 7: token for sender presented with other's signature.
 	r = f.depositReq(owner, other, good, body)
-	da, e = f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil)
+	da, e = f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil, nil)
 	if e != nil {
 		t.Fatal(code(e))
 	}

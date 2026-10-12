@@ -136,6 +136,7 @@ func TestRateLimitConfig(t *testing.T) {
 	d := Defaults()
 	if d.RateIPPerSec != 200 || d.RateIPBurst != 2000 || d.RateKeyPerSec != 20 || d.RateKeyBurst != 100 ||
 		d.RateAuthFailPerSec != 1 || d.RateAuthFailBurst != 60 || d.AuthFailMaxPenalty != 10*time.Minute ||
+		d.RateKeyFailPerSec != 0.1 || d.RateKeyFailBurst != 30 ||
 		d.RateRegisterPerSec != 1 || d.RateRegisterBurst != 100 || d.RateSenderPerSec != 5 || d.RateSenderBurst != 20 ||
 		d.RateClaimPerSec != 1 || d.RateClaimBurst != 10 {
 		t.Fatalf("defaults differ from docs/RELAY-PROTOCOL.md §7.2: %+v", d)
@@ -148,6 +149,8 @@ func TestRateLimitConfig(t *testing.T) {
 		"RELAY_RATE_AUTHFAIL_RPS":         "0.2",
 		"RELAY_RATE_AUTHFAIL_BURST":       "10",
 		"RELAY_RATE_AUTHFAIL_MAX_PENALTY": "5m",
+		"RELAY_RATE_KEYFAIL_RPS":          "0.5",
+		"RELAY_RATE_KEYFAIL_BURST":        "9",
 		"RELAY_RATE_REGISTER_RPS":         "0.1",
 		"RELAY_RATE_REGISTER_BURST":       "7",
 	}))
@@ -156,7 +159,7 @@ func TestRateLimitConfig(t *testing.T) {
 	}
 	if c.RateIPPerSec != 50 || c.RateIPBurst != 500 || c.RateKeyPerSec != 2.5 || c.RateKeyBurst != 30 ||
 		c.RateAuthFailPerSec != 0.2 || c.RateAuthFailBurst != 10 || c.AuthFailMaxPenalty != 5*time.Minute ||
-		c.RateRegisterPerSec != 0.1 || c.RateRegisterBurst != 7 {
+		c.RateRegisterPerSec != 0.1 || c.RateRegisterBurst != 7 || c.RateKeyFailPerSec != 0.5 || c.RateKeyFailBurst != 9 {
 		t.Fatalf("%+v", c)
 	}
 	for _, bad := range []map[string]string{

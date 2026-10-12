@@ -155,30 +155,74 @@ func TestAuthFailBudget(t *testing.T) {
 	f.expectFrom(hostA, badSig(f, stranger), 401, CodeSignatureInvalid)
 }
 
-// A key whose holder fails on a penalised address stops being known there,
-// and a penalised address gains no known keys: failures cannot be bought
-// with valid requests.
-func TestAuthFailKnownKeyLosesStanding(t *testing.T) {
-	f := newFixture(t, failBudget(2))
-	owner, mallory, nobody := newPrincipal(1), newPrincipal(2), newPrincipal(8)
+// A refused deposit that is properly signed by a key known at its address
+// is that key's failure, not its address's: one vault with expired tokens
+// does not spend the budget its whole host shares, and one key cannot keep
+// failing either.
+func TestRefusedDepositsChargeTheSenderKey(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		failBudget(2)(c)
+		c.RateKeyFailPerSec, c.RateKeyFailBurst = 0.1, 2
+	})
+	owner, vault, passerby, nobody := newPrincipal(1), newPrincipal(2), newPrincipal(3), newPrincipal(8)
 	f.register(owner)
-	f.register(mallory)
-	f.expectFrom(hostA, collectReq(mallory), 200, "")
+	f.register(vault)
+	f.expectFrom(hostA, collectReq(vault), 200, "") // vault is known at hostA
+	tok := f.mint(owner, vault, nil)
+	gone := func(signer principal) req {
+		return req{method: "POST", path: "/v1/mailbox/" + nobody.mbx, body: depositBody([]byte("x")), signer: &signer, token: tok}
+	}
+	for i := 0; i < 2; i++ {
+		f.expectFrom(hostA, gone(vault), 404, CodeMailboxUnknown)
+	}
+	if f.s.fails.Len() != 0 {
+		t.Fatal("a known key's refused deposits were charged to its address")
+	}
+	// The key's own budget of refused deposits is used up: its deposits
+	// wait, valid ones too; everything else of it carries on.
+	e := f.expectFrom(hostA, gone(vault), 429, CodeRateLimited)
+	if e.RetryAfter != 10 {
+		t.Fatalf("retry_after %d", e.RetryAfter)
+	}
+	f.expectFrom(hostA, req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("x")), signer: &vault, token: tok}, 429, CodeRateLimited)
+	f.expectFrom(hostA, collectReq(vault), 200, "")
+	if v := f.s.rl.refused.With(limKeyFail).Value(); v != 2 {
+		t.Fatalf("refused counter %d", v)
+	}
+	// Nobody else can run a key's budget up: an unsigned deposit naming the
+	// key, and a signed one by a key not known here, are the address's.
+	f.clk.add(30 * time.Second)
+	h := http.Header{auth.HeaderKey: {vault.b64}}
+	f.expectFrom(hostB, req{method: "POST", path: "/v1/mailbox/" + nobody.mbx, body: depositBody([]byte("x")), header: h}, 404, CodeMailboxUnknown)
+	f.expectFrom(hostB, gone(passerby), 404, CodeMailboxUnknown)
+	if f.s.keyFails.Wait(vault.b64, f.clk.now()) != 0 || f.s.fails.Wait(hostB, f.clk.now()) == 0 {
+		t.Fatal("unproven failures were charged to the key, or not to the address")
+	}
+	f.expectFrom(hostA, req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("y")), signer: &vault, token: tok}, 201, "")
+	// On a penalised address it is the same: the known key's refused
+	// deposits are answered from its own budget, then wait.
 	for i := 0; i < 2; i++ {
 		f.expectFrom(hostA, badSig(f, nobody), 401, CodeSignatureInvalid)
 	}
-	// Penalised. mallory's key is known, so its requests are looked at,
-	// signature first: a properly signed deposit to a mailbox that does not
-	// exist is answered, once.
-	spray := func() req {
-		return req{method: "POST", path: "/v1/mailbox/" + nobody.mbx, body: depositBody([]byte("x")), signer: &mallory, token: "x"}
-	}
-	f.expectFrom(hostA, spray(), 404, CodeMailboxUnknown)
-	f.expectFrom(hostA, spray(), 429, CodeRateLimited)
-	f.expectFrom(hostA, collectReq(mallory), 429, CodeRateLimited) // no way back in while penalised
-	// An unsigned spray under mallory's key never reaches the store at all.
-	h := http.Header{auth.HeaderKey: {mallory.b64}}
-	f.expectFrom(hostA, req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("x")), header: h}, 429, CodeRateLimited)
+	f.expectFrom(hostA, gone(passerby), 429, CodeRateLimited) // not known here: nothing is looked at
+	f.expectFrom(hostA, gone(vault), 404, CodeMailboxUnknown)
+	f.expectFrom(hostA, gone(vault), 404, CodeMailboxUnknown)
+	f.expectFrom(hostA, gone(vault), 429, CodeRateLimited)
+	f.expectFrom(hostA, collectReq(vault), 200, "")
+}
+
+// A signer that turns out to have no mailbox stops counting as known at
+// its address.
+func TestNoStandingWithoutAMailbox(t *testing.T) {
+	f := newFixture(t, failBudget(2))
+	vault, nobody := newPrincipal(1), newPrincipal(8)
+	f.register(vault)
+	f.expectFrom(hostA, collectReq(vault), 200, "")
+	f.expectFrom(hostA, req{method: "DELETE", path: "/v1/mailbox", signer: &vault}, 204, "")
+	f.expectFrom(hostA, collectReq(vault), 404, CodeMailboxUnknown) // first failure
+	f.expectFrom(hostA, badSig(f, nobody), 401, CodeSignatureInvalid)
+	// Penalised now, and the key is no longer known here.
+	f.expectFrom(hostA, collectReq(vault), 429, CodeRateLimited)
 }
 
 func TestAuthFailDepositSignatureFirstWhenPenalised(t *testing.T) {

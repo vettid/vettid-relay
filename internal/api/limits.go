@@ -24,6 +24,9 @@ import (
 //	          that authenticated from that network recently are looked at.
 //	          Per process, in memory: it is checked first and costs a map
 //	          lookup, so a penalised network's flood costs nothing more.
+//	keyfail   a refused deposit that is properly signed by a key known at
+//	          its network is that key's failure, not its network's: a small
+//	          budget of refused deposits per sender key. Per process.
 //	address   before anything is parsed: a flood guard per network. It is
 //	          sized for a whole host's worth of valid traffic and bounds what
 //	          one network can make the relay do, valid keys or not. Shared.
@@ -41,6 +44,7 @@ import (
 const (
 	limAddress    = "address"
 	limAuthFail   = "authfail"
+	limKeyFail    = "keyfail"
 	limKey        = "key"
 	limSender     = "sender"
 	limRegister   = "register"
@@ -49,7 +53,7 @@ const (
 	limCollectors = "collectors"
 )
 
-var allLimiters = []string{limAddress, limAuthFail, limKey, limSender, limRegister, limClaim, limWeb, limCollectors}
+var allLimiters = []string{limAddress, limAuthFail, limKeyFail, limKey, limSender, limRegister, limClaim, limWeb, limCollectors}
 
 const (
 	// knownKeyTTL is how long a key stays "recently authenticated" from a
@@ -150,25 +154,18 @@ func (s *Server) penalty(addr string) *apiError {
 }
 
 // authFailed charges one failed authentication to the request's network
-// and returns the error to send. key, if not nil, is a key the request
-// was proved to come from (its signature verified and was not a replay):
-// it stops counting as recently authenticated, so its holder cannot keep
-// failing on a penalised network. A failure nobody proved a key for never
-// removes one, or anyone could do that to someone else's.
+// and returns the error to send.
 //
 // uniform is set for failures of the signature itself. On a penalised
 // network they are answered with the same 429 as a request carrying an
 // unknown key, so that the answer does not say whether a key has been
 // authenticating from the caller's own network.
-func (s *Server) authFailed(w http.ResponseWriter, e *apiError, key []byte, uniform bool) *apiError {
+func (s *Server) authFailed(w http.ResponseWriter, e *apiError, uniform bool) *apiError {
 	st := stateOf(w)
 	if st.addr == "" {
 		return e
 	}
 	s.fails.Charge(st.addr, s.now())
-	if key != nil {
-		s.known.Remove(knownKey(st.addr, auth.EncodeKey(key)))
-	}
 	if uniform && st.penalised {
 		if p := s.penalty(st.addr); p != nil {
 			s.rl.refused.With(limAuthFail).Inc()
@@ -176,6 +173,63 @@ func (s *Server) authFailed(w http.ResponseWriter, e *apiError, key []byte, unif
 		}
 	}
 	return e
+}
+
+// noStanding is authFailed for a request that was properly signed by a key
+// that turned out to have no mailbox: the key also stops counting as
+// recently authenticated from the network.
+func (s *Server) noStanding(w http.ResponseWriter, e *apiError, key []byte) *apiError {
+	if st := stateOf(w); st.addr != "" {
+		s.known.Remove(knownKey(st.addr, auth.EncodeKey(key)))
+	}
+	return s.authFailed(w, e, false)
+}
+
+// depositFailed charges a refused deposit (§5.3 steps 1–7). By the
+// principle above it is charged to a key if there is one to charge: when
+// the request is properly signed by a key that has been authenticating
+// from this network, the failure is that key's (an expired token, a peer
+// that is gone) and draws on the key's own small budget of refused
+// deposits, not on the budget its whole network shares. Otherwise it is
+// the network's. signed is the verified signature if the caller has
+// already checked it; if not, it is checked here (bodyHash non-nil), which
+// costs one verification on a path that is budgeted anyway.
+func (s *Server) depositFailed(w http.ResponseWriter, r *http.Request, e *apiError, signed *auth.SignedRequest, bodyHash *[32]byte) *apiError {
+	st := stateOf(w)
+	if st.addr == "" {
+		return e
+	}
+	now := s.now()
+	if signed == nil && bodyHash != nil {
+		if sr, err := auth.ParseHeaders(r.Header); err == nil && sr.Verify(r.Method, r.URL.EscapedPath(), *bodyHash, now) == nil {
+			signed = &sr
+		}
+	}
+	if signed != nil {
+		if k := auth.EncodeKey(signed.Key); s.known.Has(knownKey(st.addr, k), now) {
+			s.keyFails.Charge(k, now)
+			return e
+		}
+	}
+	return s.authFailed(w, e, false)
+}
+
+// senderOverFailures refuses a deposit naming a sender key that has used
+// up its budget of refused deposits. The header is not verified here: only
+// properly signed failures were ever charged to the key, so nobody else
+// can run it up, and all the answer says is that this key's deposits have
+// been failing.
+func (s *Server) senderOverFailures(r *http.Request) *apiError {
+	k := headerKey(r)
+	if k == "" {
+		return nil
+	}
+	wait := s.keyFails.Wait(k, s.now())
+	if wait <= 0 {
+		return nil
+	}
+	s.rl.refused.With(limKeyFail).Inc()
+	return &apiError{code: CodeRateLimited, retryAfter: min(ratelimit.RetryAfterSeconds(wait), maxPenaltyRetry)}
 }
 
 // authenticated records that key just authenticated from the request's
@@ -227,7 +281,7 @@ func (s *Server) reportLimits() {
 	now := s.now()
 	peaks := map[string]float64{}
 	for name, l := range map[string]any{
-		limAddress: s.addrLimit, limAuthFail: s.fails, limKey: s.keyLimit, limSender: s.subLimit,
+		limAddress: s.addrLimit, limAuthFail: s.fails, limKeyFail: s.keyFails, limKey: s.keyLimit, limSender: s.subLimit,
 		limRegister: s.regLimit, limClaim: s.claimLimit, limWeb: s.webLimit,
 	} {
 		if p, ok := l.(interface{ Peak() float64 }); ok {

@@ -127,7 +127,8 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_RATE_KEY_RPS` / `RELAY_RATE_KEY_BURST` | `20` / `100` | Per-key bucket, applied once a request is authenticated: owner routes, registration and mailbox deletion, and WebSocket ack frames. Keyed by the signing key. |
 | `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits after the request signature verifies (§5.3 step 7) and to blob uploads before their body is read. It's keyed by token `sub`, or by `jti` for open tokens. |
 | `RELAY_RATE_AUTHFAIL_RPS` / `RELAY_RATE_AUTHFAIL_BURST` | `1` / `60` | Budget of *failed* authentications per client network, per relay process. A network that has used it up gets no unauthenticated work done until it refills. |
-| `RELAY_RATE_AUTHFAIL_MAX_PENALTY` | `10m` | Cap on the debt failures beyond the budget run up: the longest a network stays out of budget after its last failure. |
+| `RELAY_RATE_AUTHFAIL_MAX_PENALTY` | `10m` | Cap on the debt failures beyond a budget run up: the longest a network (or a sender key, below) stays out of budget after its last failure. |
+| `RELAY_RATE_KEYFAIL_RPS` / `RELAY_RATE_KEYFAIL_BURST` | `0.1` / `30` | Budget of refused deposits per sender key, per relay process. A refused deposit that is properly signed by a key known at its network is charged here, not to the network. A sender that has used it up has its deposits refused until it refills; nothing else of it is affected. |
 | `RELAY_RATE_REGISTER_RPS` / `RELAY_RATE_REGISTER_BURST` | `1` / `100` | New mailboxes (registrations that create one, and rotations) per client network. Registering an existing key again is free. |
 | `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
 | `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | Per-source-IP bucket for the web endpoints (§6.11) and every other path outside `/v1/` except `/healthz`. It's separate from the API bucket, so scanners never use up mailbox traffic's budget, and always in-process (per relay process, no Valkey round trip). |
@@ -154,8 +155,13 @@ Spec §7.2 has the rules and where each number comes from. In short:
   has used it up is refused before anything but its `X-VettID-Key` header
   is read, unless that key authenticated from the same network in the last
   10 minutes; such a request has its signature checked before anything
-  else, and a key whose own signed request then fails loses that standing.
-  Valid traffic of keys already in use from the network is not touched.
+  else. Valid traffic of keys already in use from the network is not
+  touched.
+- Failures follow the same principle: a refused deposit properly signed by
+  a key known at its network (an expired token, a peer that is gone) is
+  charged to **that key's** own small budget (`RELAY_RATE_KEYFAIL_*`), not
+  to the network, so one vault with expired tokens does not spend what its
+  whole host shares.
 - An attacker with many keys is not bounded by per-key limits (keys are
   free); the flood guard bounds it at `RELAY_RATE_IP_RPS` in total, and
   `RELAY_RATE_REGISTER_*` limits how fast one network can make mailboxes.
@@ -175,7 +181,7 @@ nothing identifies a client): `relay_ratelimit_allowed_total`,
 `relay_ratelimit_refused_total`, `relay_ratelimit_peak_permille` (how full
 the busiest bucket of each limiter got in the last full minute; 1000 means
 something was refused), `relay_ratelimit_penalised_networks`,
-`relay_ratelimit_known_keys`. Limiters: `address`, `authfail`, `key`,
+`relay_ratelimit_known_keys`. Limiters: `address`, `authfail`, `keyfail`, `key`,
 `sender`, `register`, `claim`, `web`, `collectors`. Each process also logs
 one `rate limits` line a minute with the same peaks and the refusals of
 that minute, at info level when anything but the web bucket refused or was

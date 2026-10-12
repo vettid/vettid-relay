@@ -61,7 +61,7 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 		// (idempotent), but a request by a key without a mailbox counts
 		// against its network like any other (limits.go): fresh keys are
 		// free to make, and each of these costs a store query.
-		s.authFailed(w, nil, sr.Key, false)
+		s.noStanding(w, nil, sr.Key)
 	}
 	s.m.deletions.Add(int64(len(ids)))
 	setLog(w, "count", len(ids))

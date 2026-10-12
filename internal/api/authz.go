@@ -35,11 +35,12 @@ func bearerToken(r *http.Request) (string, bool) {
 
 // authorizeDepositToken runs spec §5.3 steps 1–6 for deposits and blob puts.
 // It needs only headers, so it runs before any body is read. Every refusal
-// here is a failed authentication (limits.go); proven, if not nil, is the
-// key the request is already known to be signed by.
-func (s *Server) authorizeDepositToken(ctx context.Context, w http.ResponseWriter, r *http.Request, mailboxID string, proven []byte) (*depositAuth, *apiError) {
+// here is a failed authentication (limits.go depositFailed): signed is the
+// request's verified signature if it has been checked already, bodyHash the
+// body's hash if the body has been read (a deposit; not a blob upload).
+func (s *Server) authorizeDepositToken(ctx context.Context, w http.ResponseWriter, r *http.Request, mailboxID string, signed *auth.SignedRequest, bodyHash *[32]byte) (*depositAuth, *apiError) {
 	refuse := func(code string) (*depositAuth, *apiError) {
-		return nil, s.authFailed(w, fail(code), proven, false)
+		return nil, s.depositFailed(w, r, fail(code), signed, bodyHash)
 	}
 	// 1. Mailbox exists.
 	if !auth.ValidMailboxID(mailboxID) {
@@ -122,7 +123,7 @@ func (s *Server) verifySender(w http.ResponseWriter, r *http.Request, da *deposi
 	if da.claims.Open() {
 		sender = auth.EncodeKey(signed.Key)
 	} else if subtle.ConstantTimeCompare(signed.Key, da.claims.SubKey) != 1 {
-		return "", s.authFailed(w, fail(CodeSignatureInvalid), signed.Key, false)
+		return "", s.depositFailed(w, r, fail(CodeSignatureInvalid), signed, nil)
 	}
 	s.authenticated(w, signed.Key)
 	return sender, nil
@@ -132,13 +133,13 @@ func (s *Server) verifySender(w http.ResponseWriter, r *http.Request, da *deposi
 func (s *Server) verifySignature(w http.ResponseWriter, r *http.Request, bodyHash [32]byte) (auth.SignedRequest, *apiError) {
 	sr, err := auth.ParseHeaders(r.Header)
 	if err != nil {
-		return sr, s.authFailed(w, fail(CodeSignatureInvalid), nil, true)
+		return sr, s.authFailed(w, fail(CodeSignatureInvalid), true)
 	}
 	switch err := sr.Verify(r.Method, r.URL.EscapedPath(), bodyHash, s.now()); {
 	case errors.Is(err, auth.ErrTimestampStale):
-		return sr, s.authFailed(w, fail(CodeTimestampStale), nil, true)
+		return sr, s.authFailed(w, fail(CodeTimestampStale), true)
 	case err != nil:
-		return sr, s.authFailed(w, fail(CodeSignatureInvalid), nil, true)
+		return sr, s.authFailed(w, fail(CodeSignatureInvalid), true)
 	}
 	return sr, nil
 }
@@ -147,7 +148,7 @@ func (s *Server) checkReplay(w http.ResponseWriter, sr auth.SignedRequest) *apiE
 	switch err := s.replay.Check(sr, s.now()); {
 	case errors.Is(err, auth.ErrReplay):
 		// Anyone who saw the request can replay it: no key is proven.
-		return s.authFailed(w, fail(CodeReplayDetected), nil, false)
+		return s.authFailed(w, fail(CodeReplayDetected), false)
 	case errors.Is(err, auth.ErrReplayCacheFull):
 		s.log.Warn("replay cache full or unavailable; shedding load", "err", err)
 		return &apiError{code: CodeRateLimited, retryAfter: 5}
@@ -181,14 +182,14 @@ func (s *Server) authorizeOwner(ctx context.Context, w http.ResponseWriter, r *h
 	}
 	mb, err := s.st.Mailbox(ctx, auth.MailboxID(sr.Key))
 	if errors.Is(err, store.ErrNotFound) {
-		return store.Mailbox{}, s.authFailed(w, fail(CodeMailboxUnknown), sr.Key, false)
+		return store.Mailbox{}, s.noStanding(w, fail(CodeMailboxUnknown), sr.Key)
 	}
 	if err != nil {
 		s.log.Error("mailbox lookup failed", "err", err)
 		return store.Mailbox{}, fail(CodeInternal)
 	}
 	if subtle.ConstantTimeCompare(mb.PubKey, sr.Key) != 1 {
-		return store.Mailbox{}, s.authFailed(w, fail(CodeMailboxUnknown), sr.Key, false)
+		return store.Mailbox{}, s.noStanding(w, fail(CodeMailboxUnknown), sr.Key)
 	}
 	s.authenticated(w, sr.Key)
 	if e := s.allowKey(sr.Key); e != nil {

@@ -128,7 +128,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	// Proof of possession: the request must be signed by the key registered.
 	if !bytes.Equal(pub, sr.Key) {
-		s.writeError(w, s.authFailed(w, fail(CodeSignatureInvalid), sr.Key, false))
+		s.writeError(w, s.authFailed(w, fail(CodeSignatureInvalid), false))
 		return
 	}
 	if e := s.allowKey(sr.Key); e != nil {
@@ -143,7 +143,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// keeps asking for mailboxes it may not have ends up penalised.
 	if _, err := s.st.Mailbox(r.Context(), id); errors.Is(err, store.ErrNotFound) {
 		if e := s.allowRegistration(w); e != nil {
-			s.writeError(w, s.authFailed(w, e, nil, false))
+			s.writeError(w, s.authFailed(w, e, false))
 			return
 		}
 	}
@@ -178,16 +178,20 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	// mailbox and token are looked at (limits.go). Otherwise the order is
 	// §5.3's.
 	var signed *auth.SignedRequest
-	var proven []byte
 	if stateOf(w).penalised {
 		sr, e := s.authorizeSigner(w, r, bodyHash)
 		if e != nil {
 			s.writeError(w, e)
 			return
 		}
-		signed, proven = &sr, sr.Key
+		signed = &sr
 	}
-	da, e := s.authorizeDepositToken(r.Context(), w, r, mailboxID, proven) // steps 1–6
+	// A sender whose deposits keep being refused waits (limits.go).
+	if e := s.senderOverFailures(r); e != nil {
+		s.writeError(w, e)
+		return
+	}
+	da, e := s.authorizeDepositToken(r.Context(), w, r, mailboxID, signed, &bodyHash) // steps 1–6
 	if e != nil {
 		s.writeError(w, e)
 		return

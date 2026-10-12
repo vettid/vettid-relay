@@ -723,13 +723,26 @@ IPv6 /64 (one subscriber or host either way).
 1. **Failed-authentication budget, per network.** A request that fails
    authentication is charged to its network after the fact: a missing, wrong
    or stale request signature, a replay, a signer without a mailbox on an
-   owner route or on mailbox deletion, any refusal of §5.3 steps 1–7
-   (unknown mailbox, bad, expired, revoked or used token, wrong sender), an
-   unknown claim, and a registration over the budget of item 5. Charges are
-   never refused; those beyond the budget run up a debt that refills first
-   (capped, so a network is never held longer than the cap after its last
-   failure). While a network is out of budget the relay does **no
-   unauthenticated work** for it:
+   owner route or on mailbox deletion, a refusal of §5.3 steps 1–7
+   (unknown mailbox, bad, expired, revoked or used token, wrong sender)
+   unless it is the sender key's own (below), an unknown claim, and a
+   registration over the budget of item 5. Charges are never refused; those
+   beyond the budget run up a debt that refills first (capped, so a network
+   is never held longer than the cap after its last failure).
+
+   The principle applies to failures too. A refused deposit that is
+   properly signed by a key which has been authenticating from the same
+   network is **that key's** failure (an expired token, a peer that is
+   gone): it draws on a small budget of refused deposits per sender key,
+   and a sender that has used it up has its deposits refused with `429`
+   until it refills, while its collects and everything else carry on. So
+   one vault whose tokens have expired does not spend the budget its whole
+   host shares, and nobody can run up a key's budget but its holder (only
+   properly signed failures are charged to it). A refused blob upload is
+   always the network's (its signature cannot be checked before its body).
+
+   While a network is out of budget the relay does **no unauthenticated
+   work** for it:
    - a request is refused, before anything but its `X-VettID-Key` header is
      read, unless that key authenticated from the same network recently (the
      relay remembers network-and-key pairs for some minutes after each
@@ -740,9 +753,10 @@ IPv6 /64 (one subscriber or host either way).
      `429` as an unknown key, so the answer does not reveal that a key is in
      use from the caller's own network, and it does not cost the key its
      standing (anyone can send one);
-   - a failure of a request whose signature did verify (not a replay) ends
-     that key's standing on that network: failures cannot be bought with
-     valid requests;
+   - a signer that turns out to have no mailbox loses its standing on that
+     network; refused deposits of a key with standing are charged to the
+     key as above, so failures cannot be bought with valid requests beyond
+     each key's own small budget;
    - blob uploads from it wait (their signature cannot be checked before
      the body is read).
 
@@ -775,8 +789,9 @@ the caller has proved the key is its own, so only the key's holder ever
 sees their `429`; on an owner route an unregistered signer gets
 `mailbox_unknown` however many requests it sends.
 
-**`retry_after`.** For a single key's limit (3, 4, 5, 6): the whole seconds
-until one request is allowed, at least 1. For the network limits that many
+**`retry_after`.** For a single key's limit (3, 4, 5, 6, and a sender's
+refused deposits, capped at 60 s): the whole seconds until one request is
+allowed, at least 1. For the network limits that many
 clients of one network can hit at once (1, 2): the same plus a random
 0–4 s, so that they do not all return in the same instant; under item 1
 the value is capped (60 s). A mailbox at its collector maximum gets 1; a
@@ -804,7 +819,8 @@ the same on its own mailbox while its vault is unlocked.
 
 | Limit | Default | Why this number |
 |---|---|---|
-| 1 failed authentications | 1/s, burst 60, debt capped at 10 min; per network, per relay process | Valid clients fail rarely (an expired token once per token; a peer that deleted its mailbox, once per peer; a wrong clock). 60 covers one event seen by many vaults of a host at once. An attacker gets 60 answers, then one a second. |
+| 1 failed authentications | 1/s, burst 60, debt capped at 10 min; per network, per relay process | What is left for the network once refused deposits of known keys are charged to the keys: wrong signatures, unknown signers, claim misses. Valid clients produce these rarely (a wrong clock; a client whose mailbox is gone). An attacker gets 60 answers, then one a second. |
+| 1 refused deposits | 0.1/s, burst 30, debt capped at 10 min; per sender key, per relay process | A vault back after a month finds its standing tokens expired: one refusal per connection, each starting a reconnect; 30 covers most vaults at once, the rest follow at one per 10 s from the vault's outbox. |
 | 2 flood guard | 200/s, burst 2,000; per network | A host of 1,000 unlocked vaults: 40/s idle, about 90/s with every vault receiving and sending a message a minute; 200/s is twice that. The burst is every one of 1,000 long-polls re-issued in the same instant, twice: a relay deploy ends them all together, and they then stay in step. |
 | 3 per key | 20/s, burst 100 | 500 times an idle vault. A message costs its recipient two requests, so 10 messages a second sustained; the burst is three full batches of 32 with their acks. |
 | 4 per sender | 5/s, burst 20 | unchanged |
@@ -814,7 +830,8 @@ the same on its own mailbox while its vault is unlocked.
 
 What one network can then cost the relay: unauthenticated, 60 requests'
 worth of verification and store reads, then one a second (the old single
-bucket allowed 20 a second for ever); with valid keys, of which an attacker
+bucket allowed 20 a second for ever), plus 30 refused deposits and then
+one per 10 s for each key it had authenticating before; with valid keys, of which an attacker
 can register as many as item 5 lets it, 200 requests a second **in total**
 (per-key limits bound nothing against someone with many keys: the flood
 guard is what bounds them). A signature check costs about 0.13 ms of one
@@ -851,7 +868,8 @@ info level when anything was refused or any bucket was at least half used.
 
 **Configuration (informative).** vettid-relay reads, each as `_RPS` and
 `_BURST`: `RELAY_RATE_IP` (2), `RELAY_RATE_KEY` (3), `RELAY_RATE_SENDER`
-(4), `RELAY_RATE_AUTHFAIL` (1; also `RELAY_RATE_AUTHFAIL_MAX_PENALTY`),
+(4), `RELAY_RATE_AUTHFAIL` and `RELAY_RATE_KEYFAIL` (1; also
+`RELAY_RATE_AUTHFAIL_MAX_PENALTY`),
 `RELAY_RATE_REGISTER` (5), `RELAY_RATE_CLAIM_GET` (6), `RELAY_RATE_WEB`
 (§6.11); and `RELAY_MAX_COLLECTORS_PER_MAILBOX` (7).
 
@@ -1025,7 +1043,8 @@ The push gateway API is specified separately.
   applied only after authentication; the per-sender limit moves after the
   deposit's signature check (§5.3); new mailboxes are limited per network,
   re-registration is not (§6.1); claim misses count as failures (§6.9);
-  limits are no oracle; `retry_after` rules; what a relay should measure;
+  limits are no oracle; refused deposits of a known sender key are charged to that key;
+  `retry_after` rules; what a relay should measure;
   the reference relay's numbers and where each comes from. No allowlist of
   vault hosts. **Nothing changes on the wire**: no new endpoint, field or
   error code; clients need no change and see fewer `429`s.

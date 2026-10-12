@@ -120,6 +120,7 @@ func oldLimits(c *config.Config) {
 	c.RateIPPerSec, c.RateIPBurst = 20, 40
 	c.RateKeyPerSec, c.RateKeyBurst = 1e6, 1_000_000
 	c.RateAuthFailPerSec, c.RateAuthFailBurst = 1e6, 1_000_000
+	c.RateKeyFailPerSec, c.RateKeyFailBurst = 1e6, 1_000_000
 	c.RateRegisterPerSec, c.RateRegisterBurst = 1e6, 1_000_000
 	c.RateSenderPerSec, c.RateSenderBurst = 5, 20
 }
@@ -130,6 +131,7 @@ func newLimits(c *config.Config) {
 	c.RateIPPerSec, c.RateIPBurst = d.RateIPPerSec, d.RateIPBurst
 	c.RateKeyPerSec, c.RateKeyBurst = d.RateKeyPerSec, d.RateKeyBurst
 	c.RateAuthFailPerSec, c.RateAuthFailBurst, c.AuthFailMaxPenalty = d.RateAuthFailPerSec, d.RateAuthFailBurst, d.AuthFailMaxPenalty
+	c.RateKeyFailPerSec, c.RateKeyFailBurst = d.RateKeyFailPerSec, d.RateKeyFailBurst
 	c.RateRegisterPerSec, c.RateRegisterBurst = d.RateRegisterPerSec, d.RateRegisterBurst
 	c.RateSenderPerSec, c.RateSenderBurst = d.RateSenderPerSec, d.RateSenderBurst
 	c.RateClaimPerSec, c.RateClaimBurst = d.RateClaimPerSec, d.RateClaimBurst

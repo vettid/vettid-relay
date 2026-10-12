@@ -83,13 +83,13 @@ func (s *Server) handleClaimGet(w http.ResponseWriter, r *http.Request) {
 	// against the network's budget (limits.go).
 	id := r.PathValue("claim_id")
 	if _, ok := auth.ParseClaimID(id); !ok {
-		s.writeError(w, s.authFailed(w, fail(CodeClaimUnknown), nil, false))
+		s.writeError(w, s.authFailed(w, fail(CodeClaimUnknown), false))
 		return
 	}
 	data, err := s.st.TakeClaim(r.Context(), id)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		s.writeError(w, s.authFailed(w, fail(CodeClaimUnknown), nil, false))
+		s.writeError(w, s.authFailed(w, fail(CodeClaimUnknown), false))
 		return
 	case err != nil:
 		s.log.Error("claim get failed", "err", err)

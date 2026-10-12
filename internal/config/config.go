@@ -70,6 +70,8 @@ type Config struct {
 	RateAuthFailPerSec float64       // RELAY_RATE_AUTHFAIL_RPS: failed authentications per network, per process
 	RateAuthFailBurst  int           // RELAY_RATE_AUTHFAIL_BURST
 	AuthFailMaxPenalty time.Duration // RELAY_RATE_AUTHFAIL_MAX_PENALTY
+	RateKeyFailPerSec  float64       // RELAY_RATE_KEYFAIL_RPS: refused deposits per known sender key, per process
+	RateKeyFailBurst   int           // RELAY_RATE_KEYFAIL_BURST
 	RateRegisterPerSec float64       // RELAY_RATE_REGISTER_RPS: new mailboxes per network
 	RateRegisterBurst  int           // RELAY_RATE_REGISTER_BURST
 	RateSenderPerSec   float64       // RELAY_RATE_SENDER_RPS
@@ -159,6 +161,8 @@ func Defaults() Config {
 		RateAuthFailPerSec: 1,
 		RateAuthFailBurst:  60,
 		AuthFailMaxPenalty: 10 * time.Minute,
+		RateKeyFailPerSec:  0.1,
+		RateKeyFailBurst:   30,
 		RateRegisterPerSec: 1,
 		RateRegisterBurst:  100,
 		RateSenderPerSec:   5,
@@ -292,6 +296,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	f64("RELAY_RATE_AUTHFAIL_RPS", &c.RateAuthFailPerSec)
 	integer("RELAY_RATE_AUTHFAIL_BURST", &c.RateAuthFailBurst)
 	dur("RELAY_RATE_AUTHFAIL_MAX_PENALTY", &c.AuthFailMaxPenalty)
+	f64("RELAY_RATE_KEYFAIL_RPS", &c.RateKeyFailPerSec)
+	integer("RELAY_RATE_KEYFAIL_BURST", &c.RateKeyFailBurst)
 	f64("RELAY_RATE_REGISTER_RPS", &c.RateRegisterPerSec)
 	integer("RELAY_RATE_REGISTER_BURST", &c.RateRegisterBurst)
 	f64("RELAY_RATE_SENDER_RPS", &c.RateSenderPerSec)
@@ -383,7 +389,7 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("RELAY_MAX_BLOB_BYTES must be > 0 when blobs are enabled"))
 	}
 	if c.MaxConcurrentBlobTransfers <= 0 || c.MaxCollectorsPerMailbox <= 0 || c.ReplayCacheMax <= 0 ||
-		c.RateIPBurst <= 0 || c.RateKeyBurst <= 0 || c.RateAuthFailBurst <= 0 || c.RateRegisterBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 || c.RateWebBurst <= 0 {
+		c.RateIPBurst <= 0 || c.RateKeyBurst <= 0 || c.RateAuthFailBurst <= 0 || c.RateKeyFailBurst <= 0 || c.RateRegisterBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 || c.RateWebBurst <= 0 {
 		errs = append(errs, errors.New("concurrency, burst and cache limits must be > 0"))
 	}
 	if len(c.AndroidCertFingerprints) > 0 && !validAndroidPackage(c.AndroidPackage) {
