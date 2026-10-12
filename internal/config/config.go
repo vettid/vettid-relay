@@ -61,14 +61,23 @@ type Config struct {
 	MaxClaimBytes int64         // RELAY_MAX_CLAIM_BYTES
 	ClaimTTL      time.Duration // RELAY_CLAIM_TTL (max TTL a creator may request)
 
-	RateIPPerSec     float64 // RELAY_RATE_IP_RPS
-	RateIPBurst      int     // RELAY_RATE_IP_BURST
-	RateSenderPerSec float64 // RELAY_RATE_SENDER_RPS
-	RateSenderBurst  int     // RELAY_RATE_SENDER_BURST
-	RateClaimPerSec  float64 // RELAY_RATE_CLAIM_GET_RPS
-	RateClaimBurst   int     // RELAY_RATE_CLAIM_GET_BURST
-	RateWebPerSec    float64 // RELAY_RATE_WEB_RPS (everything outside /v1/ and /healthz)
-	RateWebBurst     int     // RELAY_RATE_WEB_BURST
+	// Rate limits (spec §7.2). Per client network (IPv4 address / IPv6 /64)
+	// only where the caller is not authenticated yet; per key once it is.
+	RateIPPerSec       float64       // RELAY_RATE_IP_RPS: flood guard on /v1/, per network, per process
+	RateIPBurst        int           // RELAY_RATE_IP_BURST
+	RateKeyPerSec      float64       // RELAY_RATE_KEY_RPS: per authenticated key (owner routes, register, delete)
+	RateKeyBurst       int           // RELAY_RATE_KEY_BURST
+	RateAuthFailPerSec float64       // RELAY_RATE_AUTHFAIL_RPS: failed authentications per network, per process
+	RateAuthFailBurst  int           // RELAY_RATE_AUTHFAIL_BURST
+	AuthFailMaxPenalty time.Duration // RELAY_RATE_AUTHFAIL_MAX_PENALTY
+	RateRegisterPerSec float64       // RELAY_RATE_REGISTER_RPS: new mailboxes per network
+	RateRegisterBurst  int           // RELAY_RATE_REGISTER_BURST
+	RateSenderPerSec   float64       // RELAY_RATE_SENDER_RPS
+	RateSenderBurst    int           // RELAY_RATE_SENDER_BURST
+	RateClaimPerSec    float64       // RELAY_RATE_CLAIM_GET_RPS
+	RateClaimBurst     int           // RELAY_RATE_CLAIM_GET_BURST
+	RateWebPerSec      float64       // RELAY_RATE_WEB_RPS (everything outside /v1/ and /healthz)
+	RateWebBurst       int           // RELAY_RATE_WEB_BURST
 
 	// Web endpoints (spec §6.11): /.well-known/assetlinks.json names the
 	// Android app allowed to open this relay's /connect links. An empty
@@ -143,14 +152,21 @@ func Defaults() Config {
 		MaxClaimBytes: 16384,
 		ClaimTTL:      900 * time.Second,
 
-		RateIPPerSec:     20,
-		RateIPBurst:      40,
-		RateSenderPerSec: 5,
-		RateSenderBurst:  20,
-		RateClaimPerSec:  1,
-		RateClaimBurst:   10,
-		RateWebPerSec:    2,
-		RateWebBurst:     20,
+		RateIPPerSec:       200,
+		RateIPBurst:        2000,
+		RateKeyPerSec:      20,
+		RateKeyBurst:       100,
+		RateAuthFailPerSec: 1,
+		RateAuthFailBurst:  60,
+		AuthFailMaxPenalty: 10 * time.Minute,
+		RateRegisterPerSec: 1,
+		RateRegisterBurst:  100,
+		RateSenderPerSec:   5,
+		RateSenderBurst:    20,
+		RateClaimPerSec:    1,
+		RateClaimBurst:     10,
+		RateWebPerSec:      2,
+		RateWebBurst:       20,
 
 		AndroidPackage:          DefaultAndroidPackage,
 		AndroidCertFingerprints: append([]string(nil), DefaultAndroidCertFingerprints...),
@@ -271,6 +287,13 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 
 	f64("RELAY_RATE_IP_RPS", &c.RateIPPerSec)
 	integer("RELAY_RATE_IP_BURST", &c.RateIPBurst)
+	f64("RELAY_RATE_KEY_RPS", &c.RateKeyPerSec)
+	integer("RELAY_RATE_KEY_BURST", &c.RateKeyBurst)
+	f64("RELAY_RATE_AUTHFAIL_RPS", &c.RateAuthFailPerSec)
+	integer("RELAY_RATE_AUTHFAIL_BURST", &c.RateAuthFailBurst)
+	dur("RELAY_RATE_AUTHFAIL_MAX_PENALTY", &c.AuthFailMaxPenalty)
+	f64("RELAY_RATE_REGISTER_RPS", &c.RateRegisterPerSec)
+	integer("RELAY_RATE_REGISTER_BURST", &c.RateRegisterBurst)
 	f64("RELAY_RATE_SENDER_RPS", &c.RateSenderPerSec)
 	integer("RELAY_RATE_SENDER_BURST", &c.RateSenderBurst)
 	f64("RELAY_RATE_CLAIM_GET_RPS", &c.RateClaimPerSec)
@@ -360,7 +383,7 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("RELAY_MAX_BLOB_BYTES must be > 0 when blobs are enabled"))
 	}
 	if c.MaxConcurrentBlobTransfers <= 0 || c.MaxCollectorsPerMailbox <= 0 || c.ReplayCacheMax <= 0 ||
-		c.RateIPBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 || c.RateWebBurst <= 0 {
+		c.RateIPBurst <= 0 || c.RateKeyBurst <= 0 || c.RateAuthFailBurst <= 0 || c.RateRegisterBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 || c.RateWebBurst <= 0 {
 		errs = append(errs, errors.New("concurrency, burst and cache limits must be > 0"))
 	}
 	if len(c.AndroidCertFingerprints) > 0 && !validAndroidPackage(c.AndroidPackage) {

@@ -42,42 +42,42 @@ func TestAuthorizeDepositOrder(t *testing.T) {
 
 	// Happy path through step 7.
 	r := f.depositReq(owner, sender, good, body)
-	da, e := f.s.authorizeDepositToken(ctx, r, owner.mbx)
+	da, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil)
 	if e != nil {
 		t.Fatalf("steps 1-6: %v", e)
 	}
-	if got, e := f.s.verifySender(r, da, auth.BodyHash(body)); e != nil || got != sender.b64 {
+	if got, e := f.s.verifySender(httptest.NewRecorder(), r, da, auth.BodyHash(body), nil); e != nil || got != sender.b64 {
 		t.Fatalf("step 7: %v", e)
 	}
 	// Same request again → replay.
-	if _, e := f.s.verifySender(r, da, auth.BodyHash(body)); code(e) != CodeReplayDetected {
+	if _, e := f.s.verifySender(httptest.NewRecorder(), r, da, auth.BodyHash(body), nil); code(e) != CodeReplayDetected {
 		t.Fatalf("replay: %v", code(e))
 	}
 
 	// Step 1 precedes everything: unknown mailbox wins over a bad token.
 	for _, tok := range []string{"", "garbage", good} {
 		r := f.depositReq(other, sender, tok, body)
-		if _, e := f.s.authorizeDepositToken(ctx, r, other.mbx); code(e) != CodeMailboxUnknown {
+		if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, other.mbx, nil); code(e) != CodeMailboxUnknown {
 			t.Fatalf("unknown mailbox with token %q: %v", tok, code(e))
 		}
 	}
-	if _, e := f.s.authorizeDepositToken(ctx, r, "NOT-A-MAILBOX"); code(e) != CodeMailboxUnknown {
+	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, "NOT-A-MAILBOX", nil); code(e) != CodeMailboxUnknown {
 		t.Fatal("malformed mailbox id")
 	}
 
 	// Step 2: token signed by someone other than the mailbox owner.
 	forged := f.mint(other, sender, func(c *auth.Claims) { c.Iss = owner.mbx })
-	if _, e := f.s.authorizeDepositToken(ctx, f.depositReq(owner, sender, forged, body), owner.mbx); code(e) != CodeTokenInvalid {
+	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), f.depositReq(owner, sender, forged, body), owner.mbx, nil); code(e) != CodeTokenInvalid {
 		t.Fatalf("forged: %v", code(e))
 	}
 	// Missing / wrong scheme.
 	r = f.depositReq(owner, sender, "", body)
 	r.Header.Set("Authorization", "Bearer "+good)
-	if _, e := f.s.authorizeDepositToken(ctx, r, owner.mbx); code(e) != CodeTokenInvalid {
+	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil); code(e) != CodeTokenInvalid {
 		t.Fatalf("wrong scheme: %v", code(e))
 	}
 	r.Header.Set("Authorization", "vettid-deposit "+good) // scheme is case-insensitive
-	if _, e := f.s.authorizeDepositToken(ctx, r, owner.mbx); e != nil {
+	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil); e != nil {
 		t.Fatalf("lowercase scheme: %v", code(e))
 	}
 
@@ -87,17 +87,17 @@ func TestAuthorizeDepositOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	r = f.depositReq(owner, other, revoked, body) // signed by the wrong key too
-	if _, e := f.s.authorizeDepositToken(ctx, r, owner.mbx); code(e) != CodeTokenRevoked {
+	if _, e := f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil); code(e) != CodeTokenRevoked {
 		t.Fatalf("revoked jti: %v", code(e))
 	}
 
 	// Step 7: token for sender presented with other's signature.
 	r = f.depositReq(owner, other, good, body)
-	da, e = f.s.authorizeDepositToken(ctx, r, owner.mbx)
+	da, e = f.s.authorizeDepositToken(ctx, httptest.NewRecorder(), r, owner.mbx, nil)
 	if e != nil {
 		t.Fatal(code(e))
 	}
-	if _, e := f.s.verifySender(r, da, auth.BodyHash(body)); code(e) != CodeSignatureInvalid {
+	if _, e := f.s.verifySender(httptest.NewRecorder(), r, da, auth.BodyHash(body), nil); code(e) != CodeSignatureInvalid {
 		t.Fatalf("sender binding: %v", code(e))
 	}
 }
@@ -112,16 +112,16 @@ func TestAuthorizeOwner(t *testing.T) {
 		auth.SetHeaders(r.Header, p.priv, "GET", "/v1/mailbox", at, auth.BodyHash(nil))
 		return r
 	}
-	if mb, e := f.s.authorizeOwner(ctx, mk(owner, f.clk.now()), auth.BodyHash(nil)); e != nil || mb.ID != owner.mbx {
+	if mb, e := f.s.authorizeOwner(ctx, httptest.NewRecorder(), mk(owner, f.clk.now()), auth.BodyHash(nil)); e != nil || mb.ID != owner.mbx {
 		t.Fatalf("owner: %v", code(e))
 	}
-	if _, e := f.s.authorizeOwner(ctx, mk(stranger, f.clk.now()), auth.BodyHash(nil)); code(e) != CodeMailboxUnknown {
+	if _, e := f.s.authorizeOwner(ctx, httptest.NewRecorder(), mk(stranger, f.clk.now()), auth.BodyHash(nil)); code(e) != CodeMailboxUnknown {
 		t.Fatalf("unregistered: %v", code(e))
 	}
-	if _, e := f.s.authorizeOwner(ctx, mk(owner, f.clk.now().Add(-2*time.Minute)), auth.BodyHash(nil)); code(e) != CodeTimestampStale {
+	if _, e := f.s.authorizeOwner(ctx, httptest.NewRecorder(), mk(owner, f.clk.now().Add(-2*time.Minute)), auth.BodyHash(nil)); code(e) != CodeTimestampStale {
 		t.Fatalf("stale: %v", code(e))
 	}
-	if _, e := f.s.authorizeOwner(ctx, mk(owner, f.clk.now()), auth.BodyHash([]byte("x"))); code(e) != CodeSignatureInvalid {
+	if _, e := f.s.authorizeOwner(ctx, httptest.NewRecorder(), mk(owner, f.clk.now()), auth.BodyHash([]byte("x"))); code(e) != CodeSignatureInvalid {
 		t.Fatalf("body mismatch: %v", code(e))
 	}
 }

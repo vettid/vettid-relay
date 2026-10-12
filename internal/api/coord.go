@@ -13,9 +13,9 @@ import (
 // store: the signature replay cache (§4.1), rate-limit buckets (§7.2) and
 // wake-on-deposit signals (§6.2). One relay process keeps them in memory (the
 // defaults). Several processes sharing one store must share them too, or a
-// request replayed to another process would pass, limits would multiply by
-// the process count, and a collector parked on one process would not wake
-// for a deposit taken by another. internal/coord implements them on Valkey.
+// request replayed to another process would pass, a key's limits would
+// multiply by the process count, and a collector parked on one process
+// would not wake for a deposit taken by another. internal/coord implements them on Valkey.
 
 // ReplayGuard records a verified signed request and rejects a duplicate
 // (auth.ErrReplay). auth.ErrReplayCacheFull means "cannot record right now":
@@ -66,21 +66,41 @@ func WithEmptyHints(h EmptyHints) Option { return func(s *Server) { s.hints = h 
 // WithReplayGuard replaces the in-memory replay cache.
 func WithReplayGuard(g ReplayGuard) Option { return func(s *Server) { s.replay = g } }
 
-// WithRateLimiters replaces the in-memory per-IP, per-sender and claim-GET
-// limiters (nil keeps the default for that one).
-func WithRateLimiters(ip, sender, claim RateLimiter) Option {
+// Limiters are the rate limiters that several relay processes share (nil
+// keeps the in-memory default for that one). The failed-authentication
+// budget is not among them: it is per process by design (limits.go).
+type Limiters struct {
+	Address  RateLimiter // flood guard per client network
+	Key      RateLimiter // per authenticated key
+	Sender   RateLimiter // per sender key
+	Register RateLimiter // new mailboxes per client network
+	Claim    RateLimiter // unauthenticated claim GETs per client network
+}
+
+// WithRateLimiters replaces in-memory limiters with shared ones.
+func WithRateLimiters(l Limiters) Option {
 	return func(s *Server) {
-		if ip != nil {
-			s.ipLimit = ip
+		if l.Address != nil {
+			s.addrLimit = l.Address
 		}
-		if sender != nil {
-			s.subLimit = sender
+		if l.Key != nil {
+			s.keyLimit = l.Key
 		}
-		if claim != nil {
-			s.claimLimit = claim
+		if l.Sender != nil {
+			s.subLimit = l.Sender
+		}
+		if l.Register != nil {
+			s.regLimit = l.Register
+		}
+		if l.Claim != nil {
+			s.claimLimit = l.Claim
 		}
 	}
 }
+
+// WithRetryJitter replaces the random 0..4 s added to the retry_after of
+// refusals that hit many clients at once (tests).
+func WithRetryJitter(f func() int) Option { return func(s *Server) { s.retryJitter = f } }
 
 // WithWakeBus publishes every deposit's mailbox to other relay processes.
 // Signals they publish are delivered here through Server.Wake.

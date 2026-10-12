@@ -465,6 +465,46 @@ func TestMultiProcessRateLimitShared(t *testing.T) {
 	}
 }
 
+// The per-key limit follows the key across processes (§7.2): an owner's
+// budget is the same however the load balancer spreads its requests, and
+// another owner behind the same address has its own.
+func TestMultiProcessKeyLimitShared(t *testing.T) {
+	cl := newCluster(t, "RELAY_RATE_KEY_RPS=0.05", "RELAY_RATE_KEY_BURST=5")
+	a, b := cl.start(), cl.start()
+	ctx := context.Background()
+	owner, other := principal(t, a.url), principal(t, a.url)
+	for _, p := range []*client.Client{owner, other} {
+		p.MaxAttempts = 1
+		if _, err := p.Register(ctx); err != nil { // one of each key's five
+			t.Fatal(err)
+		}
+	}
+	limited := 0
+	for i := 0; i < 8; i++ {
+		url := a.url
+		if i%2 == 1 {
+			url = b.url
+		}
+		c := as(owner, url)
+		c.MaxAttempts = 1
+		switch _, err := c.Collect(ctx, 0, 1); {
+		case err == nil:
+		case client.IsCode(err, "rate_limited"):
+			limited++
+		default:
+			t.Fatal(err)
+		}
+	}
+	if limited != 4 {
+		t.Fatalf("burst 5 (one used) over two processes: %d of 8 limited (want 4)", limited)
+	}
+	c := as(other, b.url)
+	c.MaxAttempts = 1
+	if _, err := c.Collect(ctx, 0, 1); err != nil {
+		t.Fatalf("another key behind the same address was limited: %v", err)
+	}
+}
+
 // Mailbox deletion (protocol 0.5.0, §6.10) across processes: deleted on A,
 // the mailbox is gone on B at once — deposits and blob uploads refused even
 // though B has it cached, B's parked long-poll and WebSocket ended, B's

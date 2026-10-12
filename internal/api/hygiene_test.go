@@ -18,6 +18,7 @@ type syncBuf struct {
 
 func (s *syncBuf) Write(p []byte) (int, error) { s.mu.Lock(); defer s.mu.Unlock(); return s.b.Write(p) }
 func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+func (s *syncBuf) reset()                      { s.mu.Lock(); defer s.mu.Unlock(); s.b.Reset() }
 
 // Spec §8.2 / plan working agreements: logs carry msg ids, sizes and codes
 // only — never payloads, tokens, signatures, full pubkeys or mailbox ids.

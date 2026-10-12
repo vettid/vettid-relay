@@ -156,7 +156,7 @@ uses two 0.3 features.
 
 | Response | What to do |
 |---|---|
-| `429 rate_limited` | Wait `retry_after` seconds (also in the `Retry-After` header) plus jitter, then retry. |
+| `429 rate_limited` | Wait `retry_after` seconds (also in the `Retry-After` header) plus jitter, then retry. Never sooner: a limit is per key once you are authenticated (spec §7.2), so retrying early only spends your own budget, and many clients behind one address retrying early turn a touched limit into a storm. |
 | `5xx`, network error | Retry with exponential backoff and full jitter, for example 0.25 s × 2ⁿ capped at about 30 s. Re-sign every attempt. |
 | `timestamp_stale` | Fix the clock. Don't loop. |
 | `replay_detected` | You resent an identical signed request. Re-sign with a new timestamp. |

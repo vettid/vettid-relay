@@ -38,9 +38,19 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mailboxID := r.PathValue("mailbox_id")
+	// A network out of failed-authentication budget gets no unauthenticated
+	// work (limits.go). An upload's signature cannot be checked before its
+	// body is read, so uploads from it wait until it has budget again.
+	if st := stateOf(w); st.penalised {
+		if e := s.penalty(st.addr); e != nil {
+			s.rl.refused.With(limAuthFail).Inc()
+			s.writeError(w, e)
+			return
+		}
+	}
 	// §5.3 steps 1–6 need only headers: unauthorized uploads are refused
 	// before their body is read.
-	da, e := s.authorizeDepositToken(r.Context(), r, mailboxID)
+	da, e := s.authorizeDepositToken(r.Context(), w, r, mailboxID, nil)
 	if e != nil {
 		s.writeError(w, e)
 		return
@@ -51,6 +61,8 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeTokenInvalid))
 		return
 	}
+	// Before the body is read (unlike a deposit's, which is small): the
+	// token alone has to pay for the transfer.
 	if e := s.allowSender(da.claims.Sub); e != nil {
 		s.writeError(w, e)
 		return
@@ -80,7 +92,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	}
 	var bodyHash [32]byte
 	h.Sum(bodyHash[:0])
-	sender, e := s.verifySender(r, da, bodyHash) // step 7
+	sender, e := s.verifySender(w, r, da, bodyHash, nil) // step 7
 	if e != nil {
 		s.writeError(w, e)
 		return
@@ -125,7 +137,7 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	mb, e := s.authorizeOwner(r.Context(), r, auth.BodyHash(body))
+	mb, e := s.authorizeOwner(r.Context(), w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return
@@ -169,7 +181,7 @@ func (s *Server) handleBlobDelete(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	mb, e := s.authorizeOwner(r.Context(), r, auth.BodyHash(body))
+	mb, e := s.authorizeOwner(r.Context(), w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return

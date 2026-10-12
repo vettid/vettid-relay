@@ -7,7 +7,7 @@ keys to payload content: a compromised relay can drop or delay messages, but
 can't read or forge them.
 
 - **Protocol:** [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md)
-  (**v0.6.0**, reported by `relay -version` and `/healthz`). This repository
+  (**v0.7.0**, reported by `relay -version` and `/healthz`). This repository
   implements all of it:
   - registration
   - deposit tokens (PASETO v4.public, sender-bound), plus one-shot open
@@ -123,8 +123,12 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_OPEN_TOKEN_MAX_LIFETIME` | `600s` | `open_token_max_lifetime_seconds` (§5.6). This is the cap on `exp − iat` for one-shot open tokens. Up to 7 days is recommended for remote invitations. |
 | `RELAY_MAX_CLAIM_BYTES` | `16384` | `max_claim_bytes` (§6.9). This is the maximum claim body. |
 | `RELAY_CLAIM_TTL` | `900s` | `claim_ttl_seconds` (§6.9). It's the longest TTL a creator may request with `PUT /v1/claim/ttl/<seconds>`. Up to 7 days is recommended. A bare `PUT /v1/claim` gets min(900 s, this). |
-| `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `20` / `40` | Per-source-IP token bucket on `/v1/*`, applied before any parsing. The key is the IPv4 address or the IPv6 /64. |
-| `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits and blob uploads. It's keyed by token `sub`, or by `jti` for open tokens. |
+| `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `200` / `2000` | Flood guard on `/v1/*` per client network (the IPv4 address or the IPv6 /64), applied before any parsing. It is not a usage quota: it is sized to carry a full vault host (1,000 vaults behind one address) and bounds what one network can make the relay do. See [Rate limiting](#rate-limiting). |
+| `RELAY_RATE_KEY_RPS` / `RELAY_RATE_KEY_BURST` | `20` / `100` | Per-key bucket, applied once a request is authenticated: owner routes, registration and mailbox deletion, and WebSocket ack frames. Keyed by the signing key. |
+| `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits after the request signature verifies (§5.3 step 7) and to blob uploads before their body is read. It's keyed by token `sub`, or by `jti` for open tokens. |
+| `RELAY_RATE_AUTHFAIL_RPS` / `RELAY_RATE_AUTHFAIL_BURST` | `1` / `60` | Budget of *failed* authentications per client network, per relay process. A network that has used it up gets no unauthenticated work done until it refills. |
+| `RELAY_RATE_AUTHFAIL_MAX_PENALTY` | `10m` | Cap on the debt failures beyond the budget run up: the longest a network stays out of budget after its last failure. |
+| `RELAY_RATE_REGISTER_RPS` / `RELAY_RATE_REGISTER_BURST` | `1` / `100` | New mailboxes (registrations that create one, and rotations) per client network. Registering an existing key again is free. |
 | `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
 | `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | Per-source-IP bucket for the web endpoints (§6.11) and every other path outside `/v1/` except `/healthz`. It's separate from the API bucket, so scanners never use up mailbox traffic's budget, and always in-process (per relay process, no Valkey round trip). |
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
@@ -133,6 +137,65 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_REPLAY_CACHE_MAX` | `1000000` | Replay-cache capacity. When it's full, requests are shed with `rate_limited` and no live entries are evicted. |
 | `RELAY_SWEEP_INTERVAL` | `60s` | TTL sweeper period. The first pass is jittered. |
 | `RELAY_SHUTDOWN_TIMEOUT` | `20s` | Bound on the graceful drain after SIGTERM. |
+
+## Rate limiting
+
+Spec §7.2 has the rules and where each number comes from. In short:
+
+- An address is not a client. Every vault on a vault host reaches the relay
+  from that host's one address, and phones behind a carrier NAT share
+  theirs. So an address is a limit's key only while the caller is
+  unauthenticated; after that the **key** is limited
+  (`RELAY_RATE_KEY_*`, `RELAY_RATE_SENDER_*`).
+- Per network there are two things. A **flood guard** (`RELAY_RATE_IP_*`)
+  sized for a whole host. And a small budget of **failed authentications**
+  (`RELAY_RATE_AUTHFAIL_*`): bad or stale signatures, replays, signers
+  without a mailbox, refused deposit tokens, unknown claims. A network that
+  has used it up is refused before anything but its `X-VettID-Key` header
+  is read, unless that key authenticated from the same network in the last
+  10 minutes; such a request has its signature checked before anything
+  else, and a key whose own signed request then fails loses that standing.
+  Valid traffic of keys already in use from the network is not touched.
+- An attacker with many keys is not bounded by per-key limits (keys are
+  free); the flood guard bounds it at `RELAY_RATE_IP_RPS` in total, and
+  `RELAY_RATE_REGISTER_*` limits how fast one network can make mailboxes.
+- No limit is an oracle: network limits never look at a request's target,
+  and key limits apply only after the caller has proved the key is its own.
+- There is no allowlist and none is needed.
+- `retry_after` (and `Retry-After`) is the whole seconds until a request is
+  allowed; for the network limits a random 0–4 s is added so that the many
+  clients of one network do not all come back together.
+- With Valkey the flood guard and the key, sender, registration and claim
+  buckets are shared by all relay processes; the failed-authentication
+  budget and the collector cap are per process. If Valkey is unreachable
+  the shared buckets fall back to per-process ones.
+
+Metrics (on the metrics listener; the only label is the limiter's name,
+nothing identifies a client): `relay_ratelimit_allowed_total`,
+`relay_ratelimit_refused_total`, `relay_ratelimit_peak_permille` (how full
+the busiest bucket of each limiter got in the last full minute; 1000 means
+something was refused), `relay_ratelimit_penalised_networks`,
+`relay_ratelimit_known_keys`. Limiters: `address`, `authfail`, `key`,
+`sender`, `register`, `claim`, `web`, `collectors`. Each process also logs
+one `rate limits` line a minute with the same peaks and the refusals of
+that minute, at info level when anything but the web bucket refused or was
+at least half used (otherwise debug). Alarm on `address_peak` or `key_peak`
+of 800 or more: valid traffic is approaching a limit before any member is
+refused.
+
+The load and attack simulation behind the numbers is a test:
+
+```sh
+go test ./internal/api -run TestLoad -v
+```
+
+It puts 100, 500 and 1,000 vaults behind one address, each behaving as
+vettid-vault does (a long-poll every 25 s, an ack and a new collect per
+message, a deposit per message sent, and the client's retries on 429),
+against the real handler chain with a simulated clock, under the old
+single bucket (20/s, burst 40) and under the defaults; and it attacks from
+one address with bad signatures, fresh keys, registrations and many valid
+keys.
 
 ## Deployment notes
 
@@ -235,8 +298,9 @@ other process sees, refuses or is woken by.
   `relay_collect_store_queries_total`, `relay_collect_store_skips_total`,
   `relay_empty_hint_bump_failures_total`.
 - **Per-process limits.** `RELAY_MAX_COLLECTORS_PER_MAILBOX`,
-  `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` and the replay-cache capacity bound
-  each process's own resources.
+  `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS`, the replay-cache capacity and the
+  failed-authentication budget (`RELAY_RATE_AUTHFAIL_*`) bound each
+  process's own resources.
 - **Mailbox quotas** are counters updated in the same transaction as the
   write. Acks, expiry and TTL deletions can leave them high; a failing quota
   check recomputes them from the items (at most once a minute per
@@ -305,8 +369,9 @@ keep them in step:
 ## Security notes (spec §8)
 
 - **Order of checks.** Body-size limits apply before signature
-  verification, and the per-IP rate limit applies before any header, token
-  or body parsing. Deposits follow §5.3 exactly. Blob uploads run §5.3
+  verification, and the per-network limits (the failed-authentication
+  budget, which reads one header, then the flood guard) apply before any
+  token or body parsing. Per-key limits apply only after authentication. Deposits follow §5.3 exactly. Blob uploads run §5.3
   steps 1–6 on headers alone, so unauthorized uploads are refused before
   their body is read, and the body is then streamed with the limit enforced
   while reading.
@@ -372,8 +437,15 @@ implementation chooses as follows:
   bearer token upload a large blob is not needed for first contact, so the
   relay refuses it.
 - **Open tokens and rate limits.** For open tokens, the per-sender rate
-  bucket is keyed by the token's `jti`, because the signer is known only
-  after §5.3 step 7.
+  bucket is keyed by the token's `jti`: an open token has no fixed sender
+  and is single-use.
+- **Deposits from a penalised network.** For a network out of
+  failed-authentication budget the request signature (§5.3 step 7) is
+  verified and checked for replay before step 1; the remaining steps and
+  their errors are unchanged (§5.3, §7.2).
+- **Deleting a mailbox that does not exist** is `204` as the spec says, and
+  counts as a failed authentication for the network (§7.2): fresh keys are
+  free, and each such request costs a store query.
 - **Claim TTL.** The TTL is part of the signed path
   (`PUT /v1/claim/ttl/<seconds>`, canonical decimal between 1 and
   `claim_ttl_seconds`). Anything else is `bad_request`; it is not clamped.
@@ -409,7 +481,8 @@ coordination tests, the whole API suite on DynamoDB, and a two-process e2e
 (the relay binary started twice on one table and one Valkey): wake-on-deposit
 across processes for long-poll and WebSocket, one open token raced from both
 processes, one claim fetched concurrently from both, a request replayed to
-the other process, a shared rate limit, and a process stopping mid-test.
+the other process, shared rate limits (per network and per key), and a
+process stopping mid-test.
 
 Layout:
 

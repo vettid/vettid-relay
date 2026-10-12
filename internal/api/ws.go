@@ -27,13 +27,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	mb, e := s.authorizeOwner(r.Context(), r, auth.BodyHash(body))
+	mb, e := s.authorizeOwner(r.Context(), w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return
 	}
 	if !s.hub.acquire(mb.ID, s.cfg.MaxCollectorsPerMailbox) {
-		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
+		s.writeError(w, s.refuseCollector())
 		return
 	}
 	defer s.hub.release(mb.ID)
@@ -88,6 +88,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			if typ != websocket.MessageText || !decodeJSON(data, &f) || f.Ack == nil {
 				conn.Close(websocket.StatusPolicyViolation, "expected {\"ack\":\"<msg_id>\"}")
+				return
+			}
+			// Each ack is a store write: it draws on the key's bucket like
+			// a DELETE /v1/mailbox/{msg_id} would.
+			if e := s.allowKey(mb.PubKey); e != nil {
+				s.m.errors.With(e.code).Inc()
+				conn.Close(websocket.StatusTryAgainLater, CodeRateLimited)
 				return
 			}
 			if e := s.ack(ctx, mb.ID, *f.Ack); e != nil {

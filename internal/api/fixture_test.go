@@ -34,6 +34,7 @@ type testClock struct {
 
 func (c *testClock) now() time.Time      { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
 func (c *testClock) add(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.mu.Unlock() }
+func (c *testClock) set(t time.Time)     { c.mu.Lock(); c.t = t; c.mu.Unlock() }
 
 type fixture struct {
 	seq    atomic.Int64 // per-request signature timestamp offset (µs)
@@ -75,6 +76,9 @@ func newFixtureFull(t *testing.T, mut func(*config.Config), logw io.Writer, opts
 	cfg := config.Defaults()
 	cfg.BaseURL = testAud
 	cfg.RateIPPerSec, cfg.RateIPBurst = 1000, 1000
+	cfg.RateKeyPerSec, cfg.RateKeyBurst = 1000, 1000
+	cfg.RateAuthFailPerSec, cfg.RateAuthFailBurst = 1000, 1000
+	cfg.RateRegisterPerSec, cfg.RateRegisterBurst = 1000, 1000
 	cfg.RateSenderPerSec, cfg.RateSenderBurst = 1000, 1000
 	cfg.RateClaimPerSec, cfg.RateClaimBurst = 1000, 1000
 	cfg.RateWebPerSec, cfg.RateWebBurst = 1000, 1000

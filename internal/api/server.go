@@ -18,7 +18,7 @@ import (
 )
 
 // ProtocolVersion is the docs/RELAY-PROTOCOL.md version this relay implements.
-const ProtocolVersion = "0.6.0"
+const ProtocolVersion = "0.7.0"
 
 // Server is the relay API.
 type Server struct {
@@ -39,11 +39,18 @@ type Server struct {
 	bgCancel context.CancelFunc
 	bg       sync.WaitGroup
 
-	replay     ReplayGuard
-	ipLimit    RateLimiter // per source IP (IPv4 / IPv6 /64), before any parsing
-	subLimit   RateLimiter // per sender key, after token parse
-	claimLimit RateLimiter // unauthenticated claim GETs, per IPv4 / IPv6 /64
-	webLimit   RateLimiter // everything outside /v1/ and /healthz, per IPv4 / IPv6 /64 (always in-process)
+	replay ReplayGuard
+	// Rate limits (limits.go). "Network" is an IPv4 address or an IPv6 /64.
+	addrLimit   RateLimiter       // flood guard on /v1/, per network, before any parsing
+	fails       *ratelimit.Debt   // failed authentications per network (always in-process)
+	known       *ratelimit.Recent // network|key pairs that authenticated recently (always in-process)
+	keyLimit    RateLimiter       // per authenticated key
+	subLimit    RateLimiter       // per sender key, on deposits and blob uploads
+	regLimit    RateLimiter       // new mailboxes per network
+	claimLimit  RateLimiter       // unauthenticated claim GETs per network
+	webLimit    RateLimiter       // everything outside /v1/ and /healthz, per network (always in-process)
+	rl          *limiterMetrics
+	retryJitter func() int // extra retry_after seconds for crowd refusals (tests; nil: random 0..4)
 
 	web  *webDocs // /connect, /.well-known/assetlinks.json, /robots.txt (§6.11)
 	hsts bool     // public base URL is https: send Strict-Transport-Security
@@ -120,7 +127,9 @@ func WithClock(now func() time.Time) Option { return func(s *Server) { s.now = n
 // New builds the API server. By default the replay cache, rate limiters and
 // wake-on-deposit are in-process, which is correct for exactly one relay
 // process; multi-process deployments pass shared ones (WithReplayGuard,
-// WithRateLimiters, WithWakeBus — see internal/coord).
+// WithRateLimiters, WithWakeBus — see internal/coord). The per-network
+// failed-authentication budget is per process by design: it is consulted
+// before anything else, costs no round trip and cannot fail.
 func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Registry, opts ...Option) *Server {
 	s := &Server{
 		cfg:   cfg,
@@ -135,9 +144,14 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		blobSlots: make(chan struct{}, cfg.MaxConcurrentBlobTransfers),
 
 		replay:     auth.NewReplayCache(cfg.ReplayCacheMax),
-		ipLimit:    ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
+		addrLimit:  ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
+		fails:      ratelimit.NewDebt(cfg.RateAuthFailPerSec, cfg.RateAuthFailBurst, cfg.AuthFailMaxPenalty, 200_000),
+		known:      ratelimit.NewRecent(knownKeyTTL, maxKnownKeys),
+		keyLimit:   ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, 200_000),
 		subLimit:   ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
+		regLimit:   ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, 200_000),
 		claimLimit: ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
+		rl:         newLimiterMetrics(reg),
 		webLimit:   ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
 		hsts:       strings.HasPrefix(cfg.BaseURL, "https://"),
 	}
@@ -167,12 +181,14 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
 			c.Sweep(now)
 		}
-		for _, l := range []RateLimiter{s.ipLimit, s.subLimit, s.claimLimit, s.webLimit} {
+		for _, l := range []any{s.addrLimit, s.fails, s.known, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
 			if p, ok := l.(interface{ Prune(time.Time) }); ok {
 				p.Prune(now)
 			}
 		}
 	})
+	reg.GaugeFunc("relay_ratelimit_known_keys", "Network and key pairs remembered as recently authenticated.", func() int64 { return int64(s.known.Len()) })
+	s.every(time.Minute, func(time.Time) { s.reportLimits() })
 	return s
 }
 

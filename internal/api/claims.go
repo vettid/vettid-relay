@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/vettid/vettid-relay/internal/ratelimit"
 	"github.com/vettid/vettid-relay/internal/store"
 	auth "github.com/vettid/vettid-relay/relayauth"
 )
@@ -45,7 +44,7 @@ func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	mb, e := s.authorizeOwner(r.Context(), r, auth.BodyHash(body))
+	mb, e := s.authorizeOwner(r.Context(), w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return
@@ -76,19 +75,21 @@ func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 // GET /v1/claim/{claim_id} — unauthenticated, rate-limited per client
 // network, single fetch. Every miss is the same 404 claim_unknown.
 func (s *Server) handleClaimGet(w http.ResponseWriter, r *http.Request) {
-	if ok, wait := s.claimLimit.Allow(rateKey(clientIP(r, s.cfg.TrustProxy)), s.now()); !ok {
-		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)})
+	if e := s.take(limClaim, s.claimLimit, rateKey(clientIP(r, s.cfg.TrustProxy)), false); e != nil {
+		s.writeError(w, e)
 		return
 	}
+	// A miss is a failed authentication of sorts (a guess): it counts
+	// against the network's budget (limits.go).
 	id := r.PathValue("claim_id")
 	if _, ok := auth.ParseClaimID(id); !ok {
-		s.writeError(w, fail(CodeClaimUnknown))
+		s.writeError(w, s.authFailed(w, fail(CodeClaimUnknown), nil, false))
 		return
 	}
 	data, err := s.st.TakeClaim(r.Context(), id)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		s.writeError(w, fail(CodeClaimUnknown))
+		s.writeError(w, s.authFailed(w, fail(CodeClaimUnknown), nil, false))
 		return
 	case err != nil:
 		s.log.Error("claim get failed", "err", err)
@@ -110,7 +111,7 @@ func (s *Server) handleClaimDelete(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	mb, e := s.authorizeOwner(r.Context(), r, auth.BodyHash(body))
+	mb, e := s.authorizeOwner(r.Context(), w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return

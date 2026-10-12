@@ -16,6 +16,9 @@ func TestExposition(t *testing.T) {
 	v.With("token_invalid").Inc()
 	v.With("rate_limited").Add(2)
 	r.GaugeFunc("relay_fn", "Fn.", func() int64 { return 7 })
+	gv := r.GaugeVec("relay_peak", "Peak.", "limiter")
+	gv.With("key").Set(250)
+	gv.With("key").Set(120)
 	var b strings.Builder
 	r.WriteTo(&b)
 	out := b.String()
@@ -25,6 +28,7 @@ func TestExposition(t *testing.T) {
 		`relay_errors_total{code="rate_limited"} 2`,
 		`relay_errors_total{code="token_invalid"} 1`,
 		"relay_fn 7\n",
+		"# TYPE relay_peak gauge\nrelay_peak{limiter=\"key\"} 120\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)

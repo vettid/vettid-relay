@@ -82,3 +82,113 @@ func TestRetryAfterSeconds(t *testing.T) {
 		}
 	}
 }
+
+func TestPeak(t *testing.T) {
+	l := New(1, 4, 10)
+	now := time.Unix(1_700_000_000, 0)
+	l.Allow("a", now)
+	l.Allow("a", now)
+	l.Allow("b", now)
+	if p := l.Peak(); p != 0.5 {
+		t.Fatalf("peak %v, want 0.5 (two of four)", p)
+	}
+	if p := l.Peak(); p != 0 {
+		t.Fatalf("peak not reset: %v", p)
+	}
+	for i := 0; i < 5; i++ {
+		l.Allow("a", now)
+	}
+	if p := l.Peak(); p != 1 {
+		t.Fatalf("peak after a refusal %v, want 1", p)
+	}
+}
+
+func TestDebt(t *testing.T) {
+	d := NewDebt(1, 3, time.Minute, 10)
+	now := time.Unix(1_700_000_000, 0)
+	if d.Wait("a", now) != 0 {
+		t.Fatal("fresh key has budget")
+	}
+	d.Charge("a", now)
+	d.Charge("a", now)
+	if w := d.Wait("a", now); w != 0 {
+		t.Fatalf("two of three used, wait %v", w)
+	}
+	d.Charge("a", now)
+	if w := d.Wait("a", now); w != time.Second {
+		t.Fatalf("budget used up: wait %v, want 1s", w)
+	}
+	if d.Wait("b", now) != 0 || d.Exhausted(now) != 1 {
+		t.Fatal("keys are independent")
+	}
+	// Events beyond the budget run up a debt: ten more, ten more seconds.
+	for i := 0; i < 10; i++ {
+		d.Charge("a", now)
+	}
+	if w := d.Wait("a", now); w != 11*time.Second {
+		t.Fatalf("debt: wait %v, want 11s", w)
+	}
+	if w := d.Wait("a", now.Add(11*time.Second)); w != 0 {
+		t.Fatalf("after the debt refilled: wait %v", w)
+	}
+	// The debt is capped.
+	for i := 0; i < 1000; i++ {
+		d.Charge("a", now)
+	}
+	if w := d.Wait("a", now); w != time.Minute {
+		t.Fatalf("capped debt: wait %v, want 1m", w)
+	}
+	if p := d.Peak(); p != 1 {
+		t.Fatalf("peak %v", p)
+	}
+	d.Prune(now.Add(time.Hour))
+	if d.Len() != 0 {
+		t.Fatalf("idle keys not pruned: %d", d.Len())
+	}
+}
+
+func TestDebtTableFull(t *testing.T) {
+	d := NewDebt(1, 1, time.Minute, 2)
+	now := time.Unix(1_700_000_000, 0)
+	d.Charge("a", now)
+	d.Charge("b", now)
+	d.Charge("c", now) // untracked
+	if d.Len() != 2 || d.Wait("c", now) != 0 {
+		t.Fatalf("len %d", d.Len())
+	}
+	d.Charge("c", now.Add(time.Hour)) // a and b have refilled: pruned
+	if d.Len() != 1 {
+		t.Fatalf("len after prune %d", d.Len())
+	}
+}
+
+func TestRecent(t *testing.T) {
+	r := NewRecent(time.Minute, 2)
+	now := time.Unix(1_700_000_000, 0)
+	r.Add("a", now, false)
+	if r.Has("a", now) {
+		t.Fatal("refresh-only add inserted")
+	}
+	r.Add("a", now, true)
+	r.Add("b", now, true)
+	r.Add("c", now, true) // full
+	if !r.Has("a", now) || !r.Has("b", now) || r.Has("c", now) {
+		t.Fatal("membership")
+	}
+	r.Add("a", now.Add(50*time.Second), false) // refreshed
+	if !r.Has("a", now.Add(100*time.Second)) || r.Has("b", now.Add(100*time.Second)) {
+		t.Fatal("expiry")
+	}
+	r.Add("c", now.Add(100*time.Second), true) // b expired: room again
+	if !r.Has("c", now.Add(100*time.Second)) {
+		t.Fatal("no room after expiry")
+	}
+	r.Remove("a")
+	if r.Has("a", now.Add(100*time.Second)) {
+		t.Fatal("remove")
+	}
+	r.Prune(now.Add(time.Hour))
+	if r.Len() != 0 {
+		t.Fatalf("len %d", r.Len())
+	}
+}

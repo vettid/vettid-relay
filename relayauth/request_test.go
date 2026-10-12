@@ -300,3 +300,24 @@ func TestTimestampUsedVerbatim(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkVerifyRequest is what an unauthenticated signed request costs the
+// relay before it knows whether the signature is good: parsing the three
+// headers and one Ed25519 verification (spec §7.2 sizes the flood guard
+// from it).
+func BenchmarkVerifyRequest(b *testing.B) {
+	priv := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, 32))
+	now := time.Unix(1_760_000_000, 0)
+	h := http.Header{}
+	SetHeaders(h, priv, "GET", "/v1/mailbox", now, BodyHash(nil))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sr, err := ParseHeaders(h)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := sr.Verify("GET", "/v1/mailbox", BodyHash(nil), now); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

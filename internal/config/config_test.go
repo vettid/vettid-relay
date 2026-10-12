@@ -131,3 +131,43 @@ func TestDynamoStoreConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRateLimitConfig(t *testing.T) {
+	d := Defaults()
+	if d.RateIPPerSec != 200 || d.RateIPBurst != 2000 || d.RateKeyPerSec != 20 || d.RateKeyBurst != 100 ||
+		d.RateAuthFailPerSec != 1 || d.RateAuthFailBurst != 60 || d.AuthFailMaxPenalty != 10*time.Minute ||
+		d.RateRegisterPerSec != 1 || d.RateRegisterBurst != 100 || d.RateSenderPerSec != 5 || d.RateSenderBurst != 20 ||
+		d.RateClaimPerSec != 1 || d.RateClaimBurst != 10 {
+		t.Fatalf("defaults differ from docs/RELAY-PROTOCOL.md §7.2: %+v", d)
+	}
+	c, err := Load(env(map[string]string{
+		"RELAY_RATE_IP_RPS":               "50",
+		"RELAY_RATE_IP_BURST":             "500",
+		"RELAY_RATE_KEY_RPS":              "2.5",
+		"RELAY_RATE_KEY_BURST":            "30",
+		"RELAY_RATE_AUTHFAIL_RPS":         "0.2",
+		"RELAY_RATE_AUTHFAIL_BURST":       "10",
+		"RELAY_RATE_AUTHFAIL_MAX_PENALTY": "5m",
+		"RELAY_RATE_REGISTER_RPS":         "0.1",
+		"RELAY_RATE_REGISTER_BURST":       "7",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RateIPPerSec != 50 || c.RateIPBurst != 500 || c.RateKeyPerSec != 2.5 || c.RateKeyBurst != 30 ||
+		c.RateAuthFailPerSec != 0.2 || c.RateAuthFailBurst != 10 || c.AuthFailMaxPenalty != 5*time.Minute ||
+		c.RateRegisterPerSec != 0.1 || c.RateRegisterBurst != 7 {
+		t.Fatalf("%+v", c)
+	}
+	for _, bad := range []map[string]string{
+		{"RELAY_RATE_KEY_RPS": "0"},
+		{"RELAY_RATE_KEY_BURST": "0"},
+		{"RELAY_RATE_AUTHFAIL_BURST": "-1"},
+		{"RELAY_RATE_AUTHFAIL_MAX_PENALTY": "never"},
+		{"RELAY_RATE_REGISTER_RPS": "x"},
+	} {
+		if _, err := Load(env(bad)); err == nil {
+			t.Errorf("%v: expected an error", bad)
+		}
+	}
+}

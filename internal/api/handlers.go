@@ -109,7 +109,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	sr, e := s.authorizeSigner(r, auth.BodyHash(body))
+	sr, e := s.authorizeSigner(w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return
@@ -128,16 +128,32 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	// Proof of possession: the request must be signed by the key registered.
 	if !bytes.Equal(pub, sr.Key) {
-		s.writeError(w, fail(CodeSignatureInvalid))
+		s.writeError(w, s.authFailed(w, fail(CodeSignatureInvalid), sr.Key, false))
+		return
+	}
+	if e := s.allowKey(sr.Key); e != nil {
+		s.writeError(w, e)
 		return
 	}
 	id := auth.MailboxID(pub)
+	// A new mailbox draws on its network's registration budget; registering
+	// an existing one again (every vault does at unlock) does not. Only the
+	// holder of the key gets this far, so the difference tells nobody
+	// anything. A refusal counts as a failed authentication: a network that
+	// keeps asking for mailboxes it may not have ends up penalised.
+	if _, err := s.st.Mailbox(r.Context(), id); errors.Is(err, store.ErrNotFound) {
+		if e := s.allowRegistration(w); e != nil {
+			s.writeError(w, s.authFailed(w, e, nil, false))
+			return
+		}
+	}
 	created, err := s.st.Register(r.Context(), id, pub)
 	if err != nil {
 		s.log.Error("register failed", "err", err)
 		s.writeError(w, fail(CodeInternal))
 		return
 	}
+	s.authenticated(w, sr.Key)
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
@@ -156,17 +172,34 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mailboxID := r.PathValue("mailbox_id")
-	da, e := s.authorizeDepositToken(r.Context(), r, mailboxID) // steps 1–6
+	bodyHash := auth.BodyHash(body)
+	// A network out of failed-authentication budget gets no unauthenticated
+	// work: its request's own signature (step 7's) is checked before the
+	// mailbox and token are looked at (limits.go). Otherwise the order is
+	// §5.3's.
+	var signed *auth.SignedRequest
+	var proven []byte
+	if stateOf(w).penalised {
+		sr, e := s.authorizeSigner(w, r, bodyHash)
+		if e != nil {
+			s.writeError(w, e)
+			return
+		}
+		signed, proven = &sr, sr.Key
+	}
+	da, e := s.authorizeDepositToken(r.Context(), w, r, mailboxID, proven) // steps 1–6
 	if e != nil {
 		s.writeError(w, e)
 		return
 	}
+	sender, e := s.verifySender(w, r, da, bodyHash, signed) // step 7
+	if e != nil {
+		s.writeError(w, e)
+		return
+	}
+	// The per-sender limit comes after step 7: a token without its
+	// sender's key (a leaked one) cannot use up the sender's budget.
 	if e := s.allowSender(senderRateKey(da)); e != nil {
-		s.writeError(w, e)
-		return
-	}
-	sender, e := s.verifySender(r, da, auth.BodyHash(body)) // step 7
-	if e != nil {
 		s.writeError(w, e)
 		return
 	}
@@ -219,8 +252,7 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 }
 
 // senderRateKey keys the per-sender bucket: the bound sender's key, or the
-// open token's jti (the signer is only known after step 7, and an open token
-// is single-use anyway).
+// open token's jti (an open token is single-use, and its signer is anyone).
 func senderRateKey(da *depositAuth) string {
 	if da.claims.Open() {
 		return "open:" + da.mailbox.ID + ":" + da.claims.Jti
@@ -282,7 +314,7 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	mb, e := s.authorizeOwner(r.Context(), r, auth.BodyHash(body))
+	mb, e := s.authorizeOwner(r.Context(), w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return
@@ -293,7 +325,7 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.hub.acquire(mb.ID, s.cfg.MaxCollectorsPerMailbox) {
-		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
+		s.writeError(w, s.refuseCollector())
 		return
 	}
 	defer s.hub.release(mb.ID)
@@ -392,7 +424,7 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	mb, e := s.authorizeOwner(r.Context(), r, auth.BodyHash(body))
+	mb, e := s.authorizeOwner(r.Context(), w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return
@@ -453,7 +485,7 @@ func (s *Server) handleDenylist(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	mb, e := s.authorizeOwner(r.Context(), r, auth.BodyHash(body))
+	mb, e := s.authorizeOwner(r.Context(), w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return
@@ -516,7 +548,7 @@ func (s *Server) handleRotate(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	mb, e := s.authorizeOwner(r.Context(), r, auth.BodyHash(body))
+	mb, e := s.authorizeOwner(r.Context(), w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return
@@ -539,6 +571,11 @@ func (s *Server) handleRotate(w http.ResponseWriter, r *http.Request) {
 	// of the current mailbox_id.
 	if err != nil || len(proof) != ed25519.SignatureSize || !ed25519.Verify(newPub, []byte(mb.ID), proof) {
 		s.writeError(w, fail(CodeSignatureInvalid))
+		return
+	}
+	// The successor is a new mailbox: it draws on the registration budget.
+	if e := s.allowRegistration(w); e != nil {
+		s.writeError(w, e)
 		return
 	}
 	newID := auth.MailboxID(newPub)

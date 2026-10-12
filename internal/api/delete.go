@@ -27,13 +27,17 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	sr, e := s.authorizeSigner(r, auth.BodyHash(body))
+	sr, e := s.authorizeSigner(w, r, auth.BodyHash(body))
 	if e != nil {
 		s.writeError(w, e)
 		return
 	}
 	if len(body) != 0 {
 		s.writeError(w, fail(CodeBadRequest))
+		return
+	}
+	if e := s.allowKey(sr.Key); e != nil {
+		s.writeError(w, e)
 		return
 	}
 	// Tokens minted before the deletion stay refused if the key registers
@@ -51,6 +55,13 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("mailbox delete failed", "err", err)
 		s.writeError(w, fail(CodeInternal))
 		return
+	}
+	if len(ids) == 0 {
+		// Nothing was registered under this key. The answer is still 204
+		// (idempotent), but a request by a key without a mailbox counts
+		// against its network like any other (limits.go): fresh keys are
+		// free to make, and each of these costs a store query.
+		s.authFailed(w, nil, sr.Key, false)
 	}
 	s.m.deletions.Add(int64(len(ids)))
 	setLog(w, "count", len(ids))
