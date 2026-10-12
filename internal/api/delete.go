@@ -36,6 +36,10 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeBadRequest))
 		return
 	}
+	if e := s.allowKey(sr.Key); e != nil {
+		s.writeError(w, e)
+		return
+	}
 	// Tokens minted before the deletion stay refused if the key registers
 	// again: iat must be at least notBefore. The freshness window covers an
 	// owner clock running ahead of ours (this request's timestamp was

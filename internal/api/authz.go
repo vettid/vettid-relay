@@ -176,5 +176,10 @@ func (s *Server) authorizeOwner(ctx context.Context, r *http.Request, bodyHash [
 	if subtle.ConstantTimeCompare(mb.PubKey, sr.Key) != 1 {
 		return store.Mailbox{}, fail(CodeMailboxUnknown)
 	}
+	// The per-key limit applies only now: the caller has proved the key is
+	// its own and has a mailbox, so only its owner ever sees this 429.
+	if e := s.allowKey(sr.Key); e != nil {
+		return store.Mailbox{}, e
+	}
 	return mb, nil
 }

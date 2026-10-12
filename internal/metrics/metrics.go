@@ -74,6 +74,9 @@ func (g Gauge) Inc() { g.v.Add(1) }
 // Dec subtracts one.
 func (g Gauge) Dec() { g.v.Add(-1) }
 
+// Set sets the value.
+func (g Gauge) Set(n int64) { g.v.Store(n) }
+
 // Value returns the current value.
 func (g Gauge) Value() int64 { return g.v.Load() }
 
@@ -100,6 +103,17 @@ type CounterVec struct{ f *family }
 func (r *Registry) CounterVec(name, help, label string) CounterVec {
 	return CounterVec{r.family(name, help, "counter", label)}
 }
+
+// GaugeVec is a gauge family with one label.
+type GaugeVec struct{ f *family }
+
+// GaugeVec registers a gauge family keyed by one label.
+func (r *Registry) GaugeVec(name, help, label string) GaugeVec {
+	return GaugeVec{r.family(name, help, "gauge", label)}
+}
+
+// With returns the gauge for a label value (must come from a closed set).
+func (v GaugeVec) With(value string) Gauge { return Gauge{v.f.get(value)} }
 
 // With returns the counter for a label value (must come from a closed set).
 func (v CounterVec) With(value string) Counter { return Counter{v.f.get(value)} }

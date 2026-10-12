@@ -152,11 +152,13 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 		bus = vc.NewWakeBus(reg)
 		opts = append(opts,
 			api.WithReplayGuard(vc.ReplayGuard()),
-			api.WithRateLimiters(
-				vc.Limiter("ip", cfg.RateIPPerSec, cfg.RateIPBurst),
-				vc.Limiter("sender", cfg.RateSenderPerSec, cfg.RateSenderBurst),
-				vc.Limiter("claim", cfg.RateClaimPerSec, cfg.RateClaimBurst),
-			),
+			api.WithRateLimiters(api.Limiters{
+				Address:  vc.Limiter("address", cfg.RateIPPerSec, cfg.RateIPBurst),
+				Key:      vc.Limiter("key", cfg.RateKeyPerSec, cfg.RateKeyBurst),
+				Sender:   vc.Limiter("sender", cfg.RateSenderPerSec, cfg.RateSenderBurst),
+				Register: vc.Limiter("register", cfg.RateRegisterPerSec, cfg.RateRegisterBurst),
+				Claim:    vc.Limiter("claim", cfg.RateClaimPerSec, cfg.RateClaimBurst),
+			}),
 			api.WithWakeBus(bus),
 		)
 		if cfg.EmptyHints {
