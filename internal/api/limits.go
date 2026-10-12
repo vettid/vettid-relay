@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"sync"
@@ -75,6 +76,7 @@ const (
 	limVerify     = "verify"
 	limAuthFail   = "authfail"
 	limTrickle    = "trickle"
+	limTrickleAny = "trickleclaim"
 	limNoMailbox  = "nomailbox"
 	limKeyFail    = "keyfail"
 	limKey        = "key"
@@ -86,13 +88,24 @@ const (
 	limBodies     = "bodies"
 )
 
-var allLimiters = []string{limAddress, limVerify, limAuthFail, limTrickle, limNoMailbox, limKeyFail, limKey, limSender, limRegister, limClaim, limWeb, limCollectors, limBodies}
+var allLimiters = []string{limAddress, limVerify, limAuthFail, limTrickle, limTrickleAny, limNoMailbox, limKeyFail, limKey, limSender, limRegister, limClaim, limWeb, limCollectors, limBodies}
 
 const (
 	// maxHeldKeys bounds each per-key table (keys without a mailbox, keys
 	// already charged once, refused deposits): about 150 bytes a key. A
 	// full table tracks no new key and charges nobody for it.
 	maxHeldKeys = 50_000
+	// perNetworkKeys is the share of each of those tables one client
+	// network may fill: more than a full host's worth of keys, and little
+	// enough that filling a table takes twenty networks.
+	perNetworkKeys = maxHeldKeys / 20
+	// localKeys bounds each in-process bucket table (per network or key).
+	localKeys = 20_000
+	// Small bodies being read: per process and per network.
+	smallBodyPool, smallBodyPoolPerNetwork = 4 << 20, 512 << 10
+	// wsMaxLifetime: a WebSocket session is closed (1013) after this long
+	// and the client reconnects.
+	wsMaxLifetime = time.Hour
 	// holdRecheck is how often a held key's mailbox is looked up again:
 	// it may have registered on another process.
 	holdRecheck = 5 * time.Second
@@ -243,7 +256,7 @@ func (s *Server) keyFailedOnce(w http.ResponseWriter, e *apiError, kind string, 
 	if s.onceSeen.Has(k, now) {
 		return e // already paid for in this window (the entry is not renewed)
 	}
-	s.onceSeen.Add(k, now, true)
+	s.onceSeen.AddIn(st.addr, k, now, true)
 	// A full table remembers nothing: then nobody is charged, or one
 	// client's repeats would be charged to its network every time.
 	if s.onceSeen.Has(k, now) {
@@ -263,7 +276,7 @@ func (s *Server) noMailbox(w http.ResponseWriter, e *apiError, key []byte) *apiE
 	if st.addr == "" {
 		return e
 	}
-	if s.orphans.Fail(auth.EncodeKey(key), s.now()) {
+	if s.orphans.FailIn(st.addr, auth.EncodeKey(key), s.now()) {
 		s.chargeNetwork(st.addr)
 	}
 	return e
@@ -301,10 +314,10 @@ func (s *Server) hasMailbox(ctx context.Context, key []byte) bool {
 func pairKey(senderB64, mailbox string) string { return senderB64 + "|" + mailbox }
 
 // depositFailed charges a refused deposit (§5.3 steps 1–7) to whoever it
-// belongs to. Properly signed (a vault whose token expired, or whose peer
-// is gone): the sender key's own budgets of refused deposits, one per
-// mailbox and one overall; its network is never charged if the key has a
-// mailbox, and once per key otherwise. Not properly signed: the network.
+// belongs to. Properly signed by a key with a mailbox (a vault whose token
+// expired, or whose peer is gone): the sender key's own budgets of refused
+// deposits, one per mailbox and one overall; its network is never charged.
+// Anything else: the network.
 // signed is the verified signature if the caller has checked it; if not,
 // it is checked here when the body can be had (hash non-nil), and recorded
 // against replay, so that a captured failing deposit cannot be sent again
@@ -315,9 +328,11 @@ func (s *Server) depositFailed(w http.ResponseWriter, r *http.Request, e *apiErr
 	}
 	now := s.now()
 	if signed == nil && hash != nil {
-		// The body is read (for its hash) only for a request that at least
-		// carries well-formed signature headers.
-		if sr, err := auth.ParseHeaders(r.Header); err == nil {
+		// Whose failure is it? Finding out takes the body (for the
+		// signature), and a body is not read for just anyone: only if the
+		// key the request names has a mailbox. Anything else is its
+		// network's failure, unread.
+		if sr, err := auth.ParseHeaders(r.Header); err == nil && s.hasMailbox(r.Context(), sr.Key) {
 			if h := hash(); h != nil && sr.Verify(r.Method, r.URL.EscapedPath(), *h, now) == nil {
 				switch err := s.replay.Check(sr, now); {
 				case err == nil:
@@ -333,19 +348,23 @@ func (s *Server) depositFailed(w http.ResponseWriter, r *http.Request, e *apiErr
 	if signed == nil {
 		return s.authFailed(w, e)
 	}
-	// The key's own budgets. Its network pays only for a key without a
-	// mailbox (free to make), and then once, not per repeat.
+	// The key's own budgets, per peer and overall.
 	k := auth.EncodeKey(signed.Key)
 	s.pairFails.Charge(pairKey(k, mailboxID), now)
-	if first := s.keyFails.Charge(k, now); first && !s.hasMailbox(r.Context(), signed.Key) {
-		s.chargeNetwork(stateOf(w).addr)
+	s.keyFails.Charge(k, now)
+	// A signer with a mailbox never costs its network anything. One
+	// without (it got here through a penalised network's trickle) costs it
+	// one unit a minute, like the other failures a key cannot answer for.
+	if !s.hasMailbox(r.Context(), signed.Key) {
+		return s.keyFailedOnce(w, e, onceDeposit, signed.Key)
 	}
 	return e
 }
 
 const (
-	onceStale  = "s|"
-	onceReplay = "r|"
+	onceStale   = "s|"
+	onceReplay  = "r|"
+	onceDeposit = "d|"
 )
 
 // senderOverFailures is the 429 for a deposit by a sender key that has
@@ -365,43 +384,163 @@ func (s *Server) senderOverFailures(r *http.Request, mailboxID string) *apiError
 	return &apiError{code: CodeRateLimited, retryAfter: min(ratelimit.RetryAfterSeconds(wait), maxPenaltyRetry)}
 }
 
-// bodies counts request body bytes being read, per process and per client
-// network: a body that is announced and then stalls holds its buffer, and
-// nothing about the sender is known yet.
-type bodies struct {
+// bodyPool counts memory held for request bodies that are being read. The
+// count grows as bytes arrive, never by what a request announces: a client
+// that announces a body and sends nothing holds nothing.
+//
+// There are three pools, so that none can be filled, by requests that cost
+// nothing to make, at the expense of requests that have earned their place
+// (spec §7.2 item 8):
+//
+//	small   bodies of at most smallBodyLimit: registrations, rotations,
+//	        denylist updates, claims. They are read before the signature
+//	        can be checked, and they are tiny.
+//	open    deposit bodies read before the request is authenticated: on a
+//	        penalised network (signature first), and to tell whose failure
+//	        a refused deposit is. A small share per network.
+//	keyed   deposit bodies read after the deposit token has verified
+//	        (§5.3 steps 1–6): nothing unauthenticated ever counts here.
+type bodyPool struct {
+	max, maxNet int64
+
 	mu     sync.Mutex
 	total  int64
 	perNet map[string]int64
+	peak   int64 // thousandths of max, since the last report
 }
 
-// reserveBody admits n body bytes from the request's network, or returns
-// the 429. The caller releases them when the body has been read.
-func (s *Server) reserveBody(w http.ResponseWriter, n int64) (release func(), e *apiError) {
+func newBodyPool(max, maxNet int64) *bodyPool {
+	return &bodyPool{max: max, maxNet: maxNet, perNet: map[string]int64{}}
+}
+
+func (p *bodyPool) take(net string, n int64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.total+n > p.max || net != "" && p.perNet[net]+n > p.maxNet {
+		p.peak = 1000
+		return false
+	}
+	p.total += n
+	if net != "" {
+		p.perNet[net] += n
+	}
+	if used := p.total * 1000 / p.max; used > p.peak {
+		p.peak = used
+	}
+	return true
+}
+
+func (p *bodyPool) give(net string, n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.total -= n
+	if net != "" {
+		if p.perNet[net] -= n; p.perNet[net] <= 0 {
+			delete(p.perNet, net)
+		}
+	}
+}
+
+func (p *bodyPool) inFlight() (total int64, nets int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.total, len(p.perNet)
+}
+
+func (p *bodyPool) takePeak() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	v := p.peak
+	p.peak = 0
+	return v
+}
+
+// bodyPace is how fast a body has to arrive: something every idle, all of
+// it within total.
+type bodyPace struct{ idle, total time.Duration }
+
+// Before a request is authenticated its body has to come promptly: a
+// largest deposit (about 350 KiB) in 20 s is 140 kbit/s. That only applies
+// to deposits on a penalised network and to small bodies (16 KiB in 20 s:
+// 7 kbit/s). Once the deposit token has verified the sender has minutes,
+// as before: 350 KiB in 5 minutes is under 10 kbit/s.
+var (
+	paceOpen  = bodyPace{idle: 5 * time.Second, total: 20 * time.Second}
+	paceKeyed = bodyPace{idle: 30 * time.Second, total: 5 * time.Minute}
+)
+
+const bodyChunk = 4096
+
+// readBodyFrom reads a request body of at most limit bytes, counting the
+// memory it holds against pool as it grows and holding the sender to pace.
+func (s *Server) readBodyFrom(w http.ResponseWriter, r *http.Request, limit int64, pool *bodyPool, pace bodyPace) ([]byte, *apiError) {
+	if r.ContentLength > limit {
+		return nil, fail(CodePayloadTooLarge)
+	}
+	if r.ContentLength == 0 {
+		return []byte{}, nil
+	}
+	want := limit // the most the buffer may have to hold
+	if r.ContentLength > 0 {
+		want = r.ContentLength
+	}
 	addr := stateOf(w).addr
-	b := &s.bodies
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.total+n > s.cfg.MaxBodyBytes || addr != "" && b.perNet[addr]+n > s.cfg.MaxBodyBytesPerNetwork {
+	held := min(bodyChunk, want)
+	refuse := func() ([]byte, *apiError) {
 		s.rl.refused.With(limBodies).Inc()
 		return nil, &apiError{code: CodeRateLimited, retryAfter: 1 + s.jitter()}
 	}
-	b.total += n
-	if addr != "" {
-		b.perNet[addr] += n
+	if !pool.take(addr, held) {
+		return refuse()
 	}
-	if used := b.total * 1000 / s.cfg.MaxBodyBytes; used > s.bodiesPeak.Load() {
-		s.bodiesPeak.Store(used)
-	}
-	return func() {
-		b.mu.Lock()
-		b.total -= n
-		if addr != "" {
-			if b.perNet[addr] -= n; b.perNet[addr] <= 0 {
-				delete(b.perNet, addr)
+	defer func() { pool.give(addr, held) }()
+	buf := make([]byte, 0, held)
+	src := http.MaxBytesReader(w, r.Body, limit)
+	rc := http.NewResponseController(w)
+	start, timed := time.Now(), true
+	for {
+		if len(buf) == cap(buf) {
+			if int64(cap(buf)) >= want && r.ContentLength > 0 {
+				break
 			}
+			grown := min(2*int64(cap(buf)), want)
+			if grown == int64(cap(buf)) {
+				grown++ // length not declared and limit reached: room for the byte that proves it too long
+			}
+			if !pool.take(addr, grown-held) {
+				return refuse()
+			}
+			held = grown
+			buf = append(make([]byte, 0, grown), buf...)
 		}
-		b.mu.Unlock()
-	}, nil
+		if timed {
+			deadline := start.Add(pace.total)
+			if d := time.Now().Add(pace.idle); d.Before(deadline) {
+				deadline = d
+			}
+			timed = rc.SetReadDeadline(deadline) == nil
+		}
+		n, err := src.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		var mbe *http.MaxBytesError
+		switch {
+		case err == io.EOF:
+		case errors.As(err, &mbe):
+			return nil, fail(CodePayloadTooLarge)
+		case err != nil:
+			return nil, fail(CodeBadRequest) // also: too slow
+		default:
+			continue
+		}
+		break
+	}
+	if timed {
+		rc.SetReadDeadline(time.Time{})
+	}
+	if r.ContentLength > 0 && int64(len(buf)) != r.ContentLength {
+		return nil, fail(CodeBadRequest)
+	}
+	return buf, nil
 }
 
 // allowKey applies the per-key bucket to a caller that has proved it holds
@@ -450,14 +589,14 @@ func (s *Server) reportLimits() {
 	now := s.now()
 	peaks := map[string]float64{}
 	for name, l := range map[string]any{
-		limAddress: s.addrLimit, limVerify: s.verifyLimit, limAuthFail: s.fails, limTrickle: s.trickle, limKeyFail: s.keyFails, limKey: s.keyLimit, limSender: s.subLimit,
+		limAddress: s.addrLimit, limVerify: s.verifyLimit, limAuthFail: s.fails, limTrickle: s.trickle, limTrickleAny: s.trickleClaim, limKeyFail: s.keyFails, limKey: s.keyLimit, limSender: s.subLimit,
 		limRegister: s.regLimit, limClaim: s.claimLimit, limWeb: s.webLimit,
 	} {
 		if p, ok := l.(interface{ Peak() float64 }); ok {
 			peaks[name] = p.Peak()
 		}
 	}
-	peaks[limBodies] = float64(s.bodiesPeak.Swap(0)) / 1000
+	peaks[limBodies] = float64(max(s.smallBodies.takePeak(), s.openBodies.takePeak(), s.keyedBodies.takePeak())) / 1000
 	peaks[limCollectors] = float64(s.hub.collectors()) / float64(s.cfg.MaxCollectors)
 	s.rl.penalised.Set(int64(s.fails.Exhausted(now)))
 	attrs := make([]any, 0, 4*len(allLimiters))
@@ -478,6 +617,9 @@ func (s *Server) reportLimits() {
 			notable = true
 		}
 	}
+	// The absolute number, for scaling the service on (the peak above is
+	// relative to one process's cap).
+	attrs = append(attrs, "collectors", s.hub.collectors())
 	if notable {
 		s.log.Info("rate limits", attrs...)
 	} else {

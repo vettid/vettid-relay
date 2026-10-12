@@ -102,7 +102,9 @@ func WithRateLimiters(l Limiters) Option {
 // WithNoMailboxHold replaces the first hold (1 s, then doubling) of a key
 // that signed properly and had no mailbox; 0 turns holds off (tests).
 func WithNoMailboxHold(base time.Duration) Option {
-	return func(s *Server) { s.orphans = ratelimit.NewHold(base, s.cfg.AuthFailMaxPenalty, maxHeldKeys) }
+	return func(s *Server) {
+		s.orphans = ratelimit.NewHold(base, s.cfg.AuthFailMaxPenalty, maxHeldKeys, perNetworkKeys)
+	}
 }
 
 // WithPairFailBudget replaces the budget of refused deposits per sender
@@ -113,8 +115,14 @@ func WithPairFailBudget(rate float64, burst int) Option {
 	}
 }
 
-// WithBodyTimeout replaces the time a request body has to arrive (tests).
-func WithBodyTimeout(d time.Duration) Option { return func(s *Server) { s.bodyTimeout = d } }
+// WithBodyPace replaces how fast a not yet authenticated request's body
+// has to arrive (tests).
+func WithBodyPace(idle, total time.Duration) Option {
+	return func(s *Server) { s.paceOpen = bodyPace{idle: idle, total: total} }
+}
+
+// WithWebSocketLifetime replaces the maximum life of a WebSocket session.
+func WithWebSocketLifetime(d time.Duration) Option { return func(s *Server) { s.wsLifetime = d } }
 
 // WithTimer replaces the timer behind a long-poll's wait (tests drive it
 // from their clock).

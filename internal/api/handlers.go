@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -26,46 +25,11 @@ const (
 	timeFormat       = "2006-01-02T15:04:05Z" // RFC 3339 UTC, second precision (spec examples)
 )
 
-// bodyReadTimeout bounds how long one request body (other than a blob) may
-// take to arrive. Bodies are at most a deposit (about 350 KiB): a slow
-// mobile link sends that in a few seconds, and a client that stalls is
-// holding memory.
-const bodyReadTimeout = 20 * time.Second
-
-// readBody reads the whole body, enforcing limit while reading (spec §8.5:
-// size limits precede signature verification). What is being read counts
-// against the process's and the network's caps on body bytes in flight,
-// and has to arrive within bodyReadTimeout (limits.go bodies).
+// readBody reads a small body (at most smallBodyLimit, or a claim),
+// enforcing limit while reading (spec §8.5: size limits precede signature
+// verification). See limits.go bodyPool.
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, *apiError) {
-	if r.ContentLength > limit {
-		return nil, fail(CodePayloadTooLarge)
-	}
-	if r.ContentLength == 0 {
-		return []byte{}, nil
-	}
-	n := r.ContentLength
-	if n < 0 {
-		n = limit // length not declared: count the most it may be
-	}
-	release, e := s.reserveBody(w, n)
-	if e != nil {
-		return nil, e
-	}
-	defer release()
-	rc := http.NewResponseController(w)
-	deadline := rc.SetReadDeadline(time.Now().Add(s.bodyTimeout)) == nil
-	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
-	var mbe *http.MaxBytesError
-	switch {
-	case errors.As(err, &mbe):
-		return nil, fail(CodePayloadTooLarge)
-	case err != nil:
-		return nil, fail(CodeBadRequest)
-	}
-	if deadline {
-		rc.SetReadDeadline(time.Time{})
-	}
-	return b, nil
+	return s.readBodyFrom(w, r, limit, s.smallBodies, s.paceOpen)
 }
 
 // depositBodyLimit is the JSON envelope cap: base64 of the max payload plus
@@ -196,26 +160,32 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	}
 	mailboxID := r.PathValue("mailbox_id")
 	// The body is read as late as it can be: §5.3 steps 1–6 need only
-	// headers, so on a network with budget an unauthorized deposit is
-	// refused before its body is read (as a blob upload is). body() reads
-	// it once, when something first needs it.
+	// headers, so on a network with budget a deposit's body is read once
+	// its token has verified (as a blob upload's is).
 	var (
 		body     []byte
 		bodyHash [32]byte
 		bodyErr  *apiError
 		bodyRead bool
 	)
-	read := func() *apiError {
+	// read reads the body, once. keyed says whether the deposit token has
+	// verified by now: that decides which pool the body counts against and
+	// how long its sender has (limits.go bodyPool).
+	read := func(keyed bool) *apiError {
 		if !bodyRead {
 			bodyRead = true
-			if body, bodyErr = s.readBody(w, r, s.depositBodyLimit()); bodyErr == nil {
+			pool, pace := s.openBodies, s.paceOpen
+			if keyed {
+				pool, pace = s.keyedBodies, paceKeyed
+			}
+			if body, bodyErr = s.readBodyFrom(w, r, s.depositBodyLimit(), pool, pace); bodyErr == nil {
 				bodyHash = auth.BodyHash(body)
 			}
 		}
 		return bodyErr
 	}
 	hash := func() *[32]byte {
-		if read() != nil {
+		if read(false) != nil {
 			return nil
 		}
 		return &bodyHash
@@ -226,7 +196,7 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		// is checked before the mailbox and token are looked at, which
 		// takes the body; and the signer must have a mailbox of its own,
 		// or it is let through only at a trickle (limits.go).
-		if e := read(); e != nil {
+		if e := read(false); e != nil {
 			s.writeError(w, e)
 			return
 		}
@@ -264,7 +234,7 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	if e := read(); e != nil {
+	if e := read(true); e != nil {
 		s.writeError(w, e)
 		return
 	}
@@ -400,12 +370,12 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeBadRequest))
 		return
 	}
-	addr := stateOf(w).addr
-	if why := s.hub.acquire(mb.ID, addr, s.cfg.MaxCollectorsPerMailbox, s.cfg.MaxCollectorsPerNetwork, s.cfg.MaxCollectors); why != "" {
+	col, why := s.hub.acquire(mb.ID, stateOf(w).addr, wait > 0, s.cfg.MaxCollectorsPerMailbox, s.cfg.MaxCollectorsPerNetwork, s.cfg.MaxCollectors)
+	if col == nil {
 		s.writeError(w, s.refuseCollector(why))
 		return
 	}
-	defer s.hub.release(mb.ID, addr)
+	defer s.hub.release(mb.ID, col)
 	gone := s.hub.goneCh(mb.ID)
 	if !s.stillRegistered(r.Context(), mb.ID) {
 		s.writeError(w, fail(CodeMailboxUnknown)) // deleted since authorization
@@ -457,6 +427,10 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, fail(CodeMailboxUnknown))
 			done = true
 		case <-deadlineC:
+			s.respondMessages(w, nil)
+			done = true
+		case <-col.shed: // its place went to a mailbox that had no collector: come back
+			s.m.shed.Inc()
 			s.respondMessages(w, nil)
 			done = true
 		case <-s.drainCtx.Done():

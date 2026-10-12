@@ -165,7 +165,7 @@ func TestDebtTableFull(t *testing.T) {
 }
 
 func TestRecent(t *testing.T) {
-	r := NewRecent(time.Minute, 2)
+	r := NewRecent(time.Minute, 2, 0)
 	now := time.Unix(1_700_000_000, 0)
 	r.Add("a", now, false)
 	if r.Has("a", now) {
@@ -196,7 +196,7 @@ func TestRecent(t *testing.T) {
 }
 
 func TestHold(t *testing.T) {
-	h := NewHold(time.Second, time.Minute, 2)
+	h := NewHold(time.Second, time.Minute, 2, 0)
 	now := time.Unix(1_700_000_000, 0)
 	if h.Wait("a", now) != 0 {
 		t.Fatal("fresh key held")
@@ -245,7 +245,7 @@ func TestHold(t *testing.T) {
 		t.Fatal("recheck")
 	}
 	// A long first hold does not overflow.
-	long := NewHold(time.Minute, time.Hour, 2)
+	long := NewHold(time.Minute, time.Hour, 2, 0)
 	for i := 0; i < 80; i++ {
 		long.Fail("a", now)
 	}
@@ -255,5 +255,55 @@ func TestHold(t *testing.T) {
 	h.Prune(now.Add(time.Hour))
 	if h.Len() != 0 {
 		t.Fatal("prune")
+	}
+}
+
+// One group (a client network) cannot fill a table: it has a share, and
+// the other groups' keys are still tracked when it is at it.
+func TestTableShares(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	h := NewHold(time.Second, time.Minute, 10, 3)
+	for i := 0; i < 8; i++ {
+		h.FailIn("attacker", string(rune('a'+i)), now)
+	}
+	if h.Len() != 3 {
+		t.Fatalf("one group holds %d of a share of 3", h.Len())
+	}
+	if !h.FailIn("host", "vault", now) || h.Wait("vault", now) == 0 {
+		t.Fatal("another group's key was not tracked")
+	}
+	if h.FailIn("attacker", "z", now) || h.Wait("z", now) != 0 {
+		t.Fatal("a key over its group's share was tracked or called first")
+	}
+	h.Clear("a")
+	if !h.FailIn("attacker", "z", now) {
+		t.Fatal("share not given back")
+	}
+	h.Prune(now.Add(time.Hour))
+	if h.Len() != 0 || len(h.groups) != 0 {
+		t.Fatal("prune left group counts")
+	}
+
+	r := NewRecent(time.Minute, 10, 3)
+	for i := 0; i < 8; i++ {
+		r.AddIn("attacker", string(rune('a'+i)), now, true)
+	}
+	r.AddIn("host", "vault", now, true)
+	if r.Len() != 4 || !r.Has("vault", now) || r.Has("h", now) {
+		t.Fatalf("recent shares: len %d", r.Len())
+	}
+	r.Prune(now.Add(time.Hour))
+	r.AddIn("attacker", "again", now.Add(time.Hour), true)
+	if !r.Has("again", now.Add(time.Hour)) || len(r.groups) != 1 {
+		t.Fatal("share not given back after expiry")
+	}
+
+	// A held key is looked at again less often the longer its hold.
+	h = NewHold(time.Second, time.Minute, 10, 0)
+	for i := 0; i < 7; i++ { // 1, 2, ... 60 s
+		h.Fail("k", now)
+	}
+	if !h.Recheck("k", now, 5*time.Second) || h.Recheck("k", now.Add(14*time.Second), 5*time.Second) || !h.Recheck("k", now.Add(15*time.Second), 5*time.Second) {
+		t.Fatal("recheck interval is not a quarter of the hold")
 	}
 }

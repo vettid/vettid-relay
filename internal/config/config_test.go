@@ -136,8 +136,8 @@ func TestRateLimitConfig(t *testing.T) {
 	d := Defaults()
 	if d.RateIPPerSec != 200 || d.RateIPBurst != 4000 || d.RateKeyPerSec != 20 || d.RateKeyBurst != 100 ||
 		d.RateAuthFailPerSec != 1 || d.RateAuthFailBurst != 60 || d.AuthFailMaxPenalty != time.Minute ||
-		d.RateTricklePerSec != 0.1 || d.RateTrickleBurst != 3 || d.MaxCollectors != 6000 || d.MaxCollectorsPerNetwork != 3000 ||
-		d.MaxBodyBytes != 64<<20 || d.MaxBodyBytesPerNetwork != 16<<20 ||
+		d.RateTricklePerSec != 0.1 || d.RateTrickleBurst != 3 || d.MaxCollectors != 4000 || d.MaxCollectorsPerNetwork != 2500 ||
+		d.MaxBodyBytes != 24<<20 || d.MaxBodyBytesPerNetwork != 8<<20 || d.MaxOpenBodyBytes != 8<<20 || d.MaxOpenBodyBytesPerNetwork != 1<<20 ||
 		d.RateKeyFailPerSec != 1 || d.RateKeyFailBurst != 200 || d.RateVerifyPerSec != 1000 || d.RateVerifyBurst != 2000 ||
 		d.RateRegisterPerSec != 1 || d.RateRegisterBurst != 100 || d.RateSenderPerSec != 5 || d.RateSenderBurst != 20 ||
 		d.RateClaimPerSec != 1 || d.RateClaimBurst != 10 {
@@ -174,6 +174,8 @@ func TestRateLimitConfig(t *testing.T) {
 		{"RELAY_RATE_AUTHFAIL_MAX_PENALTY": "0"},
 		{"RELAY_MAX_COLLECTORS": "0"},
 		{"RELAY_MAX_INFLIGHT_BODY_BYTES_PER_NETWORK": "0"},
+		{"RELAY_MAX_INFLIGHT_OPEN_BODY_BYTES_PER_NETWORK": "300000"}, // less than one largest deposit
+		{"RELAY_MAX_INFLIGHT_BODY_BYTES": "1000"},
 		{"RELAY_RATE_KEY_BURST": "0"},
 		{"RELAY_RATE_AUTHFAIL_BURST": "-1"},
 		{"RELAY_RATE_AUTHFAIL_MAX_PENALTY": "never"},

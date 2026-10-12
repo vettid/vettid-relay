@@ -129,39 +129,62 @@ func (d *Debt) Len() int {
 }
 
 // Recent is a bounded set of strings that expire a fixed time after they
-// were last added. The relay uses it to remember which keys authenticated
-// from which client network lately.
+// were last added. Entries may be added on behalf of a group (a client
+// network), which may hold only a share of the set: one group cannot fill
+// it and so make it forget everyone else's keys.
 type Recent struct {
-	ttl time.Duration
-	max int
+	ttl      time.Duration
+	max      int
+	perGroup int // 0: no shares
 
-	mu sync.Mutex
-	m  map[string]time.Time // → expiry
+	mu     sync.Mutex
+	m      map[string]recentEntry
+	groups map[string]int
+}
+
+type recentEntry struct {
+	exp   time.Time
+	group string
 }
 
 // NewRecent returns a set whose entries live for ttl and which holds at
-// most max of them.
-func NewRecent(ttl time.Duration, max int) *Recent {
-	return &Recent{ttl: ttl, max: max, m: map[string]time.Time{}}
+// most max of them, at most perGroup of them per group (0: no limit).
+func NewRecent(ttl time.Duration, max, perGroup int) *Recent {
+	return &Recent{ttl: ttl, max: max, perGroup: perGroup, m: map[string]recentEntry{}, groups: map[string]int{}}
 }
 
 // Add inserts or refreshes k. With fresh false only an entry that is
 // already present is refreshed. A full set takes no new entries.
-func (r *Recent) Add(k string, now time.Time, fresh bool) {
+func (r *Recent) Add(k string, now time.Time, fresh bool) { r.AddIn("", k, now, fresh) }
+
+// AddIn is Add on behalf of group; a group at its share takes no new entries.
+func (r *Recent) AddIn(group, k string, now time.Time, fresh bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.m[k]; !ok || !e.After(now) {
+	e, ok := r.m[k]
+	if !ok || !e.exp.After(now) {
 		if !fresh {
 			return
 		}
-		if !ok && len(r.m) >= r.max {
-			r.pruneLocked(now)
-			if len(r.m) >= r.max {
-				return
+		if !ok {
+			if len(r.m) >= r.max || r.overShare(group) {
+				r.pruneLocked(now)
+				if len(r.m) >= r.max || r.overShare(group) {
+					return
+				}
+			}
+			e.group = group
+			if group != "" {
+				r.groups[group]++
 			}
 		}
 	}
-	r.m[k] = now.Add(r.ttl)
+	e.exp = now.Add(r.ttl)
+	r.m[k] = e
+}
+
+func (r *Recent) overShare(group string) bool {
+	return r.perGroup > 0 && group != "" && r.groups[group] >= r.perGroup
 }
 
 // Has reports whether k is present and not expired.
@@ -169,20 +192,31 @@ func (r *Recent) Has(k string, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.m[k]
-	return ok && e.After(now)
+	return ok && e.exp.After(now)
+}
+
+func (r *Recent) drop(k string, e recentEntry) {
+	delete(r.m, k)
+	if e.group != "" {
+		if r.groups[e.group]--; r.groups[e.group] <= 0 {
+			delete(r.groups, e.group)
+		}
+	}
 }
 
 // Remove deletes k.
 func (r *Recent) Remove(k string) {
 	r.mu.Lock()
-	delete(r.m, k)
+	if e, ok := r.m[k]; ok {
+		r.drop(k, e)
+	}
 	r.mu.Unlock()
 }
 
 func (r *Recent) pruneLocked(now time.Time) {
 	for k, e := range r.m {
-		if !e.After(now) {
-			delete(r.m, k)
+		if !e.exp.After(now) {
+			r.drop(k, e)
 		}
 	}
 }
@@ -206,55 +240,83 @@ func (r *Recent) Len() int {
 // and Wait says how long a key is still held. The relay uses it for keys
 // that sign correctly but turned out to have no mailbox: whoever keeps
 // asking is answered from this table instead of from the store, less and
-// less often. An entry is forgotten max after its hold ended.
+// less often. An entry is forgotten max after its hold ended. Keys are
+// held on behalf of a group (a client network), which may fill only a
+// share of the table.
 type Hold struct {
 	base, max time.Duration
 	maxKeys   int
+	perGroup  int // 0: no shares
 
-	mu sync.Mutex
-	m  map[string]holdEntry
+	mu     sync.Mutex
+	m      map[string]holdEntry
+	groups map[string]int
 }
 
 type holdEntry struct {
 	until   time.Time
+	dur     time.Duration // length of the current hold
 	streak  int
 	checked time.Time // last Recheck
+	group   string
 }
 
-// NewHold returns a table holding at most maxKeys keys.
-func NewHold(base, max time.Duration, maxKeys int) *Hold {
-	return &Hold{base: base, max: max, maxKeys: maxKeys, m: map[string]holdEntry{}}
+// NewHold returns a table holding at most maxKeys keys, at most perGroup
+// of them per group (0: no limit).
+func NewHold(base, max time.Duration, maxKeys, perGroup int) *Hold {
+	return &Hold{base: base, max: max, maxKeys: maxKeys, perGroup: perGroup, m: map[string]holdEntry{}, groups: map[string]int{}}
 }
 
 // Fail records one failure of key and holds it. It reports whether the key
 // was new to the table: true once per key for as long as it keeps failing.
-// If the table is full of live keys the key goes untracked: it is not
-// held, and never reported as first (what cannot be remembered must not be
-// charged to anyone else again and again).
-func (h *Hold) Fail(key string, now time.Time) (first bool) {
+// If the table (or the group's share of it) is full of live keys the key
+// goes untracked: it is not held, and never reported as first (what cannot
+// be remembered must not be charged to anyone else again and again).
+func (h *Hold) Fail(key string, now time.Time) (first bool) { return h.FailIn("", key, now) }
+
+// FailIn is Fail on behalf of group.
+func (h *Hold) FailIn(group, key string, now time.Time) (first bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	e, ok := h.m[key]
 	if ok && now.After(e.until.Add(h.max)) {
+		h.drop(key, e)
 		ok = false
 	}
 	if !ok {
-		if _, present := h.m[key]; !present && len(h.m) >= h.maxKeys {
+		if len(h.m) >= h.maxKeys || h.overShare(group) {
 			h.pruneLocked(now)
-			if len(h.m) >= h.maxKeys {
+			if len(h.m) >= h.maxKeys || h.overShare(group) {
 				return false
 			}
 		}
-		e = holdEntry{}
+		e = holdEntry{group: group}
+		if group != "" {
+			h.groups[group]++
+		}
 	}
 	e.streak++
 	d := h.base
 	for i := 1; i < e.streak && d < h.max; i++ {
 		d *= 2
 	}
-	e.until = now.Add(min(d, h.max))
+	e.dur = min(d, h.max)
+	e.until = now.Add(e.dur)
 	h.m[key] = e
 	return !ok
+}
+
+func (h *Hold) overShare(group string) bool {
+	return h.perGroup > 0 && group != "" && h.groups[group] >= h.perGroup
+}
+
+func (h *Hold) drop(key string, e holdEntry) {
+	delete(h.m, key)
+	if e.group != "" {
+		if h.groups[e.group]--; h.groups[e.group] <= 0 {
+			delete(h.groups, e.group)
+		}
+	}
 }
 
 // Wait returns how long key is still held (0: not held).
@@ -268,12 +330,15 @@ func (h *Hold) Wait(key string, now time.Time) time.Duration {
 }
 
 // Recheck reports whether it is time to look again at whether a held key
-// still deserves its hold: true at most once per `every` for each key.
-func (h *Hold) Recheck(key string, now time.Time, every time.Duration) bool {
+// still deserves its hold: true at most once per interval for each key,
+// the interval being a quarter of the key's current hold and at least
+// minEvery. So a key that has only just been held is looked at again
+// soon, one that keeps coming back less and less often.
+func (h *Hold) Recheck(key string, now time.Time, minEvery time.Duration) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	e, ok := h.m[key]
-	if !ok || now.Sub(e.checked) < every {
+	if !ok || now.Sub(e.checked) < max(minEvery, e.dur/4) {
 		return false
 	}
 	e.checked = now
@@ -284,14 +349,16 @@ func (h *Hold) Recheck(key string, now time.Time, every time.Duration) bool {
 // Clear forgets key.
 func (h *Hold) Clear(key string) {
 	h.mu.Lock()
-	delete(h.m, key)
+	if e, ok := h.m[key]; ok {
+		h.drop(key, e)
+	}
 	h.mu.Unlock()
 }
 
 func (h *Hold) pruneLocked(now time.Time) {
 	for k, e := range h.m {
 		if now.After(e.until.Add(h.max)) {
-			delete(h.m, k)
+			h.drop(k, e)
 		}
 	}
 }

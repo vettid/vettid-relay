@@ -50,7 +50,7 @@ func (c *Client) Limiter(name string, rate float64, burst int) *Limiter {
 	per := 1000 / rate
 	return &Limiter{
 		c: c, name: name, perMS: per, burstMS: per * float64(burst),
-		fallback: ratelimit.New(rate, burst, 200_000),
+		fallback: ratelimit.New(rate, burst, 20_000), // bounded: it only fills while Valkey is unreachable
 		timeout:  250 * time.Millisecond,
 	}
 }

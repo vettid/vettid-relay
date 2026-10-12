@@ -150,14 +150,18 @@ func TestPenalisedNetworkServesEveryMailbox(t *testing.T) {
 		t.Fatalf("retry_after %d, want the refill time (10 s) plus jitter (2)", e.RetryAfter)
 	}
 	// What has no key with a mailbox to serve it by gets through at a
-	// trickle (here two, then one per 20 s): claim fetches, new mailboxes,
-	// deposits by a signer without a mailbox.
-	f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa"}, 404, CodeClaimUnknown)
-	f.expectFrom(hostA, registerReq(newPrincipal(12)), 201, "")
+	// trickle (here two, then one per 20 s). Unauthenticated claim fetches
+	// have their own, so that they cannot take the place of ...
+	for i := 0; i < 2; i++ {
+		f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa"}, 404, CodeClaimUnknown)
+	}
 	e = f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa", header: keyHeader(vault)}, 429, CodeRateLimited)
 	if e.RetryAfter != 20+2 {
 		t.Fatalf("trickle retry_after %d", e.RetryAfter)
 	}
+	// ... properly signed new mailboxes and deposits by signers without a mailbox.
+	f.expectFrom(hostA, registerReq(newPrincipal(12)), 201, "")
+	f.expectFrom(hostA, depositReq(owner, stranger, strangerTok, "x"), 201, "")
 	f.expectFrom(hostA, registerReq(fresh), 429, CodeRateLimited)
 	f.expectFrom(hostA, depositReq(owner, stranger, strangerTok, "x"), 429, CodeRateLimited)
 	// Everything properly signed by a key with a mailbox is served: a key
@@ -343,19 +347,13 @@ func TestRefusedDepositsChargeTheSenderKey(t *testing.T) {
 		t.Fatal("an unsigned failure was charged to the key, or not to the address")
 	}
 	f.expectFrom(hostA, depositReq(owner, vault, tok, "y"), 201, "")
-	// A signer without a mailbox: its key's budget too, and its address
-	// once, for the first.
+	// A signer without a mailbox: no body is read to find out whose
+	// failure it is; it is its address's, each time.
 	for i := 0; i < 2; i++ {
 		f.expectFrom(hostB, depositReq(nobody, passerby, tok, "x"), 404, CodeMailboxUnknown)
 	}
-	f.expectFrom(hostB, depositReq(nobody, passerby, tok, "x"), 429, CodeRateLimited)
-	// Budget 3: the unsigned one and passerby once so far; one more uses it up.
-	if f.s.fails.Exhausted(f.clk.now()) != 0 {
-		t.Fatal("a signer without a mailbox was charged to its address more than once")
-	}
-	f.expectFrom(hostB, badSig(f, nobody), 401, CodeSignatureInvalid)
-	if f.s.fails.Exhausted(f.clk.now()) != 1 {
-		t.Fatal("a signer without a mailbox was not charged to its address")
+	if f.s.fails.Exhausted(f.clk.now()) != 1 || f.s.keyFails.Wait(passerby.b64, f.clk.now().Add(-time.Hour)) != 0 { // budget 3: the unsigned one, and these two
+		t.Fatal("refused deposits of a signer without a mailbox were not charged to its address")
 	}
 }
 

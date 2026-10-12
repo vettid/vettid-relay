@@ -80,16 +80,18 @@ type Config struct {
 	RateTrickleBurst   int           // RELAY_RATE_TRICKLE_BURST
 
 	// Resource caps, per process (spec §7.2 "Resource caps").
-	MaxCollectors           int     // RELAY_MAX_COLLECTORS: parked long-polls plus WebSocket sessions
-	MaxCollectorsPerNetwork int     // RELAY_MAX_COLLECTORS_PER_NETWORK
-	MaxBodyBytes            int64   // RELAY_MAX_INFLIGHT_BODY_BYTES: request bodies being read (blob uploads have their own slots)
-	MaxBodyBytesPerNetwork  int64   // RELAY_MAX_INFLIGHT_BODY_BYTES_PER_NETWORK
-	RateSenderPerSec        float64 // RELAY_RATE_SENDER_RPS
-	RateSenderBurst         int     // RELAY_RATE_SENDER_BURST
-	RateClaimPerSec         float64 // RELAY_RATE_CLAIM_GET_RPS
-	RateClaimBurst          int     // RELAY_RATE_CLAIM_GET_BURST
-	RateWebPerSec           float64 // RELAY_RATE_WEB_RPS (everything outside /v1/ and /healthz)
-	RateWebBurst            int     // RELAY_RATE_WEB_BURST
+	MaxCollectors              int     // RELAY_MAX_COLLECTORS: parked long-polls plus WebSocket sessions
+	MaxCollectorsPerNetwork    int     // RELAY_MAX_COLLECTORS_PER_NETWORK
+	MaxBodyBytes               int64   // RELAY_MAX_INFLIGHT_BODY_BYTES: deposit bodies being read once their token has verified
+	MaxBodyBytesPerNetwork     int64   // RELAY_MAX_INFLIGHT_BODY_BYTES_PER_NETWORK
+	MaxOpenBodyBytes           int64   // RELAY_MAX_INFLIGHT_OPEN_BODY_BYTES: deposit bodies being read before authentication
+	MaxOpenBodyBytesPerNetwork int64   // RELAY_MAX_INFLIGHT_OPEN_BODY_BYTES_PER_NETWORK
+	RateSenderPerSec           float64 // RELAY_RATE_SENDER_RPS
+	RateSenderBurst            int     // RELAY_RATE_SENDER_BURST
+	RateClaimPerSec            float64 // RELAY_RATE_CLAIM_GET_RPS
+	RateClaimBurst             int     // RELAY_RATE_CLAIM_GET_BURST
+	RateWebPerSec              float64 // RELAY_RATE_WEB_RPS (everything outside /v1/ and /healthz)
+	RateWebBurst               int     // RELAY_RATE_WEB_BURST
 
 	// Web endpoints (spec §6.11): /.well-known/assetlinks.json names the
 	// Android app allowed to open this relay's /connect links. An empty
@@ -178,18 +180,20 @@ func Defaults() Config {
 		RateTricklePerSec:  0.1,
 		RateTrickleBurst:   3,
 
-		MaxCollectors:           6000,
-		MaxCollectorsPerNetwork: 3000,
-		MaxBodyBytes:            64 << 20,
-		MaxBodyBytesPerNetwork:  16 << 20,
-		RateRegisterPerSec:      1,
-		RateRegisterBurst:       100,
-		RateSenderPerSec:        5,
-		RateSenderBurst:         20,
-		RateClaimPerSec:         1,
-		RateClaimBurst:          10,
-		RateWebPerSec:           2,
-		RateWebBurst:            20,
+		MaxCollectors:              4000,
+		MaxCollectorsPerNetwork:    2500,
+		MaxBodyBytes:               24 << 20,
+		MaxBodyBytesPerNetwork:     8 << 20,
+		MaxOpenBodyBytes:           8 << 20,
+		MaxOpenBodyBytesPerNetwork: 1 << 20,
+		RateRegisterPerSec:         1,
+		RateRegisterBurst:          100,
+		RateSenderPerSec:           5,
+		RateSenderBurst:            20,
+		RateClaimPerSec:            1,
+		RateClaimBurst:             10,
+		RateWebPerSec:              2,
+		RateWebBurst:               20,
 
 		AndroidPackage:          DefaultAndroidPackage,
 		AndroidCertFingerprints: append([]string(nil), DefaultAndroidCertFingerprints...),
@@ -327,6 +331,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	integer("RELAY_MAX_COLLECTORS_PER_NETWORK", &c.MaxCollectorsPerNetwork)
 	i64("RELAY_MAX_INFLIGHT_BODY_BYTES", &c.MaxBodyBytes)
 	i64("RELAY_MAX_INFLIGHT_BODY_BYTES_PER_NETWORK", &c.MaxBodyBytesPerNetwork)
+	i64("RELAY_MAX_INFLIGHT_OPEN_BODY_BYTES", &c.MaxOpenBodyBytes)
+	i64("RELAY_MAX_INFLIGHT_OPEN_BODY_BYTES_PER_NETWORK", &c.MaxOpenBodyBytesPerNetwork)
 	f64("RELAY_RATE_SENDER_RPS", &c.RateSenderPerSec)
 	integer("RELAY_RATE_SENDER_BURST", &c.RateSenderBurst)
 	f64("RELAY_RATE_CLAIM_GET_RPS", &c.RateClaimPerSec)
@@ -433,6 +439,13 @@ func (c Config) Validate() error {
 	}
 	if c.RateTrickleBurst <= 0 || c.MaxCollectors <= 0 || c.MaxCollectorsPerNetwork <= 0 || c.MaxBodyBytes <= 0 || c.MaxBodyBytesPerNetwork <= 0 {
 		errs = append(errs, errors.New("RELAY_RATE_TRICKLE_BURST, RELAY_MAX_COLLECTORS* and RELAY_MAX_INFLIGHT_BODY_BYTES* must be > 0"))
+	}
+	// Each body cap must admit at least one largest deposit (its JSON
+	// envelope: base64 of the payload plus headroom), or deposits of that
+	// size could never be read.
+	if largest := 4*((c.MaxPayloadBytes+2)/3) + 1024 + 1; c.MaxBodyBytes < largest || c.MaxBodyBytesPerNetwork < largest ||
+		c.MaxOpenBodyBytes < largest || c.MaxOpenBodyBytesPerNetwork < largest {
+		errs = append(errs, fmt.Errorf("RELAY_MAX_INFLIGHT_*BODY_BYTES* must each be at least one largest deposit (%d bytes)", largest))
 	}
 	if len(c.AndroidCertFingerprints) > 0 && !validAndroidPackage(c.AndroidPackage) {
 		errs = append(errs, errors.New("RELAY_ANDROID_PACKAGE must be an Android package name like com.vettid.app"))

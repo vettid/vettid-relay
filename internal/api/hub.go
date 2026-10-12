@@ -4,12 +4,23 @@ import "sync"
 
 // hub wakes parked collectors (long-poll and WebSocket) of a mailbox as soon
 // as a deposit commits — no polling loop sits on the delivery path (spec
-// §6.2 wake-on-deposit). It also caps concurrent collectors per mailbox.
+// §6.2 wake-on-deposit). It also bounds how many collectors are parked
+// (each holds a connection and a goroutine), in a way that nobody can use
+// to shut a mailbox out (spec §7.2 item 8):
+//
+//   - a collect that does not park (wait=0) is never refused by a cap on
+//     parked collectors;
+//   - a mailbox's first collector is always admitted. If the process is
+//     full, room is made by shedding one collector of the network that
+//     holds the most (it gets an empty answer and comes back), unless that
+//     network is the newcomer's own;
+//   - the process cap refuses only a mailbox's second and later
+//     collectors, and newcomers of the heaviest network.
 type hub struct {
-	mu     sync.Mutex
-	boxes  map[string]*hubEntry
-	perNet map[string]int // collectors per client network
-	total  int
+	mu    sync.Mutex
+	boxes map[string]*hubEntry
+	nets  map[string]map[*collector]struct{} // parked collectors per client network
+	total int                                // parked collectors counted against the process cap
 }
 
 type hubEntry struct {
@@ -18,7 +29,16 @@ type hubEntry struct {
 	collectors int
 }
 
-func newHub() *hub { return &hub{boxes: map[string]*hubEntry{}, perNet: map[string]int{}} }
+// collector is one admitted collect or WebSocket session.
+type collector struct {
+	net     string
+	shed    chan struct{} // closed when the collector has to give its place up
+	counted bool          // in nets and total
+}
+
+func newHub() *hub {
+	return &hub{boxes: map[string]*hubEntry{}, nets: map[string]map[*collector]struct{}{}}
+}
 
 // Why a collector was not admitted.
 const (
@@ -27,52 +47,81 @@ const (
 	fullProcess = "process" // this process has
 )
 
-// acquire registers a collector for mailbox, from client network net. It
-// returns "" or which cap was reached: collectors per mailbox, per network,
-// or in this process altogether (each parked collector holds a connection
-// and a goroutine: the caps bound that memory).
-func (h *hub) acquire(mailbox, net string, maxMailbox, maxNet, maxTotal int) string {
+// acquire registers a collector for mailbox, from client network net;
+// parked says whether it may wait (a long-poll with wait>0, a WebSocket).
+// It returns the collector, or which cap refused it.
+func (h *hub) acquire(mailbox, net string, parked bool, maxMailbox, maxNet, maxTotal int) (*collector, string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.total >= maxTotal {
-		return fullProcess
-	}
-	if net != "" && h.perNet[net] >= maxNet {
-		return fullNetwork
-	}
 	e, ok := h.boxes[mailbox]
 	if ok && e.collectors >= maxMailbox {
-		return fullMailbox
+		return nil, fullMailbox
+	}
+	c := &collector{net: net, shed: make(chan struct{})}
+	if parked {
+		if len(h.nets[net]) >= maxNet {
+			return nil, fullNetwork
+		}
+		if h.total >= maxTotal {
+			heavy, n := "", 0
+			for name, set := range h.nets {
+				if len(set) > n {
+					heavy, n = name, len(set)
+				}
+			}
+			// Only a mailbox's first collector is worth someone else's
+			// place, and never the place of a network no heavier than
+			// the newcomer's own.
+			if (ok && e.collectors > 0) || n <= len(h.nets[net])+1 {
+				return nil, fullProcess
+			}
+			for victim := range h.nets[heavy] {
+				h.uncount(victim)
+				close(victim.shed)
+				break
+			}
+		}
+		if h.nets[net] == nil {
+			h.nets[net] = map[*collector]struct{}{}
+		}
+		h.nets[net][c] = struct{}{}
+		h.total++
+		c.counted = true
 	}
 	if !ok {
 		e = &hubEntry{ch: make(chan struct{}), gone: make(chan struct{})}
 		h.boxes[mailbox] = e
 	}
 	e.collectors++
-	h.total++
-	if net != "" {
-		h.perNet[net]++
+	return c, ""
+}
+
+func (h *hub) uncount(c *collector) {
+	if !c.counted {
+		return
 	}
-	return ""
+	c.counted = false
+	h.total--
+	if set := h.nets[c.net]; set != nil {
+		delete(set, c)
+		if len(set) == 0 {
+			delete(h.nets, c.net)
+		}
+	}
 }
 
 // release unregisters a collector acquired with acquire.
-func (h *hub) release(mailbox, net string) {
+func (h *hub) release(mailbox string, c *collector) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.uncount(c)
 	e, ok := h.boxes[mailbox]
 	if !ok {
 		return
 	}
 	e.collectors--
-	h.total--
 	if e.collectors <= 0 {
 		delete(h.boxes, mailbox)
-	}
-	if net != "" {
-		if h.perNet[net]--; h.perNet[net] <= 0 {
-			delete(h.perNet, net)
-		}
 	}
 }
 

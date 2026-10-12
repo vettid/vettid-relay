@@ -78,7 +78,7 @@ func (s *Server) handleClaimGet(w http.ResponseWriter, r *http.Request) {
 	// Unauthenticated: a penalised network's fetches get through at a
 	// trickle only, whatever headers they carry (limits.go).
 	if st := stateOf(w); st.penalised {
-		if e := s.take(limTrickle, s.trickle, st.addr, true); e != nil {
+		if e := s.take(limTrickleAny, s.trickleClaim, st.addr, true); e != nil {
 			s.writeError(w, e)
 			return
 		}

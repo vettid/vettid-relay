@@ -111,7 +111,10 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 		// A refused request whose body was never read: net/http reads what
 		// is left of it before it sends the answer. A client that announced
 		// a body and stalls would hold the connection (and the answer)
-		// until the server's read timeout; give it a moment instead.
+		// until the server's read timeout (minutes). It gets ten seconds: a
+		// client still uploading a largest deposit at 280 kbit/s or more
+		// finishes and reads its answer; a slower one sees the connection
+		// close and retries.
 		if rec.status >= 400 && r.ContentLength != 0 && !rec.hijacked {
 			http.NewResponseController(w).SetReadDeadline(time.Now().Add(refusedDrainTimeout))
 		}
@@ -119,7 +122,7 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 }
 
 // refusedDrainTimeout: see withAccessLog.
-const refusedDrainTimeout = time.Second
+const refusedDrainTimeout = 10 * time.Second
 
 // withSecurityHeaders sets conservative response headers. The web
 // documents (web.go) replace them with their own fuller set.

@@ -172,15 +172,16 @@ func (s *Server) authorizeSigner(w http.ResponseWriter, r *http.Request, bodyHas
 	if e != nil {
 		return sr, e
 	}
-	// A key held for having no mailbox: its holder is told to wait.
-	if e := s.held(r, sr.Key); e != nil {
-		return sr, e
-	}
 	// On a penalised network the flood guard was put off until here, so
 	// that the network's bad requests cannot use up what its good ones
-	// need. It comes before the replay record: what one network can write
-	// to the replay store is bounded by its flood guard.
+	// need. It comes before everything that reads or writes a store: the
+	// re-check of a held key, the replay record, the mailbox lookup. What
+	// one network can cost there is bounded by its flood guard.
 	if e := s.floodGuard(w); e != nil {
+		return sr, e
+	}
+	// A key held for having no mailbox: its holder is told to wait.
+	if e := s.held(r, sr.Key); e != nil {
 		return sr, e
 	}
 	return sr, s.checkReplay(w, sr)

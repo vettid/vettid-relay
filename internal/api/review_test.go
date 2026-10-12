@@ -2,6 +2,9 @@ package api
 
 import (
 	"bufio"
+	"context"
+	"crypto/ed25519"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,9 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/ratelimit"
+	"github.com/vettid/vettid-relay/internal/store"
 	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
@@ -74,85 +80,92 @@ func TestDepositBodyNotReadBeforeHeaderChecks(t *testing.T) {
 	}
 }
 
-// F1: bodies that are announced and then stall are capped per network and
-// per process, and have to arrive within a deadline.
-func TestStalledBodiesAreCapped(t *testing.T) {
-	const each = 10_000
-	f := newFixtureWith(t, func(c *config.Config) { c.MaxBodyBytesPerNetwork, c.MaxBodyBytes = 5*each, 1<<20 },
-		func(*fixture) []Option { return []Option{WithBodyTimeout(1500 * time.Millisecond)} })
-	inFlight := func() int64 {
-		f.s.bodies.mu.Lock()
-		defer f.s.bodies.mu.Unlock()
-		return f.s.bodies.total
-	}
-	open := func() (net.Conn, *bufio.Reader) {
+// N1/F1: a body counts against the caps as it arrives, never by what it
+// announces; it has to keep arriving; and the pools are separate, so that
+// stalled unauthenticated bodies cannot take the place of authenticated
+// ones.
+func TestBodiesCountAsTheyArriveAndStalledOnesEnd(t *testing.T) {
+	f := newFixtureWith(t, nil, func(*fixture) []Option { return []Option{WithBodyPace(300*time.Millisecond, time.Second)} })
+	open := func(path string, announce, send int) (net.Conn, *bufio.Reader) {
 		c, err := net.Dial("tcp", f.ts.Listener.Addr().String())
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { c.Close() })
-		// A signed-looking registration whose body never comes.
-		fmt.Fprintf(c, "POST /v1/register HTTP/1.1\r\nHost: relay\r\nContent-Length: %d\r\n\r\n{", each)
+		fmt.Fprintf(c, "POST %s HTTP/1.1\r\nHost: relay\r\nContent-Length: %d\r\n\r\n", path, announce)
+		c.Write(make([]byte, send))
 		return c, bufio.NewReader(c)
 	}
+	// 100 registrations announce 16 KiB each (1.6 MiB in all) and send one byte.
 	var stalled []*bufio.Reader
-	for i := 0; i < 5; i++ {
-		_, r := open()
+	for i := 0; i < 100; i++ {
+		_, r := open("/v1/register", smallBodyLimit, 1)
 		stalled = append(stalled, r)
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for inFlight() != 5*each && time.Now().Before(deadline) {
+	var held int64
+	for time.Now().Before(deadline) {
+		if held, _ = f.s.smallBodies.inFlight(); held >= 100*bodyChunk {
+			break
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	// The sixth is over this network's cap: refused at once, unread.
-	c, r := open()
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
-	began := time.Now()
-	resp, err := http.ReadResponse(r, nil)
-	if time.Since(began) > 3*time.Second {
-		t.Fatalf("the refusal took %v to arrive", time.Since(began))
+	if held != 100*bodyChunk {
+		t.Fatalf("100 stalled bodies announcing %d bytes each hold %d bytes (want at most one chunk each)", smallBodyLimit, held)
 	}
-	if err != nil || resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("Retry-After") == "" {
-		t.Fatalf("sixth stalled body: %v %v", resp, err)
-	}
-	if v := f.s.rl.refused.With(limBodies).Value(); v != 1 {
-		t.Fatalf("refused counter %d", v)
-	}
-	// The stalled ones end at the deadline and give their bytes back.
+	// They end when nothing arrives, and give their bytes back.
 	for _, r := range stalled {
 		resp, err := http.ReadResponse(r, nil)
 		if err != nil || resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("stalled body after the deadline: %v %v", resp, err)
+			t.Fatalf("stalled body: %v %v", resp, err)
 		}
 	}
-	f.s.bodies.mu.Lock()
-	total, nets := f.s.bodies.total, len(f.s.bodies.perNet)
-	f.s.bodies.mu.Unlock()
-	if total != 0 || nets != 0 {
+	if total, nets := f.s.smallBodies.inFlight(); total != 0 || nets != 0 {
 		t.Fatalf("body bytes still counted: %d (%d networks)", total, nets)
 	}
-	// The per-process cap, across networks.
-	g := newFixture(t, func(c *config.Config) { c.MaxBodyBytesPerNetwork, c.MaxBodyBytes = 1<<20, 15_000 })
-	rel, e := g.s.reserveBody(httptest.NewRecorder(), each)
-	if e != nil {
-		t.Fatal(e)
+	// A body that keeps arriving, slowly, is read: the pace is about progress.
+	c, r := open("/v1/register", 600, 0)
+	for i := 0; i < 6; i++ {
+		c.Write(make([]byte, 100))
+		time.Sleep(100 * time.Millisecond)
 	}
-	if _, e := g.s.reserveBody(httptest.NewRecorder(), each); e == nil || e.code != CodeRateLimited {
-		t.Fatal("process cap not enforced")
+	if resp, err := http.ReadResponse(r, nil); err != nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("slow but steady body: %v %v", resp, err) // read whole, then: not signed
 	}
-	rel()
-	if _, e := g.s.reserveBody(httptest.NewRecorder(), each); e != nil {
-		t.Fatal("bytes not given back")
+}
+
+func TestBodyPools(t *testing.T) {
+	p := newBodyPool(100, 40)
+	if !p.take("a", 40) || p.take("a", 1) || !p.take("b", 40) || !p.take("c", 20) || p.take("d", 1) {
+		t.Fatal("caps per network and in all")
+	}
+	p.give("a", 40)
+	if total, nets := p.inFlight(); total != 60 || nets != 2 {
+		t.Fatalf("after give: %d bytes, %d networks", total, nets)
+	}
+	if p.takePeak() != 1000 || p.takePeak() != 0 {
+		t.Fatal("peak")
+	}
+	// The relay's pools are separate: deposits being read before
+	// authentication, deposits whose token has verified, small bodies.
+	f := newFixture(t, nil)
+	if f.s.openBodies == f.s.keyedBodies || f.s.smallBodies == f.s.openBodies {
+		t.Fatal("pools are shared")
+	}
+	d := config.Defaults()
+	if d.MaxOpenBodyBytesPerNetwork*8 > d.MaxOpenBodyBytes || d.MaxOpenBodyBytes+d.MaxBodyBytes+smallBodyPool > 36<<20 {
+		t.Fatalf("body budget: open %d (per network %d), keyed %d", d.MaxOpenBodyBytes, d.MaxOpenBodyBytesPerNetwork, d.MaxBodyBytes)
 	}
 }
 
 // F2: a hold on a key does not outlive its registration on another relay
-// process: before refusing, the store is asked again (every holdRecheck).
+// process: before refusing, the store is asked again (every quarter of the
+// hold: at most 15 s with the default cap of a minute).
 func TestHoldEndsWhenKeyRegistersOnAnotherProcess(t *testing.T) {
 	opts := func() []Option {
 		return []Option{WithNoMailboxHold(time.Second), WithRetryJitter(func() int { return 0 })}
 	}
-	f := newFixtureWith(t, func(c *config.Config) { c.AuthFailMaxPenalty = 10 * time.Minute }, func(*fixture) []Option { return opts() })
+	f := newFixtureWith(t, nil, func(*fixture) []Option { return opts() })
 	sB := New(f.cfg, f.st, slog.New(slog.NewJSONHandler(io.Discard, nil)), metrics.New(), append(opts(), WithClock(f.clk.now))...)
 	defer sB.Close()
 	on := func(h http.Handler, r req) int {
@@ -170,7 +183,8 @@ func TestHoldEndsWhenKeyRegistersOnAnotherProcess(t *testing.T) {
 		on(b, collectReq(orphan))
 		f.clk.add(time.Second)
 	}
-	if on(b, collectReq(orphan)) != 429 || sB.orphans.Wait(orphan.b64, f.clk.now()) < time.Minute {
+	on(b, collectReq(orphan)) // if a hold had just ended, this starts the next (a minute)
+	if on(b, collectReq(orphan)) != 429 {
 		t.Fatal("the orphan is not held on process B")
 	}
 	if code := on(a, registerReq(orphan)); code != 201 {
@@ -181,13 +195,13 @@ func TestHoldEndsWhenKeyRegistersOnAnotherProcess(t *testing.T) {
 	}
 	refused := 0
 	for on(b, collectReq(orphan)) != 200 {
-		if refused++; refused > int(holdRecheck/time.Second) {
+		if refused++; refused > 15 {
 			t.Fatalf("still refused on process B %d s after registering on A", refused)
 		}
 		f.clk.add(time.Second)
 	}
-	if sB.orphans.Len() != 0 {
-		t.Fatal("hold not cleared on process B")
+	if sB.orphans.Wait(orphan.b64, f.clk.now()) != 0 {
+		t.Fatal("still held on process B")
 	}
 	// A key that still has no mailbox costs one store lookup per recheck, not per request.
 	other := newPrincipal(8)
@@ -310,79 +324,150 @@ func (ft *fakeTimers) fire() {
 	ft.mu.Unlock()
 }
 
-// F5: parked collects (real ones: wait=25, held open) are capped per
-// network and per process, and a refused one is told to come back.
-func TestParkedCollectorsAreCapped(t *testing.T) {
-	ft := &fakeTimers{}
-	f := newFixtureWith(t, func(c *config.Config) { c.MaxCollectorsPerNetwork, c.MaxCollectors = 3, 5 },
+// parkedFixture is a relay whose long-poll deadlines fire when the test
+// says so, with small collector caps.
+type parkedFixture struct {
+	*fixture
+	ft    *fakeTimers
+	wg    sync.WaitGroup
+	mu    sync.Mutex
+	codes map[string]int // by mailbox id
+}
+
+func newParkedFixture(t *testing.T, perNetwork, inAll int) *parkedFixture {
+	pf := &parkedFixture{ft: &fakeTimers{}, codes: map[string]int{}}
+	pf.fixture = newFixtureWith(t, func(c *config.Config) { c.MaxCollectorsPerNetwork, c.MaxCollectors = perNetwork, inAll },
 		func(*fixture) []Option {
-			return []Option{WithTimer(ft.timer), WithRetryJitter(func() int { return 2 })}
+			return []Option{WithTimer(pf.ft.timer), WithRetryJitter(func() int { return 2 })}
 		})
-	vaults := make([]principal, 8)
+	return pf
+}
+
+func parkReq(p principal) req { return req{method: "GET", path: "/v1/mailbox?wait=25", signer: &p} }
+
+// park issues a long-poll that stays open, in the background.
+func (pf *parkedFixture) park(addr string, p principal) {
+	pf.wg.Add(1)
+	go func() {
+		defer pf.wg.Done()
+		code, _, _ := pf.from(addr, parkReq(p))
+		pf.mu.Lock()
+		pf.codes[p.mbx] = code
+		pf.mu.Unlock()
+	}()
+}
+
+func (pf *parkedFixture) waitParked(n int) {
+	pf.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for pf.s.hub.collectors() != n {
+		if time.Now().After(deadline) {
+			pf.t.Fatalf("parked collectors: %d, want %d", pf.s.hub.collectors(), n)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func (pf *parkedFixture) code(p principal) int {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	return pf.codes[p.mbx]
+}
+
+// F5/N2: parked collects (real ones: wait=25, held open) are capped per
+// network and per process, but nobody can use the caps to shut a mailbox
+// out: a mailbox's first collector is always admitted (room is made by
+// shedding one of the heaviest network's), and a collect that does not
+// park is never refused by them.
+func TestParkedCollectorsAreCappedWithoutLockingAnyoneOut(t *testing.T) {
+	pf := newParkedFixture(t, 4, 6)
+	f := pf.fixture
+	vaults := make([]principal, 10)
 	for i := range vaults {
 		vaults[i] = newPrincipal(byte(10 + i))
 		f.register(vaults[i])
 	}
-	park := func(p principal) req { return req{method: "GET", path: "/v1/mailbox?wait=25", signer: &p} }
-	var wg sync.WaitGroup
-	codes := make([]int, len(vaults))
-	parkFrom := func(i int, addr string) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			codes[i], _, _ = f.from(addr, park(vaults[i]))
-		}()
+	// Two addresses fill the process: four mailboxes from one, two from another.
+	for i := 0; i < 4; i++ {
+		pf.park(hostA, vaults[i])
 	}
-	waitParked := func(n int) {
-		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for f.s.hub.collectors() != n {
-			if time.Now().After(deadline) {
-				t.Fatalf("parked collectors: %d, want %d", f.s.hub.collectors(), n)
-			}
-			time.Sleep(2 * time.Millisecond)
+	pf.waitParked(4)
+	_, e, h := f.from(hostA, parkReq(vaults[4]))
+	if e.Code != CodeRateLimited || e.RetryAfter != 1+2 || h.Get("Retry-After") != "3" {
+		t.Fatalf("a fifth from a network at its cap of four: %+v", e)
+	}
+	pf.park(hostB, vaults[4])
+	pf.park(hostB, vaults[5])
+	pf.waitParked(6)
+	// The process is full. An honest vault from a third address:
+	honest := "203.0.113.30"
+	f.expectFrom(honest, collectReq(vaults[6]), 200, "") // wait=0 is never refused by a parked-collector cap
+	pf.park(honest, vaults[6])                           // its long-poll is admitted too ...
+	deadline := time.Now().Add(5 * time.Second)
+	for f.s.m.shed.Value() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("nobody was shed to make room for a mailbox without a collector")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	pf.waitParked(6) // ... and one of the heaviest network's (hostA) was sent home with an empty answer
+	shed := 0
+	for i := 0; i < 4; i++ {
+		if pf.code(vaults[i]) == 200 {
+			shed++
 		}
 	}
-	for i := 0; i < 3; i++ {
-		parkFrom(i, hostA)
+	if shed != 1 || pf.code(vaults[4]) != 0 || pf.code(vaults[5]) != 0 {
+		t.Fatalf("shed from the heaviest network: %d (want 1); the lighter network's must stay parked", shed)
 	}
-	waitParked(3)
-	// The fourth from the same network is over its cap.
-	_, e, h := f.from(hostA, park(vaults[3]))
-	if e.Code != CodeRateLimited || e.RetryAfter != 1+2 || h.Get("Retry-After") != "3" {
-		t.Fatalf("over the network cap: %+v", e)
+	// What the process cap does refuse: a second collector of a mailbox
+	// that has one, and more from the network that already holds the most.
+	if _, e, _ := f.from(honest, parkReq(vaults[6])); e.Code != CodeRateLimited {
+		t.Fatalf("second collector of a mailbox, process full: %+v", e)
 	}
-	// Another network still has room, up to the process cap.
-	parkFrom(4, hostB)
-	parkFrom(5, hostB)
-	waitParked(5)
-	if _, e, _ := f.from("203.0.113.30", park(vaults[6])); e.Code != CodeRateLimited {
-		t.Fatalf("over the process cap: %+v", e)
+	if _, e, _ := f.from(hostA, parkReq(vaults[7])); e.Code != CodeRateLimited {
+		t.Fatalf("newcomer of the heaviest network, process full: %+v", e)
 	}
-	if v := f.s.rl.refused.With(limCollectors).Value(); v != 2 {
+	if v := f.s.rl.refused.With(limCollectors).Value(); v != 3 {
 		t.Fatalf("refused counter %d", v)
 	}
-	// A deposit wakes its collector; the deadline ends the others; the slots come back.
-	tok := f.mint(vaults[0], vaults[7], nil)
-	f.expectFrom(hostB, depositReq(vaults[0], vaults[7], tok, "wake"), 201, "")
-	waitParked(4)
-	ft.fire()
-	wg.Wait()
-	for i, c := range codes[:6] {
-		if i != 3 && c != 200 {
-			t.Fatalf("parked collect %d ended with %d", i, c)
+	// A deposit still wakes its collector; the deadline ends the others; the slots come back.
+	tok := f.mint(vaults[6], vaults[9], nil)
+	f.expectFrom(hostB, depositReq(vaults[6], vaults[9], tok, "wake"), 201, "")
+	pf.waitParked(5)
+	pf.ft.fire()
+	pf.wg.Wait()
+	pf.waitParked(0)
+	for i := 0; i < 7; i++ {
+		if pf.code(vaults[i]) != 200 {
+			t.Fatalf("parked collect %d ended with %d", i, pf.code(vaults[i]))
 		}
 	}
-	waitParked(0)
-	f.expectFrom(hostA, collectReq(vaults[3]), 200, "")
+}
+
+// N2: WebSocket sessions do not live for ever.
+func TestWebSocketSessionHasAMaximumLifetime(t *testing.T) {
+	f := newFixtureWith(t, nil, func(*fixture) []Option { return []Option{WithWebSocketLifetime(200 * time.Millisecond)} })
+	owner := newPrincipal(1)
+	f.register(owner)
+	c, _, err := f.dialWS(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.CloseNow()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := c.Read(ctx); websocket.CloseStatus(err) != websocket.StatusTryAgainLater {
+		t.Fatalf("want close 1013 at the session's maximum lifetime, got %v", err)
+	}
 }
 
 // F6: a full table of held keys charges nobody: an orphan it has no room
 // for is not held, and its repeats are not charged to its network.
 func TestFullTablesChargeNobody(t *testing.T) {
 	f := newFixture(t, failBudget(3))
-	f.s.orphans = ratelimit.NewHold(time.Second, time.Minute, 1)
-	f.s.onceSeen = ratelimit.NewRecent(time.Minute, 1)
+	f.s.orphans = ratelimit.NewHold(time.Second, time.Minute, 1, 0)
+	f.s.onceSeen = ratelimit.NewRecent(time.Minute, 1, 0)
 	first, second := newPrincipal(7), newPrincipal(8)
 	f.expectFrom(hostB, collectReq(first), 404, CodeMailboxUnknown) // fills the table; one unit to hostB
 	for i := 0; i < 10; i++ {
@@ -495,5 +580,272 @@ func TestFloodGuardBurstCarriesAHostAtOnce(t *testing.T) {
 		// 4,000 is the burst: 3,000 used, so this one still fits.
 	} else {
 		t.Fatalf("after the mass unlock: %d", code)
+	}
+}
+
+// ---- Second review (N1–N7), and the pools seen from an honest vault.
+
+// honestVault checks that a registered vault, from its own address, gets
+// everything it does served: registering its key again, collecting (with
+// and without waiting), acking, depositing, rotating.
+func honestVault(t *testing.T, pf *parkedFixture, addr string, seed byte) {
+	t.Helper()
+	f := pf.fixture
+	v, peer, next := newPrincipal(seed), newPrincipal(seed+1), newPrincipal(seed+2)
+	if _, err := f.st.Register(t.Context(), v.mbx, v.pub); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.Register(t.Context(), peer.mbx, peer.pub); err != nil {
+		t.Fatal(err)
+	}
+	f.expectFrom(addr, registerReq(v), 200, "")
+	tok := f.mint(peer, v, nil)
+	f.expectFrom(addr, depositReq(peer, v, tok, "from the honest vault"), 201, "")
+	big := req{method: "POST", path: "/v1/mailbox/" + peer.mbx, body: depositBody(make([]byte, 200_000)), signer: &v, token: tok}
+	f.expectFrom(addr, big, 201, "")
+	f.expectFrom(addr, collectReq(v), 200, "") // wait=0
+	f.expectFrom(addr, req{method: "DELETE", path: "/v1/mailbox/01ARZ3NDEKTSV4RRFFQ69G5FAV", signer: &v}, 204, "")
+	before := f.s.hub.collectors()
+	pf.park(addr, v) // wait=25
+	deadline := time.Now().Add(5 * time.Second)
+	for f.s.m.parked.Value() == 0 || (f.s.hub.collectors() == before && f.s.m.shed.Value() == 0) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the honest vault's long-poll was not admitted (collectors %d)", f.s.hub.collectors())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// Its long-poll is woken by a deposit, like anyone's.
+	back := f.mint(v, peer, nil)
+	f.expectFrom(addr, depositReq(v, peer, back, "wake"), 201, "")
+	deadline = time.Now().Add(5 * time.Second)
+	for pf.code(v) != 200 {
+		if time.Now().After(deadline) {
+			t.Fatal("the honest vault's long-poll did not return its message")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	proof := ed25519.Sign(next.priv, []byte(v.mbx))
+	body, _ := json.Marshal(map[string]any{"new_pubkey": next.b64, "new_key_proof": proof})
+	f.expectFrom(addr, req{method: "POST", path: "/v1/mailbox/rotate", body: body, signer: &v}, 200, "")
+}
+
+// N1: addresses with no credentials cannot hold the memory for request
+// bodies: announcing bodies reserves nothing, sending them fills only the
+// attackers' own share of the pool for unauthenticated bodies, and never
+// the pools an honest vault's requests are read from.
+func TestBodyPoolsCannotBeHeldByUnauthenticatedAddresses(t *testing.T) {
+	pf := newParkedFixture(t, 100, 100)
+	f := pf.fixture
+	target := newPrincipal(1)
+	f.register(target)
+	var conns []net.Conn
+	t.Cleanup(func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+	send := func(path string, header string, announce, bytes int) {
+		c, err := net.Dial("tcp", f.ts.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+		fmt.Fprintf(c, "POST %s HTTP/1.1\r\nHost: relay\r\n%sContent-Length: %d\r\n\r\n", path, header, announce)
+		c.Write(make([]byte, bytes))
+	}
+	limit := int(f.s.depositBodyLimit())
+	h := http.Header{}
+	auth.SetHeaders(h, target.priv, "POST", "/v1/elsewhere", f.sigTime(), auth.BodyHash(nil))
+	sig := fmt.Sprintf("X-VettID-Key: %s\r\nX-VettID-Timestamp: %s\r\nX-VettID-Sig: %s\r\nAuthorization: VettID-Deposit x\r\n", h.Get(auth.HeaderKey), h.Get(auth.HeaderTimestamp), h.Get(auth.HeaderSig))
+	// (a) 400 deposits and 400 registrations that announce a full body and
+	// send none; with well-formed signature headers naming a real key.
+	for i := 0; i < 400; i++ {
+		send("/v1/mailbox/"+target.mbx, sig, limit, 0)
+		send("/v1/register", "", smallBodyLimit, 0)
+	}
+	time.Sleep(300 * time.Millisecond)
+	open, _ := f.s.openBodies.inFlight()
+	keyed, _ := f.s.keyedBodies.inFlight()
+	small, _ := f.s.smallBodies.inFlight()
+	t.Logf("800 requests announcing %d MiB in all, no body sent: bytes held: open %d, keyed %d, small %d", (400*limit+400*smallBodyLimit)>>20, open, keyed, small)
+	if keyed != 0 || open > 400*bodyChunk || small > 400*bodyChunk {
+		t.Fatalf("announced bodies hold memory: open %d, keyed %d, small %d", open, keyed, small)
+	}
+	// (b) The same deposits, now sending all but the last byte, to hold
+	// what they can (the fixture's server sees them all from 127.0.0.1:
+	// one network, so they are bounded by one network's share).
+	for i := 0; i < 20; i++ {
+		send("/v1/mailbox/"+target.mbx, sig, limit, limit-1)
+	}
+	time.Sleep(500 * time.Millisecond)
+	open, _ = f.s.openBodies.inFlight()
+	keyed, _ = f.s.keyedBodies.inFlight()
+	t.Logf("20 stalled deposit bodies of %d KiB under a real key's name: bytes held: open %d (one network's share: %d), keyed %d", limit>>10, open, f.cfg.MaxOpenBodyBytesPerNetwork, keyed)
+	if keyed != 0 || open > f.cfg.MaxOpenBodyBytesPerNetwork {
+		t.Fatalf("stalled bodies: open %d (cap per network %d), keyed %d", open, f.cfg.MaxOpenBodyBytesPerNetwork, keyed)
+	}
+	// Meanwhile an honest vault, from another address, is served in full.
+	honestVault(t, pf, hostB, 50)
+}
+
+// N2: addresses holding as many parked collectors as the process allows
+// (WebSocket sessions and long-polls of mailboxes they registered) cannot
+// shut out a vault's collect.
+func TestCollectorCapCannotLockOutAVault(t *testing.T) {
+	pf := newParkedFixture(t, 30, 60)
+	f := pf.fixture
+	// Two addresses, 30 registered mailboxes each: one holds WebSocket
+	// sessions, the other long-polls. The process is full.
+	for i := 0; i < 30; i++ {
+		p := simPrincipal("squatter-ws", i)
+		if _, err := f.st.Register(t.Context(), p.mbx, p.pub); err != nil {
+			t.Fatal(err)
+		}
+		c, _, err := f.dialWS(p) // from 127.0.0.1
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.CloseNow() })
+		q := simPrincipal("squatter-poll", i)
+		if _, err := f.st.Register(t.Context(), q.mbx, q.pub); err != nil {
+			t.Fatal(err)
+		}
+		pf.park(hostA, q)
+	}
+	pf.waitParked(60)
+	for i := byte(0); i < 5; i++ { // five honest vaults, one after the other
+		honestVault(t, pf, hostB, 100+10*i)
+	}
+	if f.s.hub.collectors() > 60 {
+		t.Fatalf("parked collectors %d over the process cap", f.s.hub.collectors())
+	}
+	if f.s.m.shed.Value() < 1 {
+		t.Fatal("nobody was shed: the squatters kept every place")
+	}
+	pf.ft.fire()
+}
+
+// N3: re-checking a held key's mailbox is a store read, so it comes after
+// the flood guard: many held keys asking at once cost the store no more
+// than the flood guard lets through.
+func TestHoldRecheckIsBoundedByFloodGuard(t *testing.T) {
+	f := newFixtureWith(t, func(c *config.Config) {
+		failBudget(1)(c)
+		c.RateIPPerSec, c.RateIPBurst = 0.01, 600
+	}, func(*fixture) []Option { return []Option{WithNoMailboxHold(time.Minute)} })
+	st := &countingStore{Backend: f.s.st}
+	f.s.st = st
+	keys := make([]principal, 500)
+	for i := range keys {
+		keys[i] = simPrincipal("held", i)
+		f.expectFrom(hostA, collectReq(keys[i]), 404, CodeMailboxUnknown) // held now; hostA penalised
+	}
+	f.clk.add(20 * time.Second) // every hold is due a re-check; the flood guard has 100 tokens left
+	st.mailbox.Store(0)
+	refused := 0
+	for round := 0; round < 3; round++ {
+		for i := range keys {
+			if code, _, _ := f.from(hostA, collectReq(keys[i])); code == 429 {
+				refused++
+			}
+		}
+	}
+	if got := st.mailbox.Load(); got > 100 || refused != 1500 {
+		t.Fatalf("1,500 requests by 500 held keys: %d store reads (flood guard had 100 tokens), %d refused", got, refused)
+	}
+}
+
+type countingStore struct {
+	store.Backend
+	mailbox atomic.Int64
+}
+
+func (c *countingStore) Mailbox(ctx context.Context, id string) (store.Mailbox, error) {
+	c.mailbox.Add(1)
+	return c.Backend.Mailbox(ctx, id)
+}
+
+// N4: on a penalised address, someone fetching claims cannot take the
+// trickle that properly signed new registrations and rotations get.
+func TestClaimFetchesCannotStarveNewMailboxes(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		d := config.Defaults()
+		failBudget(1)(c)
+		c.RateAuthFailPerSec = 0.001
+		c.RateTricklePerSec, c.RateTrickleBurst = d.RateTricklePerSec, d.RateTrickleBurst
+	})
+	f.expectFrom(hostA, req{method: "GET", path: "/v1/mailbox"}, 401, CodeSignatureInvalid) // penalised for the whole test
+	fetched, enrolled, tried := 0, 0, 0
+	for sec := 0; sec < 600; sec++ {
+		if code, _, _ := f.from(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa"}); code == 404 {
+			fetched++
+		}
+		if sec%15 == 0 { // a new member every 15 s
+			tried++
+			if code, _, _ := f.from(hostA, registerReq(simPrincipal("enrol", sec))); code == 201 {
+				enrolled++
+			}
+		}
+		f.clk.add(time.Second)
+	}
+	if enrolled != tried || fetched < 55 || fetched > 65 {
+		t.Fatalf("10 min on a penalised address: claim fetches let through %d (their own trickle: about 60), new mailboxes %d of %d", fetched, enrolled, tried)
+	}
+}
+
+// N6: a refused deposit by a signer that got in through the trickle and
+// has no mailbox is charged to its network once a minute, not every time.
+func TestMailboxlessSenderChargedOncePerMinute(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		failBudget(1)(c)
+		c.RateAuthFailPerSec = 0.001
+	})
+	owner, passerby, gone := newPrincipal(1), newPrincipal(3), newPrincipal(8)
+	f.register(owner)
+	tok := f.mint(owner, passerby, nil)
+	f.expectFrom(hostA, req{method: "GET", path: "/v1/mailbox"}, 401, CodeSignatureInvalid) // penalised
+	before := f.s.rl.charged.Value()
+	st := &countingStore{Backend: f.s.st}
+	f.s.st = st
+	for i := 0; i < 30; i++ {
+		f.expectFrom(hostA, depositReq(gone, passerby, tok, "x"), 404, CodeMailboxUnknown)
+		f.clk.add(time.Second)
+	}
+	if got := f.s.rl.charged.Value() - before; got != 1 {
+		t.Fatalf("30 refused deposits in 30 s by one signer without a mailbox: %d units charged to its network", got)
+	}
+}
+
+// N7: a deposit whose token has verified has minutes for its body, not
+// seconds: a slow link is not refused.
+func TestSlowDepositBodyIsReadOnceTheTokenVerified(t *testing.T) {
+	f := newFixtureWith(t, nil, func(*fixture) []Option { return []Option{WithBodyPace(150*time.Millisecond, 400*time.Millisecond)} })
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	tok := f.mint(owner, sender, nil)
+	body := depositBody(make([]byte, 3000))
+	hr := f.build(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: body, signer: &sender, token: tok})
+	c, err := net.Dial("tcp", f.ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	fmt.Fprintf(c, "POST %s HTTP/1.1\r\nHost: relay\r\nContent-Length: %d\r\n", hr.URL.Path, len(body))
+	for _, k := range []string{auth.HeaderKey, auth.HeaderTimestamp, auth.HeaderSig, "Authorization"} {
+		fmt.Fprintf(c, "%s: %s\r\n", k, hr.Header.Get(k))
+	}
+	fmt.Fprint(c, "\r\n")
+	// 1.2 s for the body, in ten pieces: three times the unauthenticated limit.
+	for i := 0; i < 10; i++ {
+		c.Write(body[i*len(body)/10 : (i+1)*len(body)/10])
+		time.Sleep(120 * time.Millisecond)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("slow deposit with a valid token: %v %v", resp, err)
+	}
+	if paceKeyed.total < 5*time.Minute || paceKeyed.idle < 30*time.Second {
+		t.Fatalf("pace for authenticated deposit bodies: %+v", paceKeyed)
 	}
 }

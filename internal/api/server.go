@@ -41,25 +41,26 @@ type Server struct {
 
 	replay ReplayGuard
 	// Rate limits (limits.go). "Network" is an IPv4 address or an IPv6 /64.
-	addrLimit   RateLimiter                                    // flood guard on /v1/, per network, before any parsing
-	fails       *ratelimit.Debt                                // failed authentications per network (always in-process)
-	verifyLimit RateLimiter                                    // signature checks per penalised network (always in-process)
-	orphans     *ratelimit.Hold                                // keys that signed properly and had no mailbox (always in-process)
-	onceSeen    *ratelimit.Recent                              // keys already charged once for a stale timestamp or a replay (always in-process)
-	keyFails    *ratelimit.Debt                                // refused deposits per sender key (always in-process)
-	pairFails   *ratelimit.Debt                                // refused deposits per sender key and mailbox (always in-process)
-	trickle     RateLimiter                                    // new mailboxes and claim fetches let through per penalised network (always in-process)
-	bodies      bodies                                         // request body bytes being read
-	bodyTimeout time.Duration                                  // how long one body may take to arrive
-	bodiesPeak  atomic.Int64                                   // thousandths of the process cap, since the last report
-	timer       func(time.Duration) (<-chan time.Time, func()) // long-poll deadline (tests inject the clock)
-	keyLimit    RateLimiter                                    // per authenticated key
-	subLimit    RateLimiter                                    // per sender key, on deposits and blob uploads
-	regLimit    RateLimiter                                    // new mailboxes per network
-	claimLimit  RateLimiter                                    // unauthenticated claim GETs per network
-	webLimit    RateLimiter                                    // everything outside /v1/ and /healthz, per network (always in-process)
-	rl          *limiterMetrics
-	retryJitter func() int // extra retry_after seconds for crowd refusals (tests; nil: random 0..4)
+	addrLimit                            RateLimiter                                    // flood guard on /v1/, per network, before any parsing
+	fails                                *ratelimit.Debt                                // failed authentications per network (always in-process)
+	verifyLimit                          RateLimiter                                    // signature checks per penalised network (always in-process)
+	orphans                              *ratelimit.Hold                                // keys that signed properly and had no mailbox (always in-process)
+	onceSeen                             *ratelimit.Recent                              // keys already charged once for a stale timestamp or a replay (always in-process)
+	keyFails                             *ratelimit.Debt                                // refused deposits per sender key (always in-process)
+	pairFails                            *ratelimit.Debt                                // refused deposits per sender key and mailbox (always in-process)
+	trickle                              RateLimiter                                    // new mailboxes and claim fetches let through per penalised network (always in-process)
+	trickleClaim                         RateLimiter                                    // unauthenticated claim fetches let through per penalised network (always in-process)
+	smallBodies, openBodies, keyedBodies *bodyPool                                      // memory held by request bodies being read (limits.go)
+	paceOpen                             bodyPace                                       // how fast a body has to arrive before its request is authenticated
+	wsLifetime                           time.Duration                                  // a WebSocket session's maximum life
+	timer                                func(time.Duration) (<-chan time.Time, func()) // long-poll deadline (tests inject the clock)
+	keyLimit                             RateLimiter                                    // per authenticated key
+	subLimit                             RateLimiter                                    // per sender key, on deposits and blob uploads
+	regLimit                             RateLimiter                                    // new mailboxes per network
+	claimLimit                           RateLimiter                                    // unauthenticated claim GETs per network
+	webLimit                             RateLimiter                                    // everything outside /v1/ and /healthz, per network (always in-process)
+	rl                                   *limiterMetrics
+	retryJitter                          func() int // extra retry_after seconds for crowd refusals (tests; nil: random 0..4)
 
 	web  *webDocs // /connect, /.well-known/assetlinks.json, /robots.txt (§6.11)
 	hsts bool     // public base URL is https: send Strict-Transport-Security
@@ -85,6 +86,7 @@ type serverMetrics struct {
 	rotations     metrics.Counter
 	deletions     metrics.Counter
 	parked        metrics.Gauge
+	shed          metrics.Counter
 	wsSessions    metrics.Gauge
 	blobPuts      metrics.Counter
 	blobBytes     metrics.Counter
@@ -110,6 +112,7 @@ func newServerMetrics(reg *metrics.Registry) *serverMetrics {
 		revocations:   reg.Counter("relay_denylist_entries_total", "Denylist entries added."),
 		rotations:     reg.Counter("relay_rotations_total", "Mailbox key rotations."),
 		deletions:     reg.Counter("relay_mailbox_deletions_total", "Mailboxes deleted by their owners (rotated predecessors included)."),
+		shed:          reg.Counter("relay_collectors_shed_total", "Parked collectors ended early to make room for a mailbox that had none."),
 		parked:        reg.Gauge("relay_parked_collectors", "Long-poll requests currently parked waiting for a deposit."),
 		wsSessions:    reg.Gauge("relay_ws_sessions", "Open WebSocket collect sessions."),
 		blobPuts:      reg.Counter("relay_blob_puts_total", "Blobs uploaded."),
@@ -152,27 +155,31 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 
 		blobSlots: make(chan struct{}, cfg.MaxConcurrentBlobTransfers),
 
-		replay:      auth.NewReplayCache(cfg.ReplayCacheMax),
-		addrLimit:   ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
-		fails:       ratelimit.NewDebt(cfg.RateAuthFailPerSec, cfg.RateAuthFailBurst, cfg.AuthFailMaxPenalty, 200_000),
-		verifyLimit: ratelimit.New(cfg.RateVerifyPerSec, cfg.RateVerifyBurst, 200_000),
-		orphans:     ratelimit.NewHold(holdBase, cfg.AuthFailMaxPenalty, maxHeldKeys),
-		onceSeen:    ratelimit.NewRecent(cfg.AuthFailMaxPenalty, maxHeldKeys),
-		pairFails:   ratelimit.NewDebt(pairFailRate, pairFailBurst, cfg.AuthFailMaxPenalty, maxHeldKeys),
-		trickle:     ratelimit.New(cfg.RateTricklePerSec, cfg.RateTrickleBurst, 200_000),
-		bodies:      bodies{perNet: map[string]int64{}},
-		bodyTimeout: bodyReadTimeout,
+		replay:       auth.NewReplayCache(cfg.ReplayCacheMax),
+		addrLimit:    ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, localKeys),
+		fails:        ratelimit.NewDebt(cfg.RateAuthFailPerSec, cfg.RateAuthFailBurst, cfg.AuthFailMaxPenalty, localKeys),
+		verifyLimit:  ratelimit.New(cfg.RateVerifyPerSec, cfg.RateVerifyBurst, localKeys),
+		orphans:      ratelimit.NewHold(holdBase, cfg.AuthFailMaxPenalty, maxHeldKeys, perNetworkKeys),
+		onceSeen:     ratelimit.NewRecent(cfg.AuthFailMaxPenalty, maxHeldKeys, perNetworkKeys),
+		pairFails:    ratelimit.NewDebt(pairFailRate, pairFailBurst, cfg.AuthFailMaxPenalty, maxHeldKeys),
+		trickle:      ratelimit.New(cfg.RateTricklePerSec, cfg.RateTrickleBurst, localKeys),
+		trickleClaim: ratelimit.New(cfg.RateTricklePerSec, cfg.RateTrickleBurst, localKeys),
+		smallBodies:  newBodyPool(smallBodyPool, smallBodyPoolPerNetwork),
+		openBodies:   newBodyPool(cfg.MaxOpenBodyBytes, cfg.MaxOpenBodyBytesPerNetwork),
+		keyedBodies:  newBodyPool(cfg.MaxBodyBytes, cfg.MaxBodyBytesPerNetwork),
+		paceOpen:     paceOpen,
+		wsLifetime:   wsMaxLifetime,
 		timer: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTimer(d)
 			return t.C, func() { t.Stop() }
 		},
 		keyFails:   ratelimit.NewDebt(cfg.RateKeyFailPerSec, cfg.RateKeyFailBurst, cfg.AuthFailMaxPenalty, maxHeldKeys),
-		keyLimit:   ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, 200_000),
-		subLimit:   ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
-		regLimit:   ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, 200_000),
-		claimLimit: ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
+		keyLimit:   ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, localKeys),
+		subLimit:   ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, localKeys),
+		regLimit:   ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, localKeys),
+		claimLimit: ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, localKeys),
 		rl:         newLimiterMetrics(reg),
-		webLimit:   ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
+		webLimit:   ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, localKeys),
 		hsts:       strings.HasPrefix(cfg.BaseURL, "https://"),
 	}
 	web, err := newWebDocs(cfg.AndroidPackage, cfg.AndroidCertFingerprints, s.hsts)
@@ -201,7 +208,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
 			c.Sweep(now)
 		}
-		for _, l := range []any{s.addrLimit, s.verifyLimit, s.fails, s.orphans, s.onceSeen, s.keyFails, s.pairFails, s.trickle, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
+		for _, l := range []any{s.addrLimit, s.verifyLimit, s.fails, s.orphans, s.onceSeen, s.keyFails, s.pairFails, s.trickle, s.trickleClaim, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
 			if p, ok := l.(interface{ Prune(time.Time) }); ok {
 				p.Prune(now)
 			}

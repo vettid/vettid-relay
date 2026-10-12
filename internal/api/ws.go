@@ -32,12 +32,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	addr := stateOf(w).addr
-	if why := s.hub.acquire(mb.ID, addr, s.cfg.MaxCollectorsPerMailbox, s.cfg.MaxCollectorsPerNetwork, s.cfg.MaxCollectors); why != "" {
+	col, why := s.hub.acquire(mb.ID, stateOf(w).addr, true, s.cfg.MaxCollectorsPerMailbox, s.cfg.MaxCollectorsPerNetwork, s.cfg.MaxCollectors)
+	if col == nil {
 		s.writeError(w, s.refuseCollector(why))
 		return
 	}
-	defer s.hub.release(mb.ID, addr)
+	defer s.hub.release(mb.ID, col)
 	gone := s.hub.goneCh(mb.ID)
 	if !s.stillRegistered(r.Context(), mb.ID) {
 		s.writeError(w, fail(CodeMailboxUnknown)) // deleted since authorization
@@ -110,6 +110,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ping := time.NewTicker(wsPingInterval)
 	defer ping.Stop()
+	// A session does not live for ever: a slot held by one upgrade request
+	// would otherwise cost nothing to keep. The client reconnects.
+	lifeC, stopLife := s.timer(s.wsLifetime)
+	defer stopLife()
 	gen := s.forceGen.Load()
 	for {
 		wake := s.hub.wait(mb.ID) // before leasing: no lost wakeups
@@ -151,6 +155,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			err := conn.Ping(pctx)
 			pcancel()
 			stop = err != nil
+		case <-lifeC:
+			conn.Close(websocket.StatusTryAgainLater, "session lifetime reached; reconnect")
+			stop = true
+		case <-col.shed: // its place went to a mailbox that had no collector
+			s.m.shed.Inc()
+			conn.Close(websocket.StatusTryAgainLater, CodeRateLimited)
+			stop = true
 		case <-gone: // the owner deleted the mailbox (§6.10)
 			conn.Close(wsStatusMailboxUnknown, CodeMailboxUnknown)
 			stop = true

@@ -129,7 +129,7 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_RATE_AUTHFAIL_RPS` / `RELAY_RATE_AUTHFAIL_BURST` | `1` / `60` | Budget, per client network and relay process, of failures nobody can be held to (wrong or missing signature, unknown claim, and once per key: a key without a mailbox, a replay, a stale timestamp). A network that has used it up is penalised: its requests are signature-checked first; requests signed by a key with a mailbox are served; claim fetches, new mailboxes and signers without a mailbox get through at a trickle. |
 | `RELAY_RATE_AUTHFAIL_MAX_PENALTY` | `1m` | Cap on every debt and hold: the longest a network stays penalised after its last failure, and the longest hold of a key without a mailbox. Between 1 s and 24 h. |
 | `RELAY_RATE_VERIFY_RPS` / `RELAY_RATE_VERIFY_BURST` | `1000` / `2000` | Signature checks per penalised network, per relay process: the only work done there for a request before its signature is known to be good. |
-| `RELAY_RATE_TRICKLE_RPS` / `RELAY_RATE_TRICKLE_BURST` | `0.1` / `3` | What a penalised network still gets, per relay process, of claim fetches, new mailboxes and deposits by signers without a mailbox. |
+| `RELAY_RATE_TRICKLE_RPS` / `RELAY_RATE_TRICKLE_BURST` | `0.1` / `3` | What a penalised network still gets, per relay process: one such bucket for properly signed new mailboxes, rotations and deposits by signers without a mailbox, and a separate one for unauthenticated claim fetches. |
 | `RELAY_RATE_KEYFAIL_RPS` / `RELAY_RATE_KEYFAIL_BURST` | `1` / `200` | Budget of refused deposits per sender key, per relay process (there is also a fixed one per sender and mailbox: 0.1/s, burst 5). A properly signed refused deposit is charged here, not to the network. A sender over it has its deposits refused until it refills; nothing else of it is affected. |
 | `RELAY_RATE_REGISTER_RPS` / `RELAY_RATE_REGISTER_BURST` | `1` / `100` | New mailboxes (registrations that create one, and rotations) per client network. Registering an existing key again is free. |
 | `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
@@ -137,8 +137,9 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
 | `RELAY_ANDROID_CERT_SHA256` | the official VettID app's signing keys | Comma-separated SHA-256 certificate fingerprints for `assetlinks.json`, colon-separated or plain hex, any case (served in uppercase colon form). The built-in default (`config.DefaultAndroidCertFingerprints`: the production upload key and the two staging signers) lets a self-hosted relay open links in the official app with no configuration. Set but empty turns `assetlinks.json` off (404). |
 | `RELAY_MAX_COLLECTORS_PER_MAILBOX` | `4` | Concurrent long-polls plus WebSockets per mailbox. |
-| `RELAY_MAX_COLLECTORS` / `RELAY_MAX_COLLECTORS_PER_NETWORK` | `6000` / `3000` | Parked long-polls plus WebSocket sessions per relay process, in all and per client network. Each holds a connection; the caps bound that memory. Over a cap: `429`. |
-| `RELAY_MAX_INFLIGHT_BODY_BYTES` / `RELAY_MAX_INFLIGHT_BODY_BYTES_PER_NETWORK` | `67108864` / `16777216` | Request body bytes being read (blob uploads have their own slots) per relay process, in all and per client network. A body has 20 s to arrive. Over a cap: `429`. |
+| `RELAY_MAX_COLLECTORS` / `RELAY_MAX_COLLECTORS_PER_NETWORK` | `4000` / `2500` | Parked long-polls plus WebSocket sessions per relay process, in all and per client network (about 45 KiB each, measured). A mailbox's first collector is always admitted: when the process is full, one collector of the network holding the most is ended early instead. A `wait=0` collect is never refused by these. WebSocket sessions live at most an hour. |
+| `RELAY_MAX_INFLIGHT_BODY_BYTES` / `RELAY_MAX_INFLIGHT_BODY_BYTES_PER_NETWORK` | `25165824` / `8388608` | Memory for deposit bodies being read after their token verified, per relay process, in all and per client network. Counted as bytes arrive. |
+| `RELAY_MAX_INFLIGHT_OPEN_BODY_BYTES` / `RELAY_MAX_INFLIGHT_OPEN_BODY_BYTES_PER_NETWORK` | `8388608` / `1048576` | The same for deposit bodies read before authentication (on a penalised network; to attribute a refused deposit). Each of the four must admit one largest deposit. Small bodies (registration and the like) have a fixed pool of 4 MiB, 512 KiB per network. |
 | `RELAY_REPLAY_CACHE_MAX` | `1000000` | Replay-cache capacity. When it's full, requests are shed with `rate_limited` and no live entries are evicted. |
 | `RELAY_SWEEP_INTERVAL` | `60s` | TTL sweeper period. The first pass is jittered. |
 | `RELAY_SHUTDOWN_TIMEOUT` | `20s` | Bound on the graceful drain after SIGTERM. |
@@ -155,9 +156,12 @@ Spec §7.2 has the rules and where each number comes from. In short:
   signed requests are the key's too.
 - **Blast radius.** Nothing keyed on an address refuses a request that is
   properly signed by a key with a mailbox, except the flood guard and the
-  resource caps (parked collectors, body bytes being read), all sized
-  well above a full host. One client behind an address cannot get the
-  others refused.
+  per-network resource caps, all sized well above a full host. One client
+  behind an address cannot get the others refused.
+- **Shared pools.** Nothing the whole process shares (parked collectors,
+  memory for bodies, the tables) can be filled by unauthenticated or cheap
+  traffic at the expense of a mailbox's holder: each pool has a reserved
+  share or a per-key guarantee, and a full pool sheds its heaviest holder.
 - Per network there are two things. A **flood guard** (`RELAY_RATE_IP_*`)
   sized for a whole host. And a small budget of **failures nobody can be
   held to** (`RELAY_RATE_AUTHFAIL_*`): wrong or missing signatures, unknown
@@ -176,16 +180,22 @@ Spec §7.2 has the rules and where each number comes from. In short:
   gone, asking again every second) is held for 1 s, 2 s, 4 s … up to the
   cap; its signed requests are refused before the store is read, and it
   costs its network one unit, once. Registering clears it, on any relay
-  process: a hold is checked against the store every 5 s before it
-  refuses.
+  process: before a hold refuses, the store is looked at again (after
+  the flood guard, at most once per quarter of the hold).
 - A refused deposit that is properly signed (an expired token, a peer that
   is gone) draws on the sender key's own budgets, per peer and overall
   (`RELAY_RATE_KEYFAIL_*`); one gone peer does not stop deposits to the
   others. A wrong clock or a client sending requests twice costs the
   network one unit per key and minute, and holds nobody.
-- Request bodies are read after the checks that need only headers (a
-  deposit's after §5.3 steps 1–6), count against per-network and
-  per-process caps while they are read, and have 20 s to arrive.
+- Request bodies: memory is counted as bytes arrive, never by the
+  announced length, in three pools (small bodies; deposits before
+  authentication; deposits after the token verified), and a body has to
+  keep arriving (5 s without a byte before authentication, 30 s after). A
+  deposit's body is read after §5.3 steps 1–6, except on a penalised
+  network and to attribute a refused deposit whose named key has a mailbox.
+- Parked collectors are capped per network and per process, but a
+  mailbox's first collector is always admitted (the heaviest network is
+  shed), and `wait=0` is never refused by those caps.
 - An attacker with many keys is not bounded by per-key limits (keys are
   free); the flood guard bounds it at `RELAY_RATE_IP_RPS` in total, and
   `RELAY_RATE_REGISTER_*` limits how fast one network can make mailboxes.
@@ -208,8 +218,10 @@ nothing identifies a client): `relay_ratelimit_allowed_total`,
 `relay_ratelimit_refused_total`, `relay_ratelimit_peak_permille` (how full
 the busiest bucket of each limiter got in the last full minute; 1000 means
 something was refused), `relay_ratelimit_authfail_charged_total`,
-`relay_ratelimit_penalised_networks`, `relay_ratelimit_held_keys`.
-Limiters: `address`, `verify`, `authfail`, `trickle`, `nomailbox`,
+`relay_ratelimit_penalised_networks`, `relay_ratelimit_held_keys`,
+`relay_collectors_shed_total`.
+Limiters: `address`, `verify`, `authfail`, `trickle`, `trickleclaim`,
+`nomailbox`,
 `keyfail`, `key`, `sender`, `register`, `claim`, `web`, `collectors`,
 `bodies`. Each process also logs
 one `rate limits` line a minute with the same peaks and the refusals of
@@ -238,7 +250,20 @@ misbehaving neighbour. The "old" limiter in these is this code with its
 limits set to what `main` had (one per-address bucket, everything else
 off), not `main`'s code. A long-poll is counted when it is issued, so the
 simulation issues it with `wait=0`; real parked collects are covered by
-`TestParkedCollectorsAreCapped`.
+`TestParkedCollectorsAreCappedWithoutLockingAnyoneOut`.
+
+### Memory budget
+
+Measured with `RELAY_MEASURE=1 go test ./internal/api -run TestMeasureMemory -v`
+(Go heap and stacks of the relay; x86): a parked long-poll 42 KiB, a
+WebSocket session 45 KiB, a key in a table 110 to 140 bytes. With the
+defaults, at worst: parked collectors 180 MiB (4,000), bodies 36 MiB, blob
+transfers 64 MiB (8 slots of 8 MiB), tables 45 MiB, the rest about 30 MiB:
+about 355 MiB. Run a 512 MiB task with `GOMEMLIMIT=400MiB` (set it in the
+deployment: it depends on the task size, so the image does not), and
+scale the service on the number of parked collectors
+(`relay_active_collectors`; also `collectors` in the `rate limits` log
+line): CPU and memory tracking do not react to parked connections.
 
 ## Deployment notes
 
