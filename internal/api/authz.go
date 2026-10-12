@@ -125,7 +125,6 @@ func (s *Server) verifySender(w http.ResponseWriter, r *http.Request, da *deposi
 	} else if subtle.ConstantTimeCompare(signed.Key, da.claims.SubKey) != 1 {
 		return "", s.depositFailed(w, r, fail(CodeSignatureInvalid), signed, nil)
 	}
-	s.authenticated(w, signed.Key)
 	return sender, nil
 }
 
@@ -133,13 +132,17 @@ func (s *Server) verifySender(w http.ResponseWriter, r *http.Request, da *deposi
 func (s *Server) verifySignature(w http.ResponseWriter, r *http.Request, bodyHash [32]byte) (auth.SignedRequest, *apiError) {
 	sr, err := auth.ParseHeaders(r.Header)
 	if err != nil {
-		return sr, s.authFailed(w, fail(CodeSignatureInvalid), true)
+		return sr, s.authFailed(w, fail(CodeSignatureInvalid))
 	}
 	switch err := sr.Verify(r.Method, r.URL.EscapedPath(), bodyHash, s.now()); {
 	case errors.Is(err, auth.ErrTimestampStale):
-		return sr, s.authFailed(w, fail(CodeTimestampStale), true)
+		// A wrong clock, not a wrong key, if the signature is good.
+		if sr.SignatureValid(r.Method, r.URL.EscapedPath(), bodyHash) {
+			return sr, s.staleFailed(w, fail(CodeTimestampStale), sr.Key)
+		}
+		return sr, s.authFailed(w, fail(CodeTimestampStale))
 	case err != nil:
-		return sr, s.authFailed(w, fail(CodeSignatureInvalid), true)
+		return sr, s.authFailed(w, fail(CodeSignatureInvalid))
 	}
 	return sr, nil
 }
@@ -148,7 +151,7 @@ func (s *Server) checkReplay(w http.ResponseWriter, sr auth.SignedRequest) *apiE
 	switch err := s.replay.Check(sr, s.now()); {
 	case errors.Is(err, auth.ErrReplay):
 		// Anyone who saw the request can replay it: no key is proven.
-		return s.authFailed(w, fail(CodeReplayDetected), false)
+		return s.authFailed(w, fail(CodeReplayDetected))
 	case errors.Is(err, auth.ErrReplayCacheFull):
 		s.log.Warn("replay cache full or unavailable; shedding load", "err", err)
 		return &apiError{code: CodeRateLimited, retryAfter: 5}
@@ -167,7 +170,12 @@ func (s *Server) authorizeSigner(w http.ResponseWriter, r *http.Request, bodyHas
 	if e != nil {
 		return sr, e
 	}
-	return sr, s.checkReplay(w, sr)
+	if e := s.checkReplay(w, sr); e != nil {
+		return sr, e
+	}
+	// On a penalised network the flood guard was put off until here, so
+	// that the network's bad requests cannot use up what its good ones need.
+	return sr, s.floodGuard(w)
 }
 
 // authorizeOwner authenticates an owner route (collect, ack, denylist,
@@ -182,16 +190,15 @@ func (s *Server) authorizeOwner(ctx context.Context, w http.ResponseWriter, r *h
 	}
 	mb, err := s.st.Mailbox(ctx, auth.MailboxID(sr.Key))
 	if errors.Is(err, store.ErrNotFound) {
-		return store.Mailbox{}, s.noStanding(w, fail(CodeMailboxUnknown), sr.Key)
+		return store.Mailbox{}, s.noMailbox(w, fail(CodeMailboxUnknown), sr.Key)
 	}
 	if err != nil {
 		s.log.Error("mailbox lookup failed", "err", err)
 		return store.Mailbox{}, fail(CodeInternal)
 	}
 	if subtle.ConstantTimeCompare(mb.PubKey, sr.Key) != 1 {
-		return store.Mailbox{}, s.noStanding(w, fail(CodeMailboxUnknown), sr.Key)
+		return store.Mailbox{}, s.noMailbox(w, fail(CodeMailboxUnknown), sr.Key)
 	}
-	s.authenticated(w, sr.Key)
 	if e := s.allowKey(sr.Key); e != nil {
 		return store.Mailbox{}, e
 	}

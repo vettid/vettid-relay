@@ -172,6 +172,13 @@ func ParseHeaders(h http.Header) (SignedRequest, error) {
 	return SignedRequest{Key: k, Timestamp: ts[0], Time: t, Sig: sig}, nil
 }
 
+// SignatureValid checks only the signature over the canonical digest, not
+// freshness: whether the holder of sr.Key signed this request at some time.
+func (sr SignedRequest) SignatureValid(method, path string, bodyHash [32]byte) bool {
+	dg := Digest(method, path, sr.Timestamp, bodyHash)
+	return ed25519.Verify(sr.Key, dg[:], sr.Sig)
+}
+
 // Verify checks freshness (±FreshnessWindow around now) and the signature
 // over the canonical digest. It does not consult the replay cache.
 func (sr SignedRequest) Verify(method, path string, bodyHash [32]byte, now time.Time) error {

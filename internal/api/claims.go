@@ -75,6 +75,15 @@ func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 // GET /v1/claim/{claim_id} — unauthenticated, rate-limited per client
 // network, single fetch. Every miss is the same 404 claim_unknown.
 func (s *Server) handleClaimGet(w http.ResponseWriter, r *http.Request) {
+	// Unauthenticated: a penalised network's fetches wait, whatever
+	// headers they carry (limits.go).
+	if st := stateOf(w); st.penalised {
+		if e := s.penalty(st.addr); e != nil {
+			s.rl.refused.With(limAuthFail).Inc()
+			s.writeError(w, e)
+			return
+		}
+	}
 	if e := s.take(limClaim, s.claimLimit, rateKey(clientIP(r, s.cfg.TrustProxy)), false); e != nil {
 		s.writeError(w, e)
 		return
@@ -83,13 +92,13 @@ func (s *Server) handleClaimGet(w http.ResponseWriter, r *http.Request) {
 	// against the network's budget (limits.go).
 	id := r.PathValue("claim_id")
 	if _, ok := auth.ParseClaimID(id); !ok {
-		s.writeError(w, s.authFailed(w, fail(CodeClaimUnknown), false))
+		s.writeError(w, s.authFailed(w, fail(CodeClaimUnknown)))
 		return
 	}
 	data, err := s.st.TakeClaim(r.Context(), id)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		s.writeError(w, s.authFailed(w, fail(CodeClaimUnknown), false))
+		s.writeError(w, s.authFailed(w, fail(CodeClaimUnknown)))
 		return
 	case err != nil:
 		s.log.Error("claim get failed", "err", err)

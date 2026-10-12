@@ -166,14 +166,14 @@ func rateKey(a netip.Addr) string {
 	return p.String()
 }
 
-// withIPRateLimit applies the per-network limits that come before anything
-// else (tokens, signatures, bodies) is examined (spec §7.2, §8.5).
+// withIPRateLimit applies what comes before a request's handler (spec
+// §7.2, limits.go).
 //
-// /v1/: first the failed-authentication budget: a network that has used it
-// up gets no unauthenticated work done, so only a request naming a key
-// that authenticated from that network recently goes on (its signature is
-// then checked first, authz.go). Reading one header and two map lookups
-// are all that happens before that decision. Then the flood guard.
+// /v1/: a key held for having no mailbox is refused by its header. Then, on
+// a network with failed-authentication budget, the flood guard. On a
+// penalised network the flood guard waits until the request's signature
+// has verified (authz.go): a request without a key is refused here, the
+// others pass the signature-check guard.
 //
 // Everything else (/connect, /.well-known/, /robots.txt and every unknown
 // path): a separate web bucket, so scanners spend their own budget and
@@ -183,22 +183,27 @@ func (s *Server) withIPRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case isAPIPath(r.URL.Path):
-			addr := rateKey(clientIP(r, s.cfg.TrustProxy))
+			if e := s.heldKey(r); e != nil {
+				s.writeError(w, e)
+				return
+			}
 			st := stateOf(w)
-			if e := s.penalty(addr); e != nil {
+			st.addr = rateKey(clientIP(r, s.cfg.TrustProxy))
+			if e := s.penalty(st.addr); e != nil {
 				st.penalised = true
-				k := headerKey(r)
-				if k == "" || !s.known.Has(knownKey(addr, k), s.now()) {
+				if headerKey(r) == "" {
 					s.rl.refused.With(limAuthFail).Inc()
 					s.writeError(w, e)
 					return
 				}
-			}
-			if e := s.take(limAddress, s.addrLimit, addr, true); e != nil {
+				if e := s.take(limVerify, s.verifyLimit, st.addr, true); e != nil {
+					s.writeError(w, e)
+					return
+				}
+			} else if e := s.floodGuard(w); e != nil {
 				s.writeError(w, e)
 				return
 			}
-			st.addr = addr
 		case r.URL.Path != "/healthz":
 			if e := s.take(limWeb, s.webLimit, rateKey(clientIP(r, s.cfg.TrustProxy)), false); e != nil {
 				s.writeError(w, e)

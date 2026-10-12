@@ -38,15 +38,12 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mailboxID := r.PathValue("mailbox_id")
-	// A network out of failed-authentication budget gets no unauthenticated
-	// work (limits.go). An upload's signature cannot be checked before its
-	// body is read, so uploads from it wait until it has budget again.
-	if st := stateOf(w); st.penalised {
-		if e := s.penalty(st.addr); e != nil {
-			s.rl.refused.With(limAuthFail).Inc()
-			s.writeError(w, e)
-			return
-		}
+	// An upload's signature cannot be checked before its body is read, so
+	// on a penalised network (where the flood guard otherwise waits for
+	// the signature, limits.go) it meets the flood guard here.
+	if e := s.floodGuard(w); e != nil {
+		s.writeError(w, e)
+		return
 	}
 	if e := s.senderOverFailures(r); e != nil {
 		s.writeError(w, e)

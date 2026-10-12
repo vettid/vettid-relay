@@ -58,10 +58,10 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(ids) == 0 {
 		// Nothing was registered under this key. The answer is still 204
-		// (idempotent), but a request by a key without a mailbox counts
-		// against its network like any other (limits.go): fresh keys are
-		// free to make, and each of these costs a store query.
-		s.noStanding(w, nil, sr.Key)
+		// (idempotent), but the key is one without a mailbox like any other
+		// (limits.go noMailbox): fresh keys are free to make, and each of
+		// these costs a store query.
+		s.noMailbox(w, nil, sr.Key)
 	}
 	s.m.deletions.Add(int64(len(ids)))
 	setLog(w, "count", len(ids))

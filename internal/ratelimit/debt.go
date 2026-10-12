@@ -39,17 +39,20 @@ func NewDebt(rate float64, burst int, maxPenalty time.Duration, maxKeys int) *De
 // still has one whole unit left.
 func (d *Debt) allowance() time.Duration { return time.Duration(d.burst-1) * d.per }
 
-// Charge records one event for key.
-func (d *Debt) Charge(key string, now time.Time) {
+// Charge records one event for key. It reports whether the key had its
+// full budget before (its first event for a while; always true for a key
+// that goes untracked because the table is full).
+func (d *Debt) Charge(key string, now time.Time) (first bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	t, ok := d.tat[key]
 	if !ok && len(d.tat) >= d.maxKeys {
 		d.pruneLocked(now)
 		if len(d.tat) >= d.maxKeys {
-			return // table full of live keys: this one goes untracked
+			return true // table full of live keys: this one goes untracked
 		}
 	}
+	first = !t.After(now)
 	if t.Before(now) {
 		t = now
 	}
@@ -61,6 +64,7 @@ func (d *Debt) Charge(key string, now time.Time) {
 	if used := float64(t.Sub(now)) / float64(time.Duration(d.burst)*d.per); used > d.peak {
 		d.peak = min(used, 1)
 	}
+	return first
 }
 
 // Wait returns 0 while key has budget left, otherwise how long until one
@@ -194,4 +198,97 @@ func (r *Recent) Len() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.m)
+}
+
+// Hold is a bounded negative cache with a growing penalty: each Fail for a
+// key holds it for twice as long as the one before (base, 2×base, … max),
+// and Wait says how long a key is still held. The relay uses it for keys
+// that sign correctly but turned out to have no mailbox: whoever keeps
+// asking is answered from this table instead of from the store, less and
+// less often. An entry is forgotten max after its hold ended.
+type Hold struct {
+	base, max time.Duration
+	maxKeys   int
+
+	mu sync.Mutex
+	m  map[string]holdEntry
+}
+
+type holdEntry struct {
+	until  time.Time
+	streak int
+}
+
+// NewHold returns a table holding at most maxKeys keys.
+func NewHold(base, max time.Duration, maxKeys int) *Hold {
+	return &Hold{base: base, max: max, maxKeys: maxKeys, m: map[string]holdEntry{}}
+}
+
+// Fail records one failure of key and holds it. It reports whether the key
+// was new to the table: true once per key for as long as it keeps failing
+// (and every time if the table is full of live keys, where the key goes
+// untracked).
+func (h *Hold) Fail(key string, now time.Time) (first bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	e, ok := h.m[key]
+	if ok && now.After(e.until.Add(h.max)) {
+		ok = false
+	}
+	if !ok {
+		if _, present := h.m[key]; !present && len(h.m) >= h.maxKeys {
+			h.pruneLocked(now)
+			if len(h.m) >= h.maxKeys {
+				return true
+			}
+		}
+		e = holdEntry{}
+	}
+	e.streak++
+	d := h.max
+	if e.streak <= 30 {
+		d = min(h.base<<(e.streak-1), h.max)
+	}
+	e.until = now.Add(d)
+	h.m[key] = e
+	return !ok
+}
+
+// Wait returns how long key is still held (0: not held).
+func (h *Hold) Wait(key string, now time.Time) time.Duration {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if e, ok := h.m[key]; ok && e.until.After(now) {
+		return e.until.Sub(now)
+	}
+	return 0
+}
+
+// Clear forgets key.
+func (h *Hold) Clear(key string) {
+	h.mu.Lock()
+	delete(h.m, key)
+	h.mu.Unlock()
+}
+
+func (h *Hold) pruneLocked(now time.Time) {
+	for k, e := range h.m {
+		if now.After(e.until.Add(h.max)) {
+			delete(h.m, k)
+		}
+	}
+}
+
+// Prune drops forgotten keys; run periodically.
+func (h *Hold) Prune(now time.Time) {
+	h.mu.Lock()
+	h.pruneLocked(now)
+	h.mu.Unlock()
+}
+
+// Len returns the number of keys in the table.
+func (h *Hold) Len() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.m)
 }

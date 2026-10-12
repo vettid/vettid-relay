@@ -105,170 +105,277 @@ func TestKeyLimitIsNoOracle(t *testing.T) {
 	f.expectFrom(hostB, req{method: "POST", path: "/v1/mailbox/" + a.mbx, body: depositBody([]byte("x")), signer: &stranger, token: tok}, 201, "")
 }
 
+// keyHeader names p's key without signing anything.
+func keyHeader(p principal) http.Header {
+	h := http.Header{}
+	h.Set(auth.HeaderKey, p.b64)
+	return h
+}
+
 func failBudget(burst int) func(*config.Config) {
 	return func(c *config.Config) {
 		c.RateAuthFailPerSec, c.RateAuthFailBurst, c.AuthFailMaxPenalty = 0.1, burst, time.Minute
 	}
 }
 
-// The failed-authentication budget: failures are what an address is limited
-// by. Once it is used up the relay does nothing unauthenticated for that
-// address, and the keys that were already authenticating from it carry on.
-func TestAuthFailBudget(t *testing.T) {
-	f := newFixtureWith(t, failBudget(3), func(*fixture) []Option { return []Option{WithRetryJitter(func() int { return 2 })} })
-	vault, late, stranger := newPrincipal(1), newPrincipal(2), newPrincipal(9)
-	f.register(vault)
-	f.register(late)
-	f.expectFrom(hostA, collectReq(vault), 200, "") // vault is known at hostA
+func depositReq(to, signer principal, tok, payload string) req {
+	return req{method: "POST", path: "/v1/mailbox/" + to.mbx, body: depositBody([]byte(payload)), signer: &signer, token: tok}
+}
 
+// The blast-radius rule: a network that is out of failed-authentication
+// budget still has every request served that is properly signed by a key
+// with a mailbox, whether or not that key was seen there before. What
+// waits is what is not that: unsigned requests, claim fetches, new
+// mailboxes, signers without a mailbox.
+func TestPenalisedNetworkServesEveryMailbox(t *testing.T) {
+	f := newFixtureWith(t, failBudget(3), func(*fixture) []Option { return []Option{WithRetryJitter(func() int { return 2 })} })
+	vault, late, owner, stranger, fresh := newPrincipal(1), newPrincipal(2), newPrincipal(3), newPrincipal(9), newPrincipal(10)
+	for _, p := range []principal{vault, late, owner} {
+		f.register(p)
+	}
+	tok := f.mint(owner, vault, nil)
+	strangerTok := f.mint(owner, stranger, nil)
 	for i := 0; i < 3; i++ {
 		f.expectFrom(hostA, badSig(f, stranger), 401, CodeSignatureInvalid)
 	}
-	// Budget used up: anything not carrying a known key is refused unparsed.
-	e := f.expectFrom(hostA, badSig(f, stranger), 429, CodeRateLimited)
-	if e.RetryAfter != 10+2 {
-		t.Fatalf("retry_after %d, want the refill time (10 s) plus jitter (2)", e.RetryAfter)
-	}
-	f.expectFrom(hostA, req{method: "GET", path: "/v1/mailbox"}, 429, CodeRateLimited)
-	f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa"}, 429, CodeRateLimited)
-	f.expectFrom(hostA, collectReq(late), 429, CodeRateLimited) // a valid key that was not seen here before waits too
-	// The key that was authenticating from this address is not touched.
-	for i := 0; i < 5; i++ {
-		f.expectFrom(hostA, collectReq(vault), 200, "")
-	}
-	// Other addresses are not involved, IPv4 or IPv6.
-	f.expectFrom(hostB, collectReq(late), 200, "")
-	f.expectFrom(hostB, badSig(f, stranger), 401, CodeSignatureInvalid)
-	// A wrong signature under the known key is answered like an unknown
-	// key's (so the answer does not say the key is in use at this address)
-	// and does not cost the key its standing (anyone can send one).
-	f.expectFrom(hostA, badSig(f, vault), 429, CodeRateLimited)
-	f.expectFrom(hostA, collectReq(vault), 200, "")
 	if n := f.s.fails.Exhausted(f.clk.now()); n != 1 {
 		t.Fatalf("penalised networks: %d", n)
 	}
-	// The budget refills; debts are paid first (4 failures ran it up).
-	f.clk.add(9 * time.Second)
-	f.expectFrom(hostA, collectReq(late), 429, CodeRateLimited)
-	f.clk.add(11 * time.Second)
+	// Unauthenticated work waits.
+	e := f.expectFrom(hostA, req{method: "GET", path: "/v1/mailbox"}, 429, CodeRateLimited)
+	if e.RetryAfter != 10+2 {
+		t.Fatalf("retry_after %d, want the refill time (10 s) plus jitter (2)", e.RetryAfter)
+	}
+	f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa"}, 429, CodeRateLimited)
+	f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa", header: keyHeader(vault)}, 429, CodeRateLimited)
+	f.expectFrom(hostA, registerReq(fresh), 429, CodeRateLimited)                            // a new mailbox
+	f.expectFrom(hostA, depositReq(owner, stranger, strangerTok, "x"), 429, CodeRateLimited) // a signer without a mailbox
+	// Everything properly signed by a key with a mailbox is served: a key
+	// never seen from this address (a vault unlocked after a night: its
+	// first request re-registers its existing key), owner routes, deposits,
+	// blob uploads.
+	f.expectFrom(hostA, registerReq(late), 200, "")
 	f.expectFrom(hostA, collectReq(late), 200, "")
-	f.expectFrom(hostA, badSig(f, stranger), 401, CodeSignatureInvalid)
+	f.expectFrom(hostA, collectReq(vault), 200, "")
+	f.expectFrom(hostA, depositReq(owner, vault, tok, "1"), 201, "")
+	if code, e, _ := f.from(hostA, req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: []byte("blob"), signer: &vault, token: tok}); code != 201 {
+		t.Fatalf("blob upload on a penalised network: %d %q", code, e.Code)
+	}
+	// A wrong signature is still just that; it is checked, and goes no further.
+	f.expectFrom(hostA, badSig(f, vault), 401, CodeSignatureInvalid)
+	f.expectFrom(hostA, collectReq(vault), 200, "")
+	// A refused deposit of a key with a mailbox is the key's own; answered as ever.
+	f.expectFrom(hostA, depositReq(stranger, vault, tok, "x"), 404, CodeMailboxUnknown)
+	// Other addresses are not involved.
+	f.expectFrom(hostB, registerReq(fresh), 201, "")
+	// On a penalised network the flood guard is met after the signature:
+	// the unsigned and wrongly signed requests above used none of it. (The
+	// fixture's 3 registrations, the 3 first failures, the 9 properly
+	// signed requests since, and hostB's.)
+	if got := f.s.rl.allowed.With(limAddress).Value(); got != 3+3+9+1 {
+		t.Fatalf("flood guard admissions: %d", got)
+	}
+	if got := f.s.rl.allowed.With(limVerify).Value(); got != 11 { // every request with a key header
+		t.Fatalf("signature-check guard admissions: %d", got)
+	}
+	f.clk.add(2 * time.Minute)
+	f.expectFrom(hostA, registerReq(newPrincipal(11)), 201, "")
+	f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa"}, 404, CodeClaimUnknown)
 }
 
-// A refused deposit that is properly signed by a key known at its address
-// is that key's failure, not its address's: one vault with expired tokens
-// does not spend the budget its whole host shares, and one key cannot keep
-// failing either.
+// One client whose mailbox is gone and that keeps asking (a vault retries
+// a collect answered mailbox_unknown every second) costs its network one
+// unit of failure budget, however long it goes on, and is itself refused by
+// its key, for longer each time.
+func TestOrphanCostsItsNetworkOnce(t *testing.T) {
+	f := newFixtureWith(t, func(c *config.Config) { failBudget(3)(c); c.AuthFailMaxPenalty = 10 * time.Minute },
+		func(*fixture) []Option { return []Option{WithNoMailboxHold(time.Second)} })
+	vault, orphan := newPrincipal(1), newPrincipal(7)
+	f.register(vault)
+	f.expectFrom(hostA, collectReq(orphan), 404, CodeMailboxUnknown)
+	// Held: refused by its header alone, signed or not, on every route but registration.
+	e := f.expectFrom(hostA, collectReq(orphan), 429, CodeRateLimited)
+	if e.RetryAfter != 1 {
+		t.Fatalf("first hold: retry_after %d", e.RetryAfter)
+	}
+	f.expectFrom(hostA, badSig(f, orphan), 429, CodeRateLimited)
+	f.expectFrom(hostB, req{method: "DELETE", path: "/v1/mailbox", signer: &orphan}, 429, CodeRateLimited)
+	// It comes back the moment each hold ends, for a week's worth of holds.
+	hold := time.Second
+	var told []int
+	for i := 0; i < 40; i++ {
+		f.clk.add(hold)
+		f.expectFrom(hostA, collectReq(orphan), 404, CodeMailboxUnknown)
+		hold = min(2*hold, 10*time.Minute)
+		e := f.expectFrom(hostA, collectReq(orphan), 429, CodeRateLimited)
+		told = append(told, e.RetryAfter)
+		f.expectFrom(hostA, collectReq(vault), 200, "") // its neighbours never notice
+	}
+	if told[0] != 2 || told[1] != 4 || told[4] != 32 || told[5] != 60 || told[39] != 60 {
+		t.Fatalf("retry_after does not grow to its cap: %v", told)
+	}
+	if f.s.fails.Exhausted(f.clk.now()) != 0 || f.s.fails.Len() > 1 {
+		t.Fatal("the orphan's repeats were charged to its network")
+	}
+	if v := f.s.rl.refused.With(limNoMailbox).Value(); v != 43 {
+		t.Fatalf("refused counter %d", v)
+	}
+	// Registration is the way out, held or not.
+	f.expectFrom(hostA, registerReq(orphan), 201, "")
+	f.expectFrom(hostA, collectReq(orphan), 200, "")
+	// Fresh keys are free to make, so each new one is the network's: three
+	// of them use the budget up.
+	for i := byte(0); i < 3; i++ {
+		f.expectFrom(hostA, collectReq(newPrincipal(40+i)), 404, CodeMailboxUnknown)
+	}
+	if f.s.fails.Exhausted(f.clk.now()) != 1 {
+		t.Fatal("fresh keys without a mailbox did not use up the network's budget")
+	}
+	f.expectFrom(hostA, collectReq(vault), 200, "")
+}
+
+// A host whose clock is wrong makes every one of its vaults fail with
+// timestamp_stale at once, again and again. That degrades to "those
+// requests are refused": each key costs the network one unit, no key is
+// held, and the moment a request is right it is served.
+func TestStaleClockDegradesToRefusals(t *testing.T) {
+	f := newFixture(t, failBudget(3))
+	vaults := make([]principal, 6)
+	for i := range vaults {
+		vaults[i] = newPrincipal(byte(20 + i))
+		f.register(vaults[i])
+	}
+	stale := func(p principal) req {
+		r := collectReq(p)
+		r.at = f.sigTime().Add(-5 * time.Minute)
+		return r
+	}
+	for round := 0; round < 4; round++ {
+		for i, v := range vaults[:2] {
+			f.expectFrom(hostA, stale(v), 401, CodeTimestampStale)
+			if round == 0 && i == 1 && f.s.fails.Exhausted(f.clk.now()) != 0 {
+				t.Fatal("two keys used up a budget of three")
+			}
+		}
+	}
+	if f.s.fails.Exhausted(f.clk.now()) != 0 {
+		t.Fatal("repeats by the same keys were charged to the network")
+	}
+	for _, v := range vaults[2:] {
+		f.expectFrom(hostA, stale(v), 401, CodeTimestampStale)
+	}
+	if f.s.fails.Exhausted(f.clk.now()) != 1 {
+		t.Fatal("six stale keys did not use up a budget of three")
+	}
+	// Penalised, and still: stale requests get their own answer, correct
+	// ones are served at once, for every vault.
+	for _, v := range vaults {
+		f.expectFrom(hostA, stale(v), 401, CodeTimestampStale)
+		f.expectFrom(hostA, collectReq(v), 200, "")
+	}
+	if v := f.s.m.errors.With(CodeTimestampStale).Value(); v != 4*2+4+6 {
+		t.Fatalf("timestamp_stale counter %d: the event must be visible in metrics", v)
+	}
+	// A stale timestamp under a wrong signature is nobody's key's: the network's, every time.
+	g := newFixture(t, failBudget(2))
+	for i := 0; i < 2; i++ {
+		r := badSig(g, vaults[0])
+		r.header.Set(auth.HeaderTimestamp, g.clk.now().Add(-time.Hour).UTC().Format(time.RFC3339))
+		g.expectFrom(hostA, r, 401, CodeTimestampStale)
+	}
+	if g.s.fails.Exhausted(g.clk.now()) != 1 {
+		t.Fatal("unsigned stale requests were not charged each time")
+	}
+}
+
+// A refused deposit that is properly signed is its key's failure: a small
+// budget of refused deposits per sender key. Its network is never charged
+// if the key has a mailbox (one vault with expired tokens does not spend
+// what its whole host shares), and once per key otherwise.
 func TestRefusedDepositsChargeTheSenderKey(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) {
-		failBudget(2)(c)
+		failBudget(3)(c)
 		c.RateKeyFailPerSec, c.RateKeyFailBurst = 0.1, 2
 	})
 	owner, vault, passerby, nobody := newPrincipal(1), newPrincipal(2), newPrincipal(3), newPrincipal(8)
 	f.register(owner)
 	f.register(vault)
-	f.expectFrom(hostA, collectReq(vault), 200, "") // vault is known at hostA
 	tok := f.mint(owner, vault, nil)
-	gone := func(signer principal) req {
-		return req{method: "POST", path: "/v1/mailbox/" + nobody.mbx, body: depositBody([]byte("x")), signer: &signer, token: tok}
-	}
 	for i := 0; i < 2; i++ {
-		f.expectFrom(hostA, gone(vault), 404, CodeMailboxUnknown)
+		f.expectFrom(hostA, depositReq(nobody, vault, tok, "x"), 404, CodeMailboxUnknown)
 	}
 	if f.s.fails.Len() != 0 {
-		t.Fatal("a known key's refused deposits were charged to its address")
+		t.Fatal("refused deposits of a key with a mailbox were charged to its address")
 	}
 	// The key's own budget of refused deposits is used up: its deposits
 	// wait, valid ones too; everything else of it carries on.
-	e := f.expectFrom(hostA, gone(vault), 429, CodeRateLimited)
+	e := f.expectFrom(hostA, depositReq(nobody, vault, tok, "x"), 429, CodeRateLimited)
 	if e.RetryAfter != 10 {
 		t.Fatalf("retry_after %d", e.RetryAfter)
 	}
-	f.expectFrom(hostA, req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("x")), signer: &vault, token: tok}, 429, CodeRateLimited)
+	f.expectFrom(hostA, depositReq(owner, vault, tok, "x"), 429, CodeRateLimited)
 	f.expectFrom(hostA, collectReq(vault), 200, "")
 	if v := f.s.rl.refused.With(limKeyFail).Value(); v != 2 {
 		t.Fatalf("refused counter %d", v)
 	}
 	// Nobody else can run a key's budget up: an unsigned deposit naming the
-	// key, and a signed one by a key not known here, are the address's.
+	// key is its address's.
 	f.clk.add(30 * time.Second)
-	h := http.Header{auth.HeaderKey: {vault.b64}}
+	h := keyHeader(vault)
 	f.expectFrom(hostB, req{method: "POST", path: "/v1/mailbox/" + nobody.mbx, body: depositBody([]byte("x")), header: h}, 404, CodeMailboxUnknown)
-	f.expectFrom(hostB, gone(passerby), 404, CodeMailboxUnknown)
-	if f.s.keyFails.Wait(vault.b64, f.clk.now()) != 0 || f.s.fails.Wait(hostB, f.clk.now()) == 0 {
-		t.Fatal("unproven failures were charged to the key, or not to the address")
+	if f.s.keyFails.Wait(vault.b64, f.clk.now()) != 0 || f.s.fails.Len() != 1 {
+		t.Fatal("an unsigned failure was charged to the key, or not to the address")
 	}
-	f.expectFrom(hostA, req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("y")), signer: &vault, token: tok}, 201, "")
-	// On a penalised address it is the same: the known key's refused
-	// deposits are answered from its own budget, then wait.
+	f.expectFrom(hostA, depositReq(owner, vault, tok, "y"), 201, "")
+	// A signer without a mailbox: its key's budget too, and its address
+	// once, for the first.
 	for i := 0; i < 2; i++ {
-		f.expectFrom(hostA, badSig(f, nobody), 401, CodeSignatureInvalid)
+		f.expectFrom(hostB, depositReq(nobody, passerby, tok, "x"), 404, CodeMailboxUnknown)
 	}
-	f.expectFrom(hostA, gone(passerby), 429, CodeRateLimited) // not known here: nothing is looked at
-	f.expectFrom(hostA, gone(vault), 404, CodeMailboxUnknown)
-	f.expectFrom(hostA, gone(vault), 404, CodeMailboxUnknown)
-	f.expectFrom(hostA, gone(vault), 429, CodeRateLimited)
-	f.expectFrom(hostA, collectReq(vault), 200, "")
+	f.expectFrom(hostB, depositReq(nobody, passerby, tok, "x"), 429, CodeRateLimited)
+	// Budget 3: the unsigned one and passerby once so far; one more uses it up.
+	if f.s.fails.Exhausted(f.clk.now()) != 0 {
+		t.Fatal("a signer without a mailbox was charged to its address more than once")
+	}
+	f.expectFrom(hostB, badSig(f, nobody), 401, CodeSignatureInvalid)
+	if f.s.fails.Exhausted(f.clk.now()) != 1 {
+		t.Fatal("a signer without a mailbox was not charged to its address")
+	}
 }
 
-// A signer that turns out to have no mailbox stops counting as known at
-// its address.
-func TestNoStandingWithoutAMailbox(t *testing.T) {
-	f := newFixture(t, failBudget(2))
-	vault, nobody := newPrincipal(1), newPrincipal(8)
-	f.register(vault)
-	f.expectFrom(hostA, collectReq(vault), 200, "")
-	f.expectFrom(hostA, req{method: "DELETE", path: "/v1/mailbox", signer: &vault}, 204, "")
-	f.expectFrom(hostA, collectReq(vault), 404, CodeMailboxUnknown) // first failure
-	f.expectFrom(hostA, badSig(f, nobody), 401, CodeSignatureInvalid)
-	// Penalised now, and the key is no longer known here.
-	f.expectFrom(hostA, collectReq(vault), 429, CodeRateLimited)
-}
-
-func TestAuthFailDepositSignatureFirstWhenPenalised(t *testing.T) {
+// On a penalised network a deposit's own signature is checked before the
+// mailbox and the token are looked at.
+func TestDepositSignatureFirstWhenPenalised(t *testing.T) {
 	f := newFixture(t, failBudget(1))
 	owner, sender, nobody := newPrincipal(1), newPrincipal(2), newPrincipal(8)
 	f.register(owner)
+	f.register(sender)
 	tok := f.mint(owner, sender, nil)
-	dep := func(payload string) req {
-		return req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte(payload)), signer: &sender, token: tok}
-	}
-	f.expectFrom(hostA, dep("1"), 201, "") // sender is known at hostA
 	f.expectFrom(hostA, badSig(f, nobody), 401, CodeSignatureInvalid)
-	// Penalised: valid deposits from the known sender still go through...
-	f.expectFrom(hostA, dep("2"), 201, "")
-	// ...a deposit naming the sender's key without its signature gets the
-	// uniform 429 although the mailbox does not exist (signature first:
-	// no store lookup, no existence answer)...
+	f.expectFrom(hostA, depositReq(owner, sender, tok, "1"), 201, "")
+	// Unsigned, to a mailbox that does not exist: signature_invalid, where
+	// §5.3's order would have looked the mailbox up and said mailbox_unknown.
 	h := http.Header{}
 	auth.SetHeaders(h, sender.priv, "POST", "/v1/elsewhere", f.sigTime(), auth.BodyHash(nil))
-	f.expectFrom(hostA, req{method: "POST", path: "/v1/mailbox/" + nobody.mbx, body: depositBody([]byte("x")), header: h, token: tok}, 429, CodeRateLimited)
-	// ...and did not cost the sender its standing.
-	f.expectFrom(hostA, dep("3"), 201, "")
-	// Blob uploads wait: their signature cannot be checked before the body.
-	code, e, _ := f.from(hostA, req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: []byte("blob"), signer: &sender, token: tok})
-	if code != 429 || e.Code != CodeRateLimited {
-		t.Fatalf("blob put while penalised: %d %q", code, e.Code)
-	}
-	f.clk.add(time.Minute)
-	if code, e, _ := f.from(hostA, req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: []byte("blob"), signer: &sender, token: tok}); code != 201 {
-		t.Fatalf("blob put after the penalty: %d %q", code, e.Code)
-	}
+	f.expectFrom(hostA, req{method: "POST", path: "/v1/mailbox/" + nobody.mbx, body: depositBody([]byte("x")), header: h, token: tok}, 401, CodeSignatureInvalid)
+	f.expectFrom(hostA, depositReq(owner, sender, tok, "2"), 201, "")
 }
 
-// Every kind of failed authentication is charged, and nothing else is.
+// What is charged to the network, and what is not.
 func TestAuthFailKinds(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) {
 		c.RateAuthFailPerSec, c.RateAuthFailBurst, c.AuthFailMaxPenalty = 1, 1, time.Second
 		c.RateRegisterPerSec, c.RateRegisterBurst = 0.001, 3
 	})
-	owner, sender, stranger := newPrincipal(1), newPrincipal(2), newPrincipal(9)
+	owner, sender := newPrincipal(1), newPrincipal(2)
 	f.register(owner)
 	f.register(sender)
 	tok := f.mint(owner, sender, nil)
 	expired := f.mint(owner, sender, func(c *auth.Claims) { c.Exp = f.clk.now().Add(-time.Second); c.Jti = "old" })
 	n := 0
 	addr := func() string { n++; return "198.51.100." + strconv.Itoa(n) }
+	k := byte(100)
+	freshKey := func() *principal { k++; p := newPrincipal(k); return &p }
 	charged := func(name string, want bool, a string) {
 		t.Helper()
 		if got := f.s.fails.Wait(a, f.clk.now()) > 0; got != want {
@@ -278,45 +385,59 @@ func TestAuthFailKinds(t *testing.T) {
 	dep := func(mbx, token string, signer *principal) req {
 		return req{method: "POST", path: "/v1/mailbox/" + mbx, body: depositBody([]byte("x")), signer: signer, token: token}
 	}
-	stale := collectReq(owner)
-	stale.at = f.clk.now().Add(-5 * time.Minute)
-	replayAt := f.sigTime()
+	unsigned := func(r req) req { r.signer = nil; return r }
+	stale := func(p principal) req {
+		r := collectReq(p)
+		r.at = f.clk.now().Add(-5 * time.Minute)
+		return r
+	}
 	replay := collectReq(owner)
-	replay.at = replayAt
+	replay.at = f.sigTime()
 	a0 := addr()
 	f.expectFrom(a0, replay, 200, "")
 	charged("valid collect", false, a0)
-
-	for _, c := range []struct {
+	gone := newPrincipal(90)
+	type kase struct {
 		name   string
 		r      req
 		status int
 		code   string
-	}{
+	}
+	run := func(want bool, cases []kase) {
+		t.Helper()
+		for _, c := range cases {
+			a := addr()
+			f.expectFrom(a, c.r, c.status, c.code)
+			charged(c.name, want, a)
+		}
+	}
+	run(true, []kase{
+		// Nobody can be held to these.
 		{"bad signature", badSig(f, owner), 401, CodeSignatureInvalid},
 		{"no signature", req{method: "GET", path: "/v1/mailbox"}, 401, CodeSignatureInvalid},
-		{"stale timestamp", stale, 401, CodeTimestampStale},
 		{"replay", replay, 401, CodeReplayDetected},
-		{"owner route, no mailbox", collectReq(stranger), 404, CodeMailboxUnknown},
-		{"deposit, unknown mailbox", dep(stranger.mbx, tok, &sender), 404, CodeMailboxUnknown},
-		{"deposit, bad token", dep(owner.mbx, "garbage", &sender), 401, CodeTokenInvalid},
-		{"deposit, expired token", dep(owner.mbx, expired, &sender), 401, CodeTokenExpired},
-		{"deposit, not the token's sender", dep(owner.mbx, tok, &stranger), 401, CodeSignatureInvalid},
-		{"blob put, unknown mailbox", req{method: "PUT", path: "/v1/blob/" + stranger.mbx, body: []byte("b"), signer: &sender, token: tok}, 404, CodeMailboxUnknown},
 		{"claim, malformed id", req{method: "GET", path: "/v1/claim/nope"}, 404, CodeClaimUnknown},
 		{"claim, unknown", req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa"}, 404, CodeClaimUnknown},
-		{"delete, no mailbox (still 204)", req{method: "DELETE", path: "/v1/mailbox", signer: &stranger}, 204, ""},
-	} {
-		a := addr()
-		f.expectFrom(a, c.r, c.status, c.code)
-		charged(c.name, true, a)
-	}
-	for _, c := range []struct {
-		name   string
-		r      req
-		status int
-		code   string
-	}{
+		{"unsigned deposit, unknown mailbox", unsigned(dep(gone.mbx, tok, nil)), 404, CodeMailboxUnknown},
+		{"blob put, unknown mailbox (unverifiable before the body)", req{method: "PUT", path: "/v1/blob/" + gone.mbx, body: []byte("b"), signer: &sender, token: tok}, 404, CodeMailboxUnknown},
+		// The first failure of a key without a mailbox: keys are free.
+		{"owner route, fresh key", collectReq(*freshKey()), 404, CodeMailboxUnknown},
+		{"delete, fresh key (still 204)", req{method: "DELETE", path: "/v1/mailbox", signer: freshKey()}, 204, ""},
+		{"stale timestamp, first for its key", stale(*freshKey()), 401, CodeTimestampStale},
+		{"refused deposit, signer without a mailbox", dep(gone.mbx, tok, freshKey()), 404, CodeMailboxUnknown},
+		{"deposit, not the token's sender, signer without a mailbox", dep(owner.mbx, tok, freshKey()), 401, CodeSignatureInvalid},
+	})
+	orphan := newPrincipal(k - 4) // "owner route, fresh key" above
+	run(false, []kase{
+		// A key with a mailbox: its failures are its own.
+		{"refused deposit, unknown mailbox", dep(gone.mbx, tok, &sender), 404, CodeMailboxUnknown},
+		{"refused deposit, bad token", dep(owner.mbx, "garbage", &sender), 401, CodeTokenInvalid},
+		{"refused deposit, expired token", dep(owner.mbx, expired, &sender), 401, CodeTokenExpired},
+		{"deposit, not the token's sender", dep(owner.mbx, tok, &owner), 401, CodeSignatureInvalid},
+		// Repeats by a key already charged once.
+		{"owner route, the same key again", collectReq(orphan), 404, CodeMailboxUnknown},
+		{"delete, the same key again", req{method: "DELETE", path: "/v1/mailbox", signer: &orphan}, 204, ""},
+		// Not failures.
 		{"valid deposit", dep(owner.mbx, tok, &sender), 201, ""},
 		{"ack of nothing", req{method: "DELETE", path: "/v1/mailbox/01ARZ3NDEKTSV4RRFFQ69G5FAV", signer: &owner}, 204, ""},
 		{"re-registration", registerReq(owner), 200, ""},
@@ -324,19 +445,25 @@ func TestAuthFailKinds(t *testing.T) {
 		{"oversized body", req{method: "GET", path: "/v1/mailbox", body: bytes.Repeat([]byte("x"), smallBodyLimit+1), signer: &owner}, 413, CodePayloadTooLarge},
 		{"unknown blob (the owner's own question)", req{method: "GET", path: "/v1/blob/01ARZ3NDEKTSV4RRFFQ69G5FAV", signer: &owner}, 404, CodeBlobUnknown},
 		{"unknown route", req{method: "GET", path: "/v1/nothing"}, 404, CodeNotFound},
-	} {
-		a := addr()
-		f.expectFrom(a, c.r, c.status, c.code)
-		charged(c.name, false, a)
-	}
-	// Registrations over the address's budget are refused and charged.
+	})
+	// The same key's stale repeats, from one address.
+	// The same key's stale repeats (seen from a second address, to tell
+	// the charges apart).
 	a := addr()
+	sk := freshKey()
+	f.expectFrom(a, stale(*sk), 401, CodeTimestampStale)
+	charged("stale timestamp", true, a)
+	a = addr()
+	f.expectFrom(a, stale(*sk), 401, CodeTimestampStale)
+	charged("stale timestamp, the same key again", false, a)
+	// A registration over the address's budget is refused; it is a rate
+	// limit, not a failed authentication.
+	a = addr()
 	for i := byte(0); i < 3; i++ {
 		f.expectFrom(a, registerReq(newPrincipal(50+i)), 201, "")
 	}
-	charged("new mailboxes within budget", false, a)
 	f.expectFrom(a, registerReq(newPrincipal(60)), 429, CodeRateLimited)
-	charged("new mailbox over budget", true, a)
+	charged("new mailbox over budget", false, a)
 }
 
 // New mailboxes are limited per address; registering an existing one again
@@ -470,7 +597,9 @@ func TestLimiterMetricsAndReport(t *testing.T) {
 		`relay_ratelimit_refused_total{limiter="authfail"} 0`,
 		`relay_ratelimit_refused_total{limiter="collectors"} 0`,
 		"relay_ratelimit_penalised_networks 0",
-		"relay_ratelimit_known_keys 2", // the key, at each of the two addresses it was used from
+		"relay_ratelimit_held_keys 0",
+		`relay_ratelimit_refused_total{limiter="nomailbox"} 0`,
+		`relay_ratelimit_allowed_total{limiter="verify"} 0`,
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("metrics lack %q", want)

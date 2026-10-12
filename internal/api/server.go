@@ -43,8 +43,10 @@ type Server struct {
 	// Rate limits (limits.go). "Network" is an IPv4 address or an IPv6 /64.
 	addrLimit   RateLimiter       // flood guard on /v1/, per network, before any parsing
 	fails       *ratelimit.Debt   // failed authentications per network (always in-process)
-	known       *ratelimit.Recent // network|key pairs that authenticated recently (always in-process)
-	keyFails    *ratelimit.Debt   // refused deposits per known sender key (always in-process)
+	verifyLimit RateLimiter       // signature checks per penalised network (always in-process)
+	orphans     *ratelimit.Hold   // keys that signed properly and had no mailbox (always in-process)
+	staleSeen   *ratelimit.Recent // keys already charged for a stale timestamp (always in-process)
+	keyFails    *ratelimit.Debt   // refused deposits per sender key with a mailbox (always in-process)
 	keyLimit    RateLimiter       // per authenticated key
 	subLimit    RateLimiter       // per sender key, on deposits and blob uploads
 	regLimit    RateLimiter       // new mailboxes per network
@@ -144,18 +146,20 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 
 		blobSlots: make(chan struct{}, cfg.MaxConcurrentBlobTransfers),
 
-		replay:     auth.NewReplayCache(cfg.ReplayCacheMax),
-		addrLimit:  ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
-		fails:      ratelimit.NewDebt(cfg.RateAuthFailPerSec, cfg.RateAuthFailBurst, cfg.AuthFailMaxPenalty, 200_000),
-		known:      ratelimit.NewRecent(knownKeyTTL, maxKnownKeys),
-		keyFails:   ratelimit.NewDebt(cfg.RateKeyFailPerSec, cfg.RateKeyFailBurst, cfg.AuthFailMaxPenalty, 200_000),
-		keyLimit:   ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, 200_000),
-		subLimit:   ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
-		regLimit:   ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, 200_000),
-		claimLimit: ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
-		rl:         newLimiterMetrics(reg),
-		webLimit:   ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
-		hsts:       strings.HasPrefix(cfg.BaseURL, "https://"),
+		replay:      auth.NewReplayCache(cfg.ReplayCacheMax),
+		addrLimit:   ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
+		fails:       ratelimit.NewDebt(cfg.RateAuthFailPerSec, cfg.RateAuthFailBurst, cfg.AuthFailMaxPenalty, 200_000),
+		verifyLimit: ratelimit.New(cfg.RateVerifyPerSec, cfg.RateVerifyBurst, 200_000),
+		orphans:     ratelimit.NewHold(holdBase, cfg.AuthFailMaxPenalty, maxHeldKeys),
+		staleSeen:   ratelimit.NewRecent(cfg.AuthFailMaxPenalty, maxHeldKeys),
+		keyFails:    ratelimit.NewDebt(cfg.RateKeyFailPerSec, cfg.RateKeyFailBurst, cfg.AuthFailMaxPenalty, 200_000),
+		keyLimit:    ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, 200_000),
+		subLimit:    ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
+		regLimit:    ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, 200_000),
+		claimLimit:  ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
+		rl:          newLimiterMetrics(reg),
+		webLimit:    ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
+		hsts:        strings.HasPrefix(cfg.BaseURL, "https://"),
 	}
 	web, err := newWebDocs(cfg.AndroidPackage, cfg.AndroidCertFingerprints, s.hsts)
 	if err != nil {
@@ -183,13 +187,13 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
 			c.Sweep(now)
 		}
-		for _, l := range []any{s.addrLimit, s.fails, s.known, s.keyFails, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
+		for _, l := range []any{s.addrLimit, s.verifyLimit, s.fails, s.orphans, s.staleSeen, s.keyFails, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
 			if p, ok := l.(interface{ Prune(time.Time) }); ok {
 				p.Prune(now)
 			}
 		}
 	})
-	reg.GaugeFunc("relay_ratelimit_known_keys", "Network and key pairs remembered as recently authenticated.", func() int64 { return int64(s.known.Len()) })
+	reg.GaugeFunc("relay_ratelimit_held_keys", "Keys remembered as properly signing without a mailbox.", func() int64 { return int64(s.orphans.Len()) })
 	s.every(time.Minute, func(time.Time) { s.reportLimits() })
 	return s
 }

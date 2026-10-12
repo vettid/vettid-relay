@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/vettid/vettid-relay/internal/ratelimit"
 	"github.com/vettid/vettid-relay/internal/store"
 
 	auth "github.com/vettid/vettid-relay/relayauth"
@@ -96,6 +97,12 @@ func WithRateLimiters(l Limiters) Option {
 			s.claimLimit = l.Claim
 		}
 	}
+}
+
+// WithNoMailboxHold replaces the first hold (1 s, then doubling) of a key
+// that signed properly and had no mailbox; 0 turns holds off (tests).
+func WithNoMailboxHold(base time.Duration) Option {
+	return func(s *Server) { s.orphans = ratelimit.NewHold(base, s.cfg.AuthFailMaxPenalty, maxHeldKeys) }
 }
 
 // WithRetryJitter replaces the random 0..4 s added to the retry_after of

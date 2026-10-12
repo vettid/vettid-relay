@@ -192,3 +192,52 @@ func TestRecent(t *testing.T) {
 		t.Fatalf("len %d", r.Len())
 	}
 }
+
+func TestHold(t *testing.T) {
+	h := NewHold(time.Second, time.Minute, 2)
+	now := time.Unix(1_700_000_000, 0)
+	if h.Wait("a", now) != 0 {
+		t.Fatal("fresh key held")
+	}
+	if !h.Fail("a", now) {
+		t.Fatal("first failure not reported as first")
+	}
+	want := time.Second
+	for i := 0; i < 8; i++ {
+		if w := h.Wait("a", now); w != want {
+			t.Fatalf("failure %d: held %v, want %v", i+1, w, want)
+		}
+		now = now.Add(want) // comes back the moment the hold ends
+		if h.Wait("a", now) != 0 {
+			t.Fatal("still held at the end of the hold")
+		}
+		if h.Fail("a", now) {
+			t.Fatal("a repeat was reported as first")
+		}
+		want = min(2*want, time.Minute)
+	}
+	if w := h.Wait("a", now); w != time.Minute {
+		t.Fatalf("hold not capped: %v", w)
+	}
+	// Coming back long after is a new first failure.
+	now = now.Add(3 * time.Minute)
+	if !h.Fail("a", now) || h.Wait("a", now) != time.Second {
+		t.Fatal("forgotten key not treated as new")
+	}
+	h.Clear("a")
+	if h.Wait("a", now) != 0 || h.Len() != 0 {
+		t.Fatal("clear")
+	}
+	// A full table reports every failure as first and tracks nothing new.
+	h.Fail("b", now)
+	h.Fail("c", now)
+	once := h.Fail("d", now)
+	again := h.Fail("d", now)
+	if !once || !again || h.Wait("d", now) != 0 || h.Len() != 2 {
+		t.Fatal("full table")
+	}
+	h.Prune(now.Add(time.Hour))
+	if h.Len() != 0 {
+		t.Fatal("prune")
+	}
+}

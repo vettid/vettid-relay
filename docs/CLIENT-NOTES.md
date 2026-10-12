@@ -158,7 +158,7 @@ uses two 0.3 features.
 |---|---|
 | `429 rate_limited` | Wait `retry_after` seconds (also in the `Retry-After` header) plus jitter, then retry. Never sooner: a limit is per key once you are authenticated (spec §7.2), so retrying early only spends your own budget, and many clients behind one address retrying early turn a touched limit into a storm. |
 | `5xx`, network error | Retry with exponential backoff and full jitter, for example 0.25 s × 2ⁿ capped at about 30 s. Re-sign every attempt. |
-| `timestamp_stale` | Fix the clock. Don't loop. |
+| `timestamp_stale` | Fix the clock. Don't loop: back off (exponentially, to minutes) and surface it; no retry can succeed until the clock is right. |
 | `replay_detected` | You resent an identical signed request. Re-sign with a new timestamp. |
 | `token_expired` / `token_invalid` | Refresh the token from the recipient. Check `aud` against the relay URL. |
 | `token_revoked` | Stop sending to this mailbox. Surface the error to the user. |
@@ -166,7 +166,7 @@ uses two 0.3 features.
 | `409 token_used` | The one-shot open token was already used. Ask the owner for a new invitation. |
 | `claim_unknown` | The claim expired or was already fetched (single fetch). Get a fresh claim id. |
 | `payload_too_large` | Use the claim-check blob flow (§7) or split at the E2E layer. |
-| `mailbox_unknown` | Wrong address, the mailbox isn't registered, it was rotated away, or its owner deleted it. Re-resolve over E2E. For your own collect, it means your mailbox no longer exists. |
+| `mailbox_unknown` | Wrong address, the mailbox isn't registered, it was rotated away, or its owner deleted it. Re-resolve over E2E. For your own collect, it means your mailbox no longer exists: stop collecting, and register again (`POST /v1/register`) before you resume, or stop for good if the mailbox was deleted on purpose. A relay answers a key that keeps asking without a mailbox with `429` and a growing `retry_after` (spec §7.2). |
 
 Never retry 4xx errors other than 429 unchanged. Never automatically retry
 a claim `GET`: the first response may have consumed the claim.

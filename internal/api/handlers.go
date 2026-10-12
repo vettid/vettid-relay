@@ -128,7 +128,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	// Proof of possession: the request must be signed by the key registered.
 	if !bytes.Equal(pub, sr.Key) {
-		s.writeError(w, s.authFailed(w, fail(CodeSignatureInvalid), false))
+		s.writeError(w, s.authFailed(w, fail(CodeSignatureInvalid)))
 		return
 	}
 	if e := s.allowKey(sr.Key); e != nil {
@@ -136,14 +136,13 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := auth.MailboxID(pub)
-	// A new mailbox draws on its network's registration budget; registering
-	// an existing one again (every vault does at unlock) does not. Only the
-	// holder of the key gets this far, so the difference tells nobody
-	// anything. A refusal counts as a failed authentication: a network that
-	// keeps asking for mailboxes it may not have ends up penalised.
+	// A new mailbox draws on its network's registration budget (and waits
+	// while the network is penalised); registering an existing one again
+	// (every vault does at unlock) does neither. Only the holder of the key
+	// gets this far, so the difference tells nobody anything.
 	if _, err := s.st.Mailbox(r.Context(), id); errors.Is(err, store.ErrNotFound) {
 		if e := s.allowRegistration(w); e != nil {
-			s.writeError(w, s.authFailed(w, e, false))
+			s.writeError(w, e)
 			return
 		}
 	}
@@ -153,7 +152,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeInternal))
 		return
 	}
-	s.authenticated(w, sr.Key)
+	s.orphans.Clear(req.PubKey) // the key has a mailbox (again)
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
@@ -173,14 +172,26 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	}
 	mailboxID := r.PathValue("mailbox_id")
 	bodyHash := auth.BodyHash(body)
-	// A network out of failed-authentication budget gets no unauthenticated
-	// work: its request's own signature (step 7's) is checked before the
-	// mailbox and token are looked at (limits.go). Otherwise the order is
-	// §5.3's.
+	// On a penalised network the request's own signature (step 7's) is
+	// checked before the mailbox and token are looked at, and the signer
+	// must have a mailbox of its own; a signer without one waits
+	// (limits.go). Otherwise the order is §5.3's.
 	var signed *auth.SignedRequest
-	if stateOf(w).penalised {
+	if st := stateOf(w); st.penalised {
 		sr, e := s.authorizeSigner(w, r, bodyHash)
 		if e != nil {
+			s.writeError(w, e)
+			return
+		}
+		if !s.hasMailbox(r.Context(), sr.Key) {
+			if s.keyFails.Charge(auth.EncodeKey(sr.Key), s.now()) {
+				s.chargeNetwork(st.addr)
+			}
+			s.rl.refused.With(limAuthFail).Inc()
+			e := s.penalty(st.addr)
+			if e == nil {
+				e = &apiError{code: CodeRateLimited, retryAfter: 1}
+			}
 			s.writeError(w, e)
 			return
 		}
