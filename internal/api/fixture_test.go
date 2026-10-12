@@ -80,6 +80,7 @@ func newFixtureFull(t *testing.T, mut func(*config.Config), logw io.Writer, opts
 	cfg.RateAuthFailPerSec, cfg.RateAuthFailBurst = 1000, 1000
 	cfg.RateKeyFailPerSec, cfg.RateKeyFailBurst = 1000, 1000
 	cfg.RateVerifyPerSec, cfg.RateVerifyBurst = 1000, 1000
+	cfg.RateTricklePerSec, cfg.RateTrickleBurst = 1000, 1000
 	cfg.RateRegisterPerSec, cfg.RateRegisterBurst = 1000, 1000
 	cfg.RateSenderPerSec, cfg.RateSenderBurst = 1000, 1000
 	cfg.RateClaimPerSec, cfg.RateClaimBurst = 1000, 1000
@@ -102,7 +103,7 @@ func (f *fixture) start() {
 	st := f.newSt()
 	f.st = st
 	f.reg = metrics.New()
-	opts := []Option{WithClock(f.clk.now), WithNoMailboxHold(0)}
+	opts := []Option{WithClock(f.clk.now), WithNoMailboxHold(0), WithPairFailBudget(1000, 1000)}
 	if f.opts != nil {
 		opts = append(opts, f.opts(f)...)
 	}

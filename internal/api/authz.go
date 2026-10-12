@@ -36,11 +36,12 @@ func bearerToken(r *http.Request) (string, bool) {
 // authorizeDepositToken runs spec §5.3 steps 1–6 for deposits and blob puts.
 // It needs only headers, so it runs before any body is read. Every refusal
 // here is a failed authentication (limits.go depositFailed): signed is the
-// request's verified signature if it has been checked already, bodyHash the
-// body's hash if the body has been read (a deposit; not a blob upload).
-func (s *Server) authorizeDepositToken(ctx context.Context, w http.ResponseWriter, r *http.Request, mailboxID string, signed *auth.SignedRequest, bodyHash *[32]byte) (*depositAuth, *apiError) {
+// request's verified signature if it has been checked already; bodyHash
+// reads the body and returns its hash (a deposit: the body is read only if
+// a refusal has to be attributed), nil for a blob upload.
+func (s *Server) authorizeDepositToken(ctx context.Context, w http.ResponseWriter, r *http.Request, mailboxID string, signed *auth.SignedRequest, bodyHash func() *[32]byte) (*depositAuth, *apiError) {
 	refuse := func(code string) (*depositAuth, *apiError) {
-		return nil, s.depositFailed(w, r, fail(code), signed, bodyHash)
+		return nil, s.depositFailed(w, r, fail(code), mailboxID, signed, bodyHash)
 	}
 	// 1. Mailbox exists.
 	if !auth.ValidMailboxID(mailboxID) {
@@ -123,7 +124,7 @@ func (s *Server) verifySender(w http.ResponseWriter, r *http.Request, da *deposi
 	if da.claims.Open() {
 		sender = auth.EncodeKey(signed.Key)
 	} else if subtle.ConstantTimeCompare(signed.Key, da.claims.SubKey) != 1 {
-		return "", s.depositFailed(w, r, fail(CodeSignatureInvalid), signed, nil)
+		return "", s.depositFailed(w, r, fail(CodeSignatureInvalid), da.mailbox.ID, signed, nil)
 	}
 	return sender, nil
 }
@@ -138,7 +139,7 @@ func (s *Server) verifySignature(w http.ResponseWriter, r *http.Request, bodyHas
 	case errors.Is(err, auth.ErrTimestampStale):
 		// A wrong clock, not a wrong key, if the signature is good.
 		if sr.SignatureValid(r.Method, r.URL.EscapedPath(), bodyHash) {
-			return sr, s.staleFailed(w, fail(CodeTimestampStale), sr.Key)
+			return sr, s.keyFailedOnce(w, fail(CodeTimestampStale), onceStale, sr.Key)
 		}
 		return sr, s.authFailed(w, fail(CodeTimestampStale))
 	case err != nil:
@@ -150,8 +151,9 @@ func (s *Server) verifySignature(w http.ResponseWriter, r *http.Request, bodyHas
 func (s *Server) checkReplay(w http.ResponseWriter, sr auth.SignedRequest) *apiError {
 	switch err := s.replay.Check(sr, s.now()); {
 	case errors.Is(err, auth.ErrReplay):
-		// Anyone who saw the request can replay it: no key is proven.
-		return s.authFailed(w, fail(CodeReplayDetected))
+		// The signature is good, so it is this key's request sent twice: a
+		// retry bug, or someone re-sending what they saw.
+		return s.keyFailedOnce(w, fail(CodeReplayDetected), onceReplay, sr.Key)
 	case errors.Is(err, auth.ErrReplayCacheFull):
 		s.log.Warn("replay cache full or unavailable; shedding load", "err", err)
 		return &apiError{code: CodeRateLimited, retryAfter: 5}
@@ -170,12 +172,18 @@ func (s *Server) authorizeSigner(w http.ResponseWriter, r *http.Request, bodyHas
 	if e != nil {
 		return sr, e
 	}
-	if e := s.checkReplay(w, sr); e != nil {
+	// A key held for having no mailbox: its holder is told to wait.
+	if e := s.held(r, sr.Key); e != nil {
 		return sr, e
 	}
 	// On a penalised network the flood guard was put off until here, so
-	// that the network's bad requests cannot use up what its good ones need.
-	return sr, s.floodGuard(w)
+	// that the network's bad requests cannot use up what its good ones
+	// need. It comes before the replay record: what one network can write
+	// to the replay store is bounded by its flood guard.
+	if e := s.floodGuard(w); e != nil {
+		return sr, e
+	}
+	return sr, s.checkReplay(w, sr)
 }
 
 // authorizeOwner authenticates an owner route (collect, ack, denylist,

@@ -6,9 +6,10 @@ import "sync"
 // as a deposit commits — no polling loop sits on the delivery path (spec
 // §6.2 wake-on-deposit). It also caps concurrent collectors per mailbox.
 type hub struct {
-	mu    sync.Mutex
-	boxes map[string]*hubEntry
-	total int
+	mu     sync.Mutex
+	boxes  map[string]*hubEntry
+	perNet map[string]int // collectors per client network
+	total  int
 }
 
 type hubEntry struct {
@@ -17,27 +18,46 @@ type hubEntry struct {
 	collectors int
 }
 
-func newHub() *hub { return &hub{boxes: map[string]*hubEntry{}} }
+func newHub() *hub { return &hub{boxes: map[string]*hubEntry{}, perNet: map[string]int{}} }
 
-// acquire registers a collector for mailbox; false if max are already active.
-func (h *hub) acquire(mailbox string, max int) bool {
+// Why a collector was not admitted.
+const (
+	fullMailbox = "mailbox" // the mailbox has its maximum of collectors
+	fullNetwork = "network" // its client network has
+	fullProcess = "process" // this process has
+)
+
+// acquire registers a collector for mailbox, from client network net. It
+// returns "" or which cap was reached: collectors per mailbox, per network,
+// or in this process altogether (each parked collector holds a connection
+// and a goroutine: the caps bound that memory).
+func (h *hub) acquire(mailbox, net string, maxMailbox, maxNet, maxTotal int) string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.total >= maxTotal {
+		return fullProcess
+	}
+	if net != "" && h.perNet[net] >= maxNet {
+		return fullNetwork
+	}
 	e, ok := h.boxes[mailbox]
+	if ok && e.collectors >= maxMailbox {
+		return fullMailbox
+	}
 	if !ok {
 		e = &hubEntry{ch: make(chan struct{}), gone: make(chan struct{})}
 		h.boxes[mailbox] = e
 	}
-	if e.collectors >= max {
-		return false
-	}
 	e.collectors++
 	h.total++
-	return true
+	if net != "" {
+		h.perNet[net]++
+	}
+	return ""
 }
 
 // release unregisters a collector acquired with acquire.
-func (h *hub) release(mailbox string) {
+func (h *hub) release(mailbox, net string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	e, ok := h.boxes[mailbox]
@@ -48,6 +68,11 @@ func (h *hub) release(mailbox string) {
 	h.total--
 	if e.collectors <= 0 {
 		delete(h.boxes, mailbox)
+	}
+	if net != "" {
+		if h.perNet[net]--; h.perNet[net] <= 0 {
+			delete(h.perNet, net)
+		}
 	}
 }
 

@@ -45,10 +45,6 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	if e := s.senderOverFailures(r); e != nil {
-		s.writeError(w, e)
-		return
-	}
 	// §5.3 steps 1–6 need only headers: unauthorized uploads are refused
 	// before their body is read.
 	da, e := s.authorizeDepositToken(r.Context(), w, r, mailboxID, nil, nil)

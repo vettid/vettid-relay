@@ -152,7 +152,9 @@ func TestDebtTableFull(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	d.Charge("a", now)
 	d.Charge("b", now)
-	d.Charge("c", now) // untracked
+	if d.Charge("c", now) { // untracked: never "first"
+		t.Fatal("an untracked key was reported as first")
+	}
 	if d.Len() != 2 || d.Wait("c", now) != 0 {
 		t.Fatalf("len %d", d.Len())
 	}
@@ -228,13 +230,27 @@ func TestHold(t *testing.T) {
 	if h.Wait("a", now) != 0 || h.Len() != 0 {
 		t.Fatal("clear")
 	}
-	// A full table reports every failure as first and tracks nothing new.
+	// A full table tracks nothing new, and never calls an untracked key
+	// first (or its network would be charged on every repeat).
 	h.Fail("b", now)
 	h.Fail("c", now)
 	once := h.Fail("d", now)
 	again := h.Fail("d", now)
-	if !once || !again || h.Wait("d", now) != 0 || h.Len() != 2 {
+	if once || again || h.Wait("d", now) != 0 || h.Len() != 2 {
 		t.Fatal("full table")
+	}
+	// Recheck: at most once per interval per held key.
+	if !h.Recheck("b", now, 5*time.Second) || h.Recheck("b", now.Add(4*time.Second), 5*time.Second) ||
+		!h.Recheck("b", now.Add(5*time.Second), 5*time.Second) || h.Recheck("nobody", now, 5*time.Second) {
+		t.Fatal("recheck")
+	}
+	// A long first hold does not overflow.
+	long := NewHold(time.Minute, time.Hour, 2)
+	for i := 0; i < 80; i++ {
+		long.Fail("a", now)
+	}
+	if w := long.Wait("a", now); w != time.Hour {
+		t.Fatalf("long hold: %v", w)
 	}
 	h.Prune(now.Add(time.Hour))
 	if h.Len() != 0 {

@@ -26,12 +26,34 @@ const (
 	timeFormat       = "2006-01-02T15:04:05Z" // RFC 3339 UTC, second precision (spec examples)
 )
 
+// bodyReadTimeout bounds how long one request body (other than a blob) may
+// take to arrive. Bodies are at most a deposit (about 350 KiB): a slow
+// mobile link sends that in a few seconds, and a client that stalls is
+// holding memory.
+const bodyReadTimeout = 20 * time.Second
+
 // readBody reads the whole body, enforcing limit while reading (spec §8.5:
-// size limits precede signature verification).
+// size limits precede signature verification). What is being read counts
+// against the process's and the network's caps on body bytes in flight,
+// and has to arrive within bodyReadTimeout (limits.go bodies).
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, *apiError) {
 	if r.ContentLength > limit {
 		return nil, fail(CodePayloadTooLarge)
 	}
+	if r.ContentLength == 0 {
+		return []byte{}, nil
+	}
+	n := r.ContentLength
+	if n < 0 {
+		n = limit // length not declared: count the most it may be
+	}
+	release, e := s.reserveBody(w, n)
+	if e != nil {
+		return nil, e
+	}
+	defer release()
+	rc := http.NewResponseController(w)
+	deadline := rc.SetReadDeadline(time.Now().Add(s.bodyTimeout)) == nil
 	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	var mbe *http.MaxBytesError
 	switch {
@@ -39,6 +61,9 @@ func (s *Server) readBody(w http.ResponseWriter, r *http.Request, limit int64) (
 		return nil, fail(CodePayloadTooLarge)
 	case err != nil:
 		return nil, fail(CodeBadRequest)
+	}
+	if deadline {
+		rc.SetReadDeadline(time.Time{})
 	}
 	return b, nil
 }
@@ -165,45 +190,81 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 // POST /v1/mailbox/{mailbox_id} (spec §6.2, validation order §5.3)
 func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
-	body, e := s.readBody(w, r, s.depositBodyLimit())
-	if e != nil {
-		s.writeError(w, e)
+	if r.ContentLength > s.depositBodyLimit() {
+		s.writeError(w, fail(CodePayloadTooLarge))
 		return
 	}
 	mailboxID := r.PathValue("mailbox_id")
-	bodyHash := auth.BodyHash(body)
-	// On a penalised network the request's own signature (step 7's) is
-	// checked before the mailbox and token are looked at, and the signer
-	// must have a mailbox of its own; a signer without one waits
-	// (limits.go). Otherwise the order is §5.3's.
+	// The body is read as late as it can be: §5.3 steps 1–6 need only
+	// headers, so on a network with budget an unauthorized deposit is
+	// refused before its body is read (as a blob upload is). body() reads
+	// it once, when something first needs it.
+	var (
+		body     []byte
+		bodyHash [32]byte
+		bodyErr  *apiError
+		bodyRead bool
+	)
+	read := func() *apiError {
+		if !bodyRead {
+			bodyRead = true
+			if body, bodyErr = s.readBody(w, r, s.depositBodyLimit()); bodyErr == nil {
+				bodyHash = auth.BodyHash(body)
+			}
+		}
+		return bodyErr
+	}
+	hash := func() *[32]byte {
+		if read() != nil {
+			return nil
+		}
+		return &bodyHash
+	}
 	var signed *auth.SignedRequest
 	if st := stateOf(w); st.penalised {
+		// On a penalised network the request's own signature (step 7's)
+		// is checked before the mailbox and token are looked at, which
+		// takes the body; and the signer must have a mailbox of its own,
+		// or it is let through only at a trickle (limits.go).
+		if e := read(); e != nil {
+			s.writeError(w, e)
+			return
+		}
 		sr, e := s.authorizeSigner(w, r, bodyHash)
 		if e != nil {
 			s.writeError(w, e)
 			return
 		}
 		if !s.hasMailbox(r.Context(), sr.Key) {
-			if s.keyFails.Charge(auth.EncodeKey(sr.Key), s.now()) {
-				s.chargeNetwork(st.addr)
+			if e := s.take(limTrickle, s.trickle, st.addr, true); e != nil {
+				s.writeError(w, e)
+				return
 			}
-			s.rl.refused.With(limAuthFail).Inc()
-			e := s.penalty(st.addr)
-			if e == nil {
-				e = &apiError{code: CodeRateLimited, retryAfter: 1}
-			}
+		}
+		signed = &sr
+		if e := s.senderOverFailures(r, mailboxID); e != nil {
 			s.writeError(w, e)
 			return
 		}
-		signed = &sr
+	} else if s.senderOverFailures(r, mailboxID) != nil {
+		// A sender whose deposits keep being refused waits. The key is
+		// only named so far; the refusal is for its holder, so the
+		// signature is checked first and anyone else gets what they would
+		// have got.
+		if h := hash(); h != nil {
+			if sr, err := auth.ParseHeaders(r.Header); err == nil && sr.Verify(r.Method, r.URL.EscapedPath(), *h, s.now()) == nil {
+				s.rl.refused.With(limKeyFail).Inc()
+				s.writeError(w, s.senderOverFailures(r, mailboxID))
+				return
+			}
+		}
 	}
-	// A sender whose deposits keep being refused waits (limits.go).
-	if e := s.senderOverFailures(r); e != nil {
+	da, e := s.authorizeDepositToken(r.Context(), w, r, mailboxID, signed, hash) // steps 1–6
+	if e != nil {
 		s.writeError(w, e)
 		return
 	}
-	da, e := s.authorizeDepositToken(r.Context(), w, r, mailboxID, signed, &bodyHash) // steps 1–6
-	if e != nil {
+	if e := read(); e != nil {
 		s.writeError(w, e)
 		return
 	}
@@ -339,19 +400,20 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeBadRequest))
 		return
 	}
-	if !s.hub.acquire(mb.ID, s.cfg.MaxCollectorsPerMailbox) {
-		s.writeError(w, s.refuseCollector())
+	addr := stateOf(w).addr
+	if why := s.hub.acquire(mb.ID, addr, s.cfg.MaxCollectorsPerMailbox, s.cfg.MaxCollectorsPerNetwork, s.cfg.MaxCollectors); why != "" {
+		s.writeError(w, s.refuseCollector(why))
 		return
 	}
-	defer s.hub.release(mb.ID)
+	defer s.hub.release(mb.ID, addr)
 	gone := s.hub.goneCh(mb.ID)
 	if !s.stillRegistered(r.Context(), mb.ID) {
 		s.writeError(w, fail(CodeMailboxUnknown)) // deleted since authorization
 		return
 	}
 
-	deadline := time.NewTimer(wait)
-	defer deadline.Stop()
+	deadlineC, stopDeadline := s.timer(wait)
+	defer stopDeadline()
 	parked := false
 	defer func() {
 		if parked {
@@ -394,7 +456,7 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		case <-gone: // the owner deleted the mailbox (§6.10): terminal
 			s.writeError(w, fail(CodeMailboxUnknown))
 			done = true
-		case <-deadline.C:
+		case <-deadlineC:
 			s.respondMessages(w, nil)
 			done = true
 		case <-s.drainCtx.Done():

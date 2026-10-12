@@ -40,8 +40,9 @@ func NewDebt(rate float64, burst int, maxPenalty time.Duration, maxKeys int) *De
 func (d *Debt) allowance() time.Duration { return time.Duration(d.burst-1) * d.per }
 
 // Charge records one event for key. It reports whether the key had its
-// full budget before (its first event for a while; always true for a key
-// that goes untracked because the table is full).
+// full budget before (its first event for a while). A key that goes
+// untracked because the table is full is never reported as first: what
+// cannot be remembered must not be charged to anyone else again and again.
 func (d *Debt) Charge(key string, now time.Time) (first bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -49,7 +50,7 @@ func (d *Debt) Charge(key string, now time.Time) (first bool) {
 	if !ok && len(d.tat) >= d.maxKeys {
 		d.pruneLocked(now)
 		if len(d.tat) >= d.maxKeys {
-			return true // table full of live keys: this one goes untracked
+			return false // table full of live keys: this one goes untracked
 		}
 	}
 	first = !t.After(now)
@@ -215,8 +216,9 @@ type Hold struct {
 }
 
 type holdEntry struct {
-	until  time.Time
-	streak int
+	until   time.Time
+	streak  int
+	checked time.Time // last Recheck
 }
 
 // NewHold returns a table holding at most maxKeys keys.
@@ -225,9 +227,10 @@ func NewHold(base, max time.Duration, maxKeys int) *Hold {
 }
 
 // Fail records one failure of key and holds it. It reports whether the key
-// was new to the table: true once per key for as long as it keeps failing
-// (and every time if the table is full of live keys, where the key goes
-// untracked).
+// was new to the table: true once per key for as long as it keeps failing.
+// If the table is full of live keys the key goes untracked: it is not
+// held, and never reported as first (what cannot be remembered must not be
+// charged to anyone else again and again).
 func (h *Hold) Fail(key string, now time.Time) (first bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -239,17 +242,17 @@ func (h *Hold) Fail(key string, now time.Time) (first bool) {
 		if _, present := h.m[key]; !present && len(h.m) >= h.maxKeys {
 			h.pruneLocked(now)
 			if len(h.m) >= h.maxKeys {
-				return true
+				return false
 			}
 		}
 		e = holdEntry{}
 	}
 	e.streak++
-	d := h.max
-	if e.streak <= 30 {
-		d = min(h.base<<(e.streak-1), h.max)
+	d := h.base
+	for i := 1; i < e.streak && d < h.max; i++ {
+		d *= 2
 	}
-	e.until = now.Add(d)
+	e.until = now.Add(min(d, h.max))
 	h.m[key] = e
 	return !ok
 }
@@ -262,6 +265,20 @@ func (h *Hold) Wait(key string, now time.Time) time.Duration {
 		return e.until.Sub(now)
 	}
 	return 0
+}
+
+// Recheck reports whether it is time to look again at whether a held key
+// still deserves its hold: true at most once per `every` for each key.
+func (h *Hold) Recheck(key string, now time.Time, every time.Duration) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	e, ok := h.m[key]
+	if !ok || now.Sub(e.checked) < every {
+		return false
+	}
+	e.checked = now
+	h.m[key] = e
+	return true
 }
 
 // Clear forgets key.

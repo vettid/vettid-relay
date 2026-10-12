@@ -63,7 +63,7 @@ type Config struct {
 
 	// Rate limits (spec §7.2). Per client network (IPv4 address / IPv6 /64)
 	// only where the caller is not authenticated yet; per key once it is.
-	RateIPPerSec       float64       // RELAY_RATE_IP_RPS: flood guard on /v1/, per network, per process
+	RateIPPerSec       float64       // RELAY_RATE_IP_RPS: flood guard on /v1/, per network (shared by all processes)
 	RateIPBurst        int           // RELAY_RATE_IP_BURST
 	RateKeyPerSec      float64       // RELAY_RATE_KEY_RPS: per authenticated key (owner routes, register, delete)
 	RateKeyBurst       int           // RELAY_RATE_KEY_BURST
@@ -76,12 +76,20 @@ type Config struct {
 	RateKeyFailBurst   int           // RELAY_RATE_KEYFAIL_BURST
 	RateRegisterPerSec float64       // RELAY_RATE_REGISTER_RPS: new mailboxes per network
 	RateRegisterBurst  int           // RELAY_RATE_REGISTER_BURST
-	RateSenderPerSec   float64       // RELAY_RATE_SENDER_RPS
-	RateSenderBurst    int           // RELAY_RATE_SENDER_BURST
-	RateClaimPerSec    float64       // RELAY_RATE_CLAIM_GET_RPS
-	RateClaimBurst     int           // RELAY_RATE_CLAIM_GET_BURST
-	RateWebPerSec      float64       // RELAY_RATE_WEB_RPS (everything outside /v1/ and /healthz)
-	RateWebBurst       int           // RELAY_RATE_WEB_BURST
+	RateTricklePerSec  float64       // RELAY_RATE_TRICKLE_RPS: new mailboxes and claim fetches let through per penalised network, per process
+	RateTrickleBurst   int           // RELAY_RATE_TRICKLE_BURST
+
+	// Resource caps, per process (spec §7.2 "Resource caps").
+	MaxCollectors           int     // RELAY_MAX_COLLECTORS: parked long-polls plus WebSocket sessions
+	MaxCollectorsPerNetwork int     // RELAY_MAX_COLLECTORS_PER_NETWORK
+	MaxBodyBytes            int64   // RELAY_MAX_INFLIGHT_BODY_BYTES: request bodies being read (blob uploads have their own slots)
+	MaxBodyBytesPerNetwork  int64   // RELAY_MAX_INFLIGHT_BODY_BYTES_PER_NETWORK
+	RateSenderPerSec        float64 // RELAY_RATE_SENDER_RPS
+	RateSenderBurst         int     // RELAY_RATE_SENDER_BURST
+	RateClaimPerSec         float64 // RELAY_RATE_CLAIM_GET_RPS
+	RateClaimBurst          int     // RELAY_RATE_CLAIM_GET_BURST
+	RateWebPerSec           float64 // RELAY_RATE_WEB_RPS (everything outside /v1/ and /healthz)
+	RateWebBurst            int     // RELAY_RATE_WEB_BURST
 
 	// Web endpoints (spec §6.11): /.well-known/assetlinks.json names the
 	// Android app allowed to open this relay's /connect links. An empty
@@ -157,24 +165,31 @@ func Defaults() Config {
 		ClaimTTL:      900 * time.Second,
 
 		RateIPPerSec:       200,
-		RateIPBurst:        2000,
+		RateIPBurst:        4000,
 		RateKeyPerSec:      20,
 		RateKeyBurst:       100,
 		RateAuthFailPerSec: 1,
 		RateAuthFailBurst:  60,
-		AuthFailMaxPenalty: 10 * time.Minute,
+		AuthFailMaxPenalty: time.Minute,
 		RateVerifyPerSec:   1000,
 		RateVerifyBurst:    2000,
-		RateKeyFailPerSec:  0.1,
-		RateKeyFailBurst:   30,
-		RateRegisterPerSec: 1,
-		RateRegisterBurst:  100,
-		RateSenderPerSec:   5,
-		RateSenderBurst:    20,
-		RateClaimPerSec:    1,
-		RateClaimBurst:     10,
-		RateWebPerSec:      2,
-		RateWebBurst:       20,
+		RateKeyFailPerSec:  1,
+		RateKeyFailBurst:   200,
+		RateTricklePerSec:  0.1,
+		RateTrickleBurst:   3,
+
+		MaxCollectors:           6000,
+		MaxCollectorsPerNetwork: 3000,
+		MaxBodyBytes:            64 << 20,
+		MaxBodyBytesPerNetwork:  16 << 20,
+		RateRegisterPerSec:      1,
+		RateRegisterBurst:       100,
+		RateSenderPerSec:        5,
+		RateSenderBurst:         20,
+		RateClaimPerSec:         1,
+		RateClaimBurst:          10,
+		RateWebPerSec:           2,
+		RateWebBurst:            20,
 
 		AndroidPackage:          DefaultAndroidPackage,
 		AndroidCertFingerprints: append([]string(nil), DefaultAndroidCertFingerprints...),
@@ -306,6 +321,12 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	integer("RELAY_RATE_KEYFAIL_BURST", &c.RateKeyFailBurst)
 	f64("RELAY_RATE_REGISTER_RPS", &c.RateRegisterPerSec)
 	integer("RELAY_RATE_REGISTER_BURST", &c.RateRegisterBurst)
+	f64("RELAY_RATE_TRICKLE_RPS", &c.RateTricklePerSec)
+	integer("RELAY_RATE_TRICKLE_BURST", &c.RateTrickleBurst)
+	integer("RELAY_MAX_COLLECTORS", &c.MaxCollectors)
+	integer("RELAY_MAX_COLLECTORS_PER_NETWORK", &c.MaxCollectorsPerNetwork)
+	i64("RELAY_MAX_INFLIGHT_BODY_BYTES", &c.MaxBodyBytes)
+	i64("RELAY_MAX_INFLIGHT_BODY_BYTES_PER_NETWORK", &c.MaxBodyBytesPerNetwork)
 	f64("RELAY_RATE_SENDER_RPS", &c.RateSenderPerSec)
 	integer("RELAY_RATE_SENDER_BURST", &c.RateSenderBurst)
 	f64("RELAY_RATE_CLAIM_GET_RPS", &c.RateClaimPerSec)
@@ -397,6 +418,21 @@ func (c Config) Validate() error {
 	if c.MaxConcurrentBlobTransfers <= 0 || c.MaxCollectorsPerMailbox <= 0 || c.ReplayCacheMax <= 0 ||
 		c.RateIPBurst <= 0 || c.RateKeyBurst <= 0 || c.RateAuthFailBurst <= 0 || c.RateVerifyBurst <= 0 || c.RateKeyFailBurst <= 0 || c.RateRegisterBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 || c.RateWebBurst <= 0 {
 		errs = append(errs, errors.New("concurrency, burst and cache limits must be > 0"))
+	}
+	// A zero rate would silently turn a limit into "never refills" or, as
+	// a divisor, into something architecture-dependent.
+	for _, r := range []float64{c.RateIPPerSec, c.RateKeyPerSec, c.RateAuthFailPerSec, c.RateVerifyPerSec, c.RateKeyFailPerSec,
+		c.RateRegisterPerSec, c.RateTricklePerSec, c.RateSenderPerSec, c.RateClaimPerSec, c.RateWebPerSec} {
+		if !(r > 0) || r > 1e9 {
+			errs = append(errs, errors.New("every RELAY_RATE_*_RPS must be > 0"))
+			break
+		}
+	}
+	if c.AuthFailMaxPenalty < time.Second || c.AuthFailMaxPenalty > 24*time.Hour {
+		errs = append(errs, errors.New("RELAY_RATE_AUTHFAIL_MAX_PENALTY must be between 1s and 24h"))
+	}
+	if c.RateTrickleBurst <= 0 || c.MaxCollectors <= 0 || c.MaxCollectorsPerNetwork <= 0 || c.MaxBodyBytes <= 0 || c.MaxBodyBytesPerNetwork <= 0 {
+		errs = append(errs, errors.New("RELAY_RATE_TRICKLE_BURST, RELAY_MAX_COLLECTORS* and RELAY_MAX_INFLIGHT_BODY_BYTES* must be > 0"))
 	}
 	if len(c.AndroidCertFingerprints) > 0 && !validAndroidPackage(c.AndroidPackage) {
 		errs = append(errs, errors.New("RELAY_ANDROID_PACKAGE must be an Android package name like com.vettid.app"))

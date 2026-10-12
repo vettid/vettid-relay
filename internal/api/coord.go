@@ -105,6 +105,23 @@ func WithNoMailboxHold(base time.Duration) Option {
 	return func(s *Server) { s.orphans = ratelimit.NewHold(base, s.cfg.AuthFailMaxPenalty, maxHeldKeys) }
 }
 
+// WithPairFailBudget replaces the budget of refused deposits per sender
+// key and mailbox (tests).
+func WithPairFailBudget(rate float64, burst int) Option {
+	return func(s *Server) {
+		s.pairFails = ratelimit.NewDebt(rate, burst, s.cfg.AuthFailMaxPenalty, maxHeldKeys)
+	}
+}
+
+// WithBodyTimeout replaces the time a request body has to arrive (tests).
+func WithBodyTimeout(d time.Duration) Option { return func(s *Server) { s.bodyTimeout = d } }
+
+// WithTimer replaces the timer behind a long-poll's wait (tests drive it
+// from their clock).
+func WithTimer(f func(time.Duration) (<-chan time.Time, func())) Option {
+	return func(s *Server) { s.timer = f }
+}
+
 // WithRetryJitter replaces the random 0..4 s added to the retry_after of
 // refusals that hit many clients at once (tests).
 func WithRetryJitter(f func() int) Option { return func(s *Server) { s.retryJitter = f } }

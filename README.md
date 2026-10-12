@@ -123,19 +123,22 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_OPEN_TOKEN_MAX_LIFETIME` | `600s` | `open_token_max_lifetime_seconds` (§5.6). This is the cap on `exp − iat` for one-shot open tokens. Up to 7 days is recommended for remote invitations. |
 | `RELAY_MAX_CLAIM_BYTES` | `16384` | `max_claim_bytes` (§6.9). This is the maximum claim body. |
 | `RELAY_CLAIM_TTL` | `900s` | `claim_ttl_seconds` (§6.9). It's the longest TTL a creator may request with `PUT /v1/claim/ttl/<seconds>`. Up to 7 days is recommended. A bare `PUT /v1/claim` gets min(900 s, this). |
-| `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `200` / `2000` | Flood guard on `/v1/*` per client network (the IPv4 address or the IPv6 /64), applied before any parsing. It is not a usage quota: it is sized to carry a full vault host (1,000 vaults behind one address) and bounds what one network can make the relay do. See [Rate limiting](#rate-limiting). |
+| `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `200` / `4000` | Flood guard on `/v1/*` per client network (the IPv4 address or the IPv6 /64), applied before any parsing. It is not a usage quota: it is sized to carry a full vault host (1,000 vaults behind one address) and bounds what one network can make the relay do. See [Rate limiting](#rate-limiting). |
 | `RELAY_RATE_KEY_RPS` / `RELAY_RATE_KEY_BURST` | `20` / `100` | Per-key bucket, applied once a request is authenticated: owner routes, registration and mailbox deletion, and WebSocket ack frames. Keyed by the signing key. |
 | `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits after the request signature verifies (§5.3 step 7) and to blob uploads before their body is read. It's keyed by token `sub`, or by `jti` for open tokens. |
-| `RELAY_RATE_AUTHFAIL_RPS` / `RELAY_RATE_AUTHFAIL_BURST` | `1` / `60` | Budget, per client network and relay process, of failures nobody can be held to (wrong or missing signature, replay, unknown claim, the first failure of each key without a mailbox). A network that has used it up is penalised: its requests are signature-checked first, and unauthenticated requests, new mailboxes and signers without a mailbox wait; requests signed by a key with a mailbox are served. |
-| `RELAY_RATE_AUTHFAIL_MAX_PENALTY` | `10m` | Cap on every debt and hold: the longest a network stays penalised after its last failure, and the longest hold of a key without a mailbox. |
+| `RELAY_RATE_AUTHFAIL_RPS` / `RELAY_RATE_AUTHFAIL_BURST` | `1` / `60` | Budget, per client network and relay process, of failures nobody can be held to (wrong or missing signature, unknown claim, and once per key: a key without a mailbox, a replay, a stale timestamp). A network that has used it up is penalised: its requests are signature-checked first; requests signed by a key with a mailbox are served; claim fetches, new mailboxes and signers without a mailbox get through at a trickle. |
+| `RELAY_RATE_AUTHFAIL_MAX_PENALTY` | `1m` | Cap on every debt and hold: the longest a network stays penalised after its last failure, and the longest hold of a key without a mailbox. Between 1 s and 24 h. |
 | `RELAY_RATE_VERIFY_RPS` / `RELAY_RATE_VERIFY_BURST` | `1000` / `2000` | Signature checks per penalised network, per relay process: the only work done there for a request before its signature is known to be good. |
-| `RELAY_RATE_KEYFAIL_RPS` / `RELAY_RATE_KEYFAIL_BURST` | `0.1` / `30` | Budget of refused deposits per sender key, per relay process. A properly signed refused deposit is charged here, not to the network. A sender that has used it up has its deposits refused until it refills; nothing else of it is affected. |
+| `RELAY_RATE_TRICKLE_RPS` / `RELAY_RATE_TRICKLE_BURST` | `0.1` / `3` | What a penalised network still gets, per relay process, of claim fetches, new mailboxes and deposits by signers without a mailbox. |
+| `RELAY_RATE_KEYFAIL_RPS` / `RELAY_RATE_KEYFAIL_BURST` | `1` / `200` | Budget of refused deposits per sender key, per relay process (there is also a fixed one per sender and mailbox: 0.1/s, burst 5). A properly signed refused deposit is charged here, not to the network. A sender over it has its deposits refused until it refills; nothing else of it is affected. |
 | `RELAY_RATE_REGISTER_RPS` / `RELAY_RATE_REGISTER_BURST` | `1` / `100` | New mailboxes (registrations that create one, and rotations) per client network. Registering an existing key again is free. |
 | `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
 | `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | Per-source-IP bucket for the web endpoints (§6.11) and every other path outside `/v1/` except `/healthz`. It's separate from the API bucket, so scanners never use up mailbox traffic's budget, and always in-process (per relay process, no Valkey round trip). |
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
 | `RELAY_ANDROID_CERT_SHA256` | the official VettID app's signing keys | Comma-separated SHA-256 certificate fingerprints for `assetlinks.json`, colon-separated or plain hex, any case (served in uppercase colon form). The built-in default (`config.DefaultAndroidCertFingerprints`: the production upload key and the two staging signers) lets a self-hosted relay open links in the official app with no configuration. Set but empty turns `assetlinks.json` off (404). |
 | `RELAY_MAX_COLLECTORS_PER_MAILBOX` | `4` | Concurrent long-polls plus WebSockets per mailbox. |
+| `RELAY_MAX_COLLECTORS` / `RELAY_MAX_COLLECTORS_PER_NETWORK` | `6000` / `3000` | Parked long-polls plus WebSocket sessions per relay process, in all and per client network. Each holds a connection; the caps bound that memory. Over a cap: `429`. |
+| `RELAY_MAX_INFLIGHT_BODY_BYTES` / `RELAY_MAX_INFLIGHT_BODY_BYTES_PER_NETWORK` | `67108864` / `16777216` | Request body bytes being read (blob uploads have their own slots) per relay process, in all and per client network. A body has 20 s to arrive. Over a cap: `429`. |
 | `RELAY_REPLAY_CACHE_MAX` | `1000000` | Replay-cache capacity. When it's full, requests are shed with `rate_limited` and no live entries are evicted. |
 | `RELAY_SWEEP_INTERVAL` | `60s` | TTL sweeper period. The first pass is jittered. |
 | `RELAY_SHUTDOWN_TIMEOUT` | `20s` | Bound on the graceful drain after SIGTERM. |
@@ -150,29 +153,39 @@ Spec §7.2 has the rules and where each number comes from. In short:
   unauthenticated; after that the **key** is limited
   (`RELAY_RATE_KEY_*`, `RELAY_RATE_SENDER_*`), and failures of properly
   signed requests are the key's too.
-- **Blast radius.** Beyond the flood guard, nothing keyed on an address
-  refuses a request that is properly signed by a key with a mailbox. One
-  client behind an address cannot get the others refused.
+- **Blast radius.** Nothing keyed on an address refuses a request that is
+  properly signed by a key with a mailbox, except the flood guard and the
+  resource caps (parked collectors, body bytes being read), all sized
+  well above a full host. One client behind an address cannot get the
+  others refused.
 - Per network there are two things. A **flood guard** (`RELAY_RATE_IP_*`)
   sized for a whole host. And a small budget of **failures nobody can be
-  held to** (`RELAY_RATE_AUTHFAIL_*`): wrong or missing signatures,
-  replays, unknown claims, and the first failure of each key that signs
-  properly but has no mailbox (keys are free).
-- A network out of that budget is *penalised*: requests without a key
-  header and claim fetches are refused, every other request has its
-  signature checked first (`RELAY_RATE_VERIFY_*` bounds those checks) and
-  meets the flood guard only after it verified, and then everything
-  signed by a key with a mailbox is served as usual, whether the relay
-  has seen the key before or not. New mailboxes and signers without a
-  mailbox wait.
+  held to** (`RELAY_RATE_AUTHFAIL_*`): wrong or missing signatures, unknown
+  claims, and once per key what a properly signed request does wrong when
+  its key cannot answer for it (no mailbox, a replay, a stale timestamp).
+- A network out of that budget is *penalised*, for at most
+  `RELAY_RATE_AUTHFAIL_MAX_PENALTY` after its last failure. Every request
+  with a key header then has its signature checked first
+  (`RELAY_RATE_VERIFY_*` bounds those checks) and meets the flood guard
+  only after it verified, and before its replay record. Everything signed
+  by a key with a mailbox is served as usual, whether the relay has seen
+  the key before or not. Claim fetches, new mailboxes and signers without
+  a mailbox get through at a trickle (`RELAY_RATE_TRICKLE_*`); requests
+  without a key are refused.
 - A key that signs properly and has no mailbox (a client whose mailbox is
-  gone, asking again every second) is held for 1 s, 2 s, 4 s … up to
-  `RELAY_RATE_AUTHFAIL_MAX_PENALTY` and refused by its header meanwhile;
-  it costs its network one unit, once. Registering clears it.
+  gone, asking again every second) is held for 1 s, 2 s, 4 s … up to the
+  cap; its signed requests are refused before the store is read, and it
+  costs its network one unit, once. Registering clears it, on any relay
+  process: a hold is checked against the store every 5 s before it
+  refuses.
 - A refused deposit that is properly signed (an expired token, a peer that
-  is gone) draws on the sender key's own budget (`RELAY_RATE_KEYFAIL_*`).
-  A wrong clock (`timestamp_stale` under a good signature) costs the
-  network one unit per key, not per retry, and holds nobody.
+  is gone) draws on the sender key's own budgets, per peer and overall
+  (`RELAY_RATE_KEYFAIL_*`); one gone peer does not stop deposits to the
+  others. A wrong clock or a client sending requests twice costs the
+  network one unit per key and minute, and holds nobody.
+- Request bodies are read after the checks that need only headers (a
+  deposit's after §5.3 steps 1–6), count against per-network and
+  per-process caps while they are read, and have 20 s to arrive.
 - An attacker with many keys is not bounded by per-key limits (keys are
   free); the flood guard bounds it at `RELAY_RATE_IP_RPS` in total, and
   `RELAY_RATE_REGISTER_*` limits how fast one network can make mailboxes.
@@ -180,7 +193,8 @@ Spec §7.2 has the rules and where each number comes from. In short:
   checks a second per process (CPU only, about 0.12 ms each on x86), and
   `RELAY_RATE_IP_RPS` properly signed requests a second in total, each at
   most a replay record and one or two store reads.
-- No limit is an oracle, there is no allowlist, and none is needed.
+- No limit is an oracle (nothing depends on a key before its signature
+  has verified), there is no allowlist, and none is needed.
 - `retry_after` (and `Retry-After`) is the whole seconds until a request is
   allowed; for the network limits a random 0–4 s is added so that the many
   clients of one network do not all come back together.
@@ -195,8 +209,9 @@ nothing identifies a client): `relay_ratelimit_allowed_total`,
 the busiest bucket of each limiter got in the last full minute; 1000 means
 something was refused), `relay_ratelimit_authfail_charged_total`,
 `relay_ratelimit_penalised_networks`, `relay_ratelimit_held_keys`.
-Limiters: `address`, `verify`, `authfail`, `nomailbox`, `keyfail`, `key`,
-`sender`, `register`, `claim`, `web`, `collectors`. Each process also logs
+Limiters: `address`, `verify`, `authfail`, `trickle`, `nomailbox`,
+`keyfail`, `key`, `sender`, `register`, `claim`, `web`, `collectors`,
+`bodies`. Each process also logs
 one `rate limits` line a minute with the same peaks and the refusals of
 that minute, at info level when anything but the web bucket refused or was
 at least half used (otherwise debug). Alarm on `address_peak` or `key_peak`
@@ -213,12 +228,17 @@ RELAY_LOADSIM=long go test ./internal/api -run TestLoad -v   # an hour of simula
 They put 100, 500 and 1,000 vaults behind one address, each behaving as
 vettid-vault does (a long-poll every 25 s, an ack and a new collect per
 message, a deposit per message sent, and the client's retries on 429),
-against the real handler chain with a simulated clock, under the old
-single bucket (20/s, burst 40) and under the defaults; attack from one
-address with bad signatures, fresh keys, registrations and many valid
-keys; and put, on a 500-vault host's own address, orphaned clients
-retrying every second, vaults unlocked after being locked, a wrong clock,
-and wrong signatures at 500 a second.
+against the real handler chain with a simulated clock, under a single
+bucket of 20/s, burst 40 and under the defaults; attack from one address
+with bad signatures, fresh keys, registrations and many valid keys; and
+put, on a 500-vault host's own address, orphaned clients retrying every
+second, vaults unlocked after being locked, a wrong clock, and wrong
+signatures at 500 a second; and 200 phones behind one NAT address with a
+misbehaving neighbour. The "old" limiter in these is this code with its
+limits set to what `main` had (one per-address bucket, everything else
+off), not `main`'s code. A long-poll is counted when it is issued, so the
+simulation issues it with `wait=0`; real parked collects are covered by
+`TestParkedCollectorsAreCapped`.
 
 ## Deployment notes
 

@@ -128,7 +128,10 @@ func depositReq(to, signer principal, tok, payload string) req {
 // waits is what is not that: unsigned requests, claim fetches, new
 // mailboxes, signers without a mailbox.
 func TestPenalisedNetworkServesEveryMailbox(t *testing.T) {
-	f := newFixtureWith(t, failBudget(3), func(*fixture) []Option { return []Option{WithRetryJitter(func() int { return 2 })} })
+	f := newFixtureWith(t, func(c *config.Config) {
+		failBudget(3)(c)
+		c.RateTricklePerSec, c.RateTrickleBurst = 0.05, 2
+	}, func(*fixture) []Option { return []Option{WithRetryJitter(func() int { return 2 })} })
 	vault, late, owner, stranger, fresh := newPrincipal(1), newPrincipal(2), newPrincipal(3), newPrincipal(9), newPrincipal(10)
 	for _, p := range []principal{vault, late, owner} {
 		f.register(p)
@@ -141,15 +144,22 @@ func TestPenalisedNetworkServesEveryMailbox(t *testing.T) {
 	if n := f.s.fails.Exhausted(f.clk.now()); n != 1 {
 		t.Fatalf("penalised networks: %d", n)
 	}
-	// Unauthenticated work waits.
+	// A request without a key is refused unread.
 	e := f.expectFrom(hostA, req{method: "GET", path: "/v1/mailbox"}, 429, CodeRateLimited)
 	if e.RetryAfter != 10+2 {
 		t.Fatalf("retry_after %d, want the refill time (10 s) plus jitter (2)", e.RetryAfter)
 	}
-	f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa"}, 429, CodeRateLimited)
-	f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa", header: keyHeader(vault)}, 429, CodeRateLimited)
-	f.expectFrom(hostA, registerReq(fresh), 429, CodeRateLimited)                            // a new mailbox
-	f.expectFrom(hostA, depositReq(owner, stranger, strangerTok, "x"), 429, CodeRateLimited) // a signer without a mailbox
+	// What has no key with a mailbox to serve it by gets through at a
+	// trickle (here two, then one per 20 s): claim fetches, new mailboxes,
+	// deposits by a signer without a mailbox.
+	f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa"}, 404, CodeClaimUnknown)
+	f.expectFrom(hostA, registerReq(newPrincipal(12)), 201, "")
+	e = f.expectFrom(hostA, req{method: "GET", path: "/v1/claim/aaaaaaaaaaaaaaaaaaaaaaaaaa", header: keyHeader(vault)}, 429, CodeRateLimited)
+	if e.RetryAfter != 20+2 {
+		t.Fatalf("trickle retry_after %d", e.RetryAfter)
+	}
+	f.expectFrom(hostA, registerReq(fresh), 429, CodeRateLimited)
+	f.expectFrom(hostA, depositReq(owner, stranger, strangerTok, "x"), 429, CodeRateLimited)
 	// Everything properly signed by a key with a mailbox is served: a key
 	// never seen from this address (a vault unlocked after a night: its
 	// first request re-registers its existing key), owner routes, deposits,
@@ -169,14 +179,16 @@ func TestPenalisedNetworkServesEveryMailbox(t *testing.T) {
 	// Other addresses are not involved.
 	f.expectFrom(hostB, registerReq(fresh), 201, "")
 	// On a penalised network the flood guard is met after the signature:
-	// the unsigned and wrongly signed requests above used none of it. (The
-	// fixture's 3 registrations, the 3 first failures, the 9 properly
-	// signed requests since, and hostB's.)
-	if got := f.s.rl.allowed.With(limAddress).Value(); got != 3+3+9+1 {
-		t.Fatalf("flood guard admissions: %d", got)
+	// the unsigned and wrongly signed requests above used none of it.
+	before := f.s.rl.allowed.With(limAddress).Value()
+	f.expectFrom(hostA, badSig(f, vault), 401, CodeSignatureInvalid)
+	f.expectFrom(hostA, req{method: "GET", path: "/v1/mailbox"}, 429, CodeRateLimited)
+	if got := f.s.rl.allowed.With(limAddress).Value(); got != before {
+		t.Fatalf("bad requests took %d flood guard tokens on a penalised network", got-before)
 	}
-	if got := f.s.rl.allowed.With(limVerify).Value(); got != 11 { // every request with a key header
-		t.Fatalf("signature-check guard admissions: %d", got)
+	f.expectFrom(hostA, collectReq(vault), 200, "")
+	if got := f.s.rl.allowed.With(limAddress).Value(); got != before+1 {
+		t.Fatalf("a served request took %d flood guard tokens", got-before)
 	}
 	f.clk.add(2 * time.Minute)
 	f.expectFrom(hostA, registerReq(newPrincipal(11)), 201, "")
@@ -193,13 +205,17 @@ func TestOrphanCostsItsNetworkOnce(t *testing.T) {
 	vault, orphan := newPrincipal(1), newPrincipal(7)
 	f.register(vault)
 	f.expectFrom(hostA, collectReq(orphan), 404, CodeMailboxUnknown)
-	// Held: refused by its header alone, signed or not, on every route but registration.
+	// Held: its properly signed requests are refused before the store is
+	// asked, on every route but registration, from any address.
 	e := f.expectFrom(hostA, collectReq(orphan), 429, CodeRateLimited)
 	if e.RetryAfter != 1 {
 		t.Fatalf("first hold: retry_after %d", e.RetryAfter)
 	}
-	f.expectFrom(hostA, badSig(f, orphan), 429, CodeRateLimited)
 	f.expectFrom(hostB, req{method: "DELETE", path: "/v1/mailbox", signer: &orphan}, 429, CodeRateLimited)
+	// Only the key's holder is told: someone naming the key without its
+	// signature gets what they get for any key (no oracle), and pays for it.
+	f.expectFrom(hostB, badSig(f, orphan), 401, CodeSignatureInvalid)
+	f.expectFrom(hostB, req{method: "GET", path: "/v1/mailbox", header: keyHeader(orphan)}, 401, CodeSignatureInvalid)
 	// It comes back the moment each hold ends, for a week's worth of holds.
 	hold := time.Second
 	var told []int
@@ -214,10 +230,10 @@ func TestOrphanCostsItsNetworkOnce(t *testing.T) {
 	if told[0] != 2 || told[1] != 4 || told[4] != 32 || told[5] != 60 || told[39] != 60 {
 		t.Fatalf("retry_after does not grow to its cap: %v", told)
 	}
-	if f.s.fails.Exhausted(f.clk.now()) != 0 || f.s.fails.Len() > 1 {
-		t.Fatal("the orphan's repeats were charged to its network")
+	if f.s.fails.Wait(hostA, f.clk.now()) != 0 || f.s.rl.charged.Value() != 1+2 { // the orphan once; hostB's two probes
+		t.Fatalf("the orphan's repeats were charged to its network (%d charges)", f.s.rl.charged.Value())
 	}
-	if v := f.s.rl.refused.With(limNoMailbox).Value(); v != 43 {
+	if v := f.s.rl.refused.With(limNoMailbox).Value(); v != 42 {
 		t.Fatalf("refused counter %d", v)
 	}
 	// Registration is the way out, held or not.

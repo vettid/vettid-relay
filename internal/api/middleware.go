@@ -108,8 +108,18 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			s.log.LogAttrs(r.Context(), level, "request", attrs...)
 		}()
 		next.ServeHTTP(rec, r)
+		// A refused request whose body was never read: net/http reads what
+		// is left of it before it sends the answer. A client that announced
+		// a body and stalls would hold the connection (and the answer)
+		// until the server's read timeout; give it a moment instead.
+		if rec.status >= 400 && r.ContentLength != 0 && !rec.hijacked {
+			http.NewResponseController(w).SetReadDeadline(time.Now().Add(refusedDrainTimeout))
+		}
 	})
 }
+
+// refusedDrainTimeout: see withAccessLog.
+const refusedDrainTimeout = time.Second
 
 // withSecurityHeaders sets conservative response headers. The web
 // documents (web.go) replace them with their own fuller set.
@@ -169,11 +179,11 @@ func rateKey(a netip.Addr) string {
 // withIPRateLimit applies what comes before a request's handler (spec
 // §7.2, limits.go).
 //
-// /v1/: a key held for having no mailbox is refused by its header. Then, on
-// a network with failed-authentication budget, the flood guard. On a
-// penalised network the flood guard waits until the request's signature
-// has verified (authz.go): a request without a key is refused here, the
-// others pass the signature-check guard.
+// /v1/: on a network with failed-authentication budget, the flood guard.
+// On a penalised network the flood guard waits until the request's
+// signature has verified (authz.go): a request without a key is refused
+// here (claim fetches go on to their trickle), the others pass the
+// signature-check guard.
 //
 // Everything else (/connect, /.well-known/, /robots.txt and every unknown
 // path): a separate web bucket, so scanners spend their own budget and
@@ -183,15 +193,14 @@ func (s *Server) withIPRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case isAPIPath(r.URL.Path):
-			if e := s.heldKey(r); e != nil {
-				s.writeError(w, e)
-				return
-			}
 			st := stateOf(w)
 			st.addr = rateKey(clientIP(r, s.cfg.TrustProxy))
 			if e := s.penalty(st.addr); e != nil {
 				st.penalised = true
-				if headerKey(r) == "" {
+				switch {
+				case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/claim/"):
+					// Unauthenticated by nature: its handler lets a trickle through.
+				case headerKey(r) == "":
 					s.rl.refused.With(limAuthFail).Inc()
 					s.writeError(w, e)
 					return

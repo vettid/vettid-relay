@@ -134,9 +134,11 @@ func TestDynamoStoreConfig(t *testing.T) {
 
 func TestRateLimitConfig(t *testing.T) {
 	d := Defaults()
-	if d.RateIPPerSec != 200 || d.RateIPBurst != 2000 || d.RateKeyPerSec != 20 || d.RateKeyBurst != 100 ||
-		d.RateAuthFailPerSec != 1 || d.RateAuthFailBurst != 60 || d.AuthFailMaxPenalty != 10*time.Minute ||
-		d.RateKeyFailPerSec != 0.1 || d.RateKeyFailBurst != 30 || d.RateVerifyPerSec != 1000 || d.RateVerifyBurst != 2000 ||
+	if d.RateIPPerSec != 200 || d.RateIPBurst != 4000 || d.RateKeyPerSec != 20 || d.RateKeyBurst != 100 ||
+		d.RateAuthFailPerSec != 1 || d.RateAuthFailBurst != 60 || d.AuthFailMaxPenalty != time.Minute ||
+		d.RateTricklePerSec != 0.1 || d.RateTrickleBurst != 3 || d.MaxCollectors != 6000 || d.MaxCollectorsPerNetwork != 3000 ||
+		d.MaxBodyBytes != 64<<20 || d.MaxBodyBytesPerNetwork != 16<<20 ||
+		d.RateKeyFailPerSec != 1 || d.RateKeyFailBurst != 200 || d.RateVerifyPerSec != 1000 || d.RateVerifyBurst != 2000 ||
 		d.RateRegisterPerSec != 1 || d.RateRegisterBurst != 100 || d.RateSenderPerSec != 5 || d.RateSenderBurst != 20 ||
 		d.RateClaimPerSec != 1 || d.RateClaimBurst != 10 {
 		t.Fatalf("defaults differ from docs/RELAY-PROTOCOL.md §7.2: %+v", d)
@@ -166,6 +168,12 @@ func TestRateLimitConfig(t *testing.T) {
 	}
 	for _, bad := range []map[string]string{
 		{"RELAY_RATE_KEY_RPS": "0"},
+		{"RELAY_RATE_AUTHFAIL_RPS": "0"},
+		{"RELAY_RATE_IP_RPS": "0"},
+		{"RELAY_RATE_TRICKLE_RPS": "0"},
+		{"RELAY_RATE_AUTHFAIL_MAX_PENALTY": "0"},
+		{"RELAY_MAX_COLLECTORS": "0"},
+		{"RELAY_MAX_INFLIGHT_BODY_BYTES_PER_NETWORK": "0"},
 		{"RELAY_RATE_KEY_BURST": "0"},
 		{"RELAY_RATE_AUTHFAIL_BURST": "-1"},
 		{"RELAY_RATE_AUTHFAIL_MAX_PENALTY": "never"},

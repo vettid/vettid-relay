@@ -32,11 +32,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	if !s.hub.acquire(mb.ID, s.cfg.MaxCollectorsPerMailbox) {
-		s.writeError(w, s.refuseCollector())
+	addr := stateOf(w).addr
+	if why := s.hub.acquire(mb.ID, addr, s.cfg.MaxCollectorsPerMailbox, s.cfg.MaxCollectorsPerNetwork, s.cfg.MaxCollectors); why != "" {
+		s.writeError(w, s.refuseCollector(why))
 		return
 	}
-	defer s.hub.release(mb.ID)
+	defer s.hub.release(mb.ID, addr)
 	gone := s.hub.goneCh(mb.ID)
 	if !s.stillRegistered(r.Context(), mb.ID) {
 		s.writeError(w, fail(CodeMailboxUnknown)) // deleted since authorization

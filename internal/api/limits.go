@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"math/rand/v2"
 	"net/http"
 	"sync"
@@ -22,48 +23,58 @@ import (
 // goes for penalties: a failure of a properly signed request belongs to
 // its key.
 //
-// The blast-radius rule that follows from it: beyond the flood guard,
-// nothing keyed on a network may refuse a request that is properly signed
-// by a key with a mailbox.
+// The blast-radius rule that follows from it: nothing keyed on a network
+// may refuse a request that is properly signed by a key with a mailbox,
+// except the flood guard and the resource caps (collectors, body bytes),
+// which are sized well above a full host.
 //
 //	address   flood guard per network, sized for a whole host's valid
 //	          traffic. It bounds everything one network can make the relay
 //	          do beyond checking signatures. Shared.
 //	authfail  a small budget of failures nobody can be held to: wrong
-//	          signatures, unsigned requests, replays, unknown claims,
-//	          unsigned refused deposits, and the FIRST failure of each key
-//	          that signs properly but has no mailbox (keys are free to
-//	          make, so each new one is the network's). Per process.
+//	          signatures, unsigned requests, unknown claims, unsigned
+//	          refused deposits, and ONCE per key: a key that signs properly
+//	          but has no mailbox, a replay, a stale timestamp. Per process.
 //	          A network that has used it up is "penalised": requests
 //	          without a key are refused unread, every other request has its
 //	          signature checked before anything else (bounded by verify),
 //	          and only then meets the flood guard, so that the network's
-//	          bad requests cannot use up what its good ones need. New
-//	          mailboxes, and deposits by signers without a mailbox, wait.
+//	          bad requests cannot use up what its good ones need.
 //	          Everything properly signed by a key with a mailbox is served.
+//	          New mailboxes, claim fetches and deposits by signers without
+//	          a mailbox get through at a trickle.
 //	verify    signature checks per penalised network: the only work done
 //	          for a request there before its signature is known to be good.
 //	          Per process.
+//	trickle   what a penalised network still gets of the things that wait.
+//	          Per process.
 //	nomailbox keys that signed an owner request properly and had no
 //	          mailbox are remembered and held for 1 s, 2 s, 4 s ... (a
-//	          client whose mailbox is gone and that keeps asking): refused
-//	          by reading one header, until the key registers. Per process.
+//	          client whose mailbox is gone and that keeps asking), until
+//	          the key registers, on this process or (re-checked every few
+//	          seconds) on another. Per process.
 //	keyfail   refused deposits per properly signing sender key (an expired
-//	          token, a peer that is gone): the key's own small budget. Its
-//	          network is not charged if the key has a mailbox, and once per
-//	          key otherwise. Per process.
+//	          token, a peer that is gone): a small budget per sender and
+//	          mailbox, and a larger one per sender. Its network is not
+//	          charged if the key has a mailbox, and once per key otherwise.
+//	          Per process.
 //	key       per signing key, after authentication. Shared.
 //	sender    per sender key, on deposits after the signature. Shared.
 //	register  new mailboxes (registration, rotation) per network. Shared.
 //	claim     unauthenticated claim fetches per network. Shared.
+//	collectors parked long-polls and WebSocket sessions: per mailbox, per
+//	          network and per process.
+//	bodies    request body bytes being read: per network and per process.
 //	web       everything outside /v1/, per network. Per process.
 //
-// No limit answers differently depending on whether a mailbox exists, except
-// to the holder of its key (who is told mailbox_unknown anyway).
+// Every refusal that depends on a key (held, over its refused deposits,
+// over its bucket) is made only after that key's signature has verified,
+// so only its holder ever sees it.
 const (
 	limAddress    = "address"
 	limVerify     = "verify"
 	limAuthFail   = "authfail"
+	limTrickle    = "trickle"
 	limNoMailbox  = "nomailbox"
 	limKeyFail    = "keyfail"
 	limKey        = "key"
@@ -72,14 +83,22 @@ const (
 	limClaim      = "claim"
 	limWeb        = "web"
 	limCollectors = "collectors"
+	limBodies     = "bodies"
 )
 
-var allLimiters = []string{limAddress, limVerify, limAuthFail, limNoMailbox, limKeyFail, limKey, limSender, limRegister, limClaim, limWeb, limCollectors}
+var allLimiters = []string{limAddress, limVerify, limAuthFail, limTrickle, limNoMailbox, limKeyFail, limKey, limSender, limRegister, limClaim, limWeb, limCollectors, limBodies}
 
 const (
-	// maxHeldKeys bounds the table of keys without a mailbox, and the table
-	// of keys already charged for a stale timestamp (about 150 bytes each).
-	maxHeldKeys = 200_000
+	// maxHeldKeys bounds each per-key table (keys without a mailbox, keys
+	// already charged once, refused deposits): about 150 bytes a key. A
+	// full table tracks no new key and charges nobody for it.
+	maxHeldKeys = 50_000
+	// holdRecheck is how often a held key's mailbox is looked up again:
+	// it may have registered on another process.
+	holdRecheck = 5 * time.Second
+	// Refused deposits per (sender, mailbox): one peer that is gone must
+	// not stop a sender's deposits to its other peers.
+	pairFailRate, pairFailBurst = 0.1, 5
 	// holdBase is the first hold of a key found without a mailbox.
 	holdBase = time.Second
 	// retryJitterMax spreads the retry_after of refusals that hit many
@@ -197,8 +216,8 @@ func (s *Server) chargeNetwork(addr string) {
 }
 
 // authFailed charges a failure nobody can be held to (a wrong signature,
-// an unsigned request, a replay, an unknown claim) to the request's
-// network and returns the error to send.
+// an unsigned request, an unknown claim) to the request's network and
+// returns the error to send.
 func (s *Server) authFailed(w http.ResponseWriter, e *apiError) *apiError {
 	if st := stateOf(w); st.addr != "" {
 		s.chargeNetwork(st.addr)
@@ -206,55 +225,67 @@ func (s *Server) authFailed(w http.ResponseWriter, e *apiError) *apiError {
 	return e
 }
 
-// staleFailed charges a properly signed request with a timestamp outside
-// the freshness window: a client with a wrong clock, retrying. It is its
-// key's failure; the network pays once per key (keys are free), not once
-// per retry. The key is not held: an old request can be sent again by
-// anyone who saw it, and that must not be a way to hold someone's key.
-func (s *Server) staleFailed(w http.ResponseWriter, e *apiError, key []byte) *apiError {
+// keyFailedOnce charges a failure of a request that carries key's good
+// signature, but that its holder cannot be punished for: a timestamp
+// outside the window (a wrong clock) or a replay (a retry bug; or someone
+// else re-sending what they saw, which must not be a way to hold a key).
+// The network pays once per key, kind and window (the cap of a penalty),
+// not once per repeat: one such client behind an address costs it one unit
+// a minute, while a whole host of them (a wrong host clock) keeps its
+// address in signature-first mode for as long as it lasts, so that their
+// requests do not use up the flood guard the correct ones will need.
+func (s *Server) keyFailedOnce(w http.ResponseWriter, e *apiError, kind string, key []byte) *apiError {
 	st := stateOf(w)
 	if st.addr == "" {
 		return e
 	}
-	k, now := auth.EncodeKey(key), s.now()
-	if !s.staleSeen.Has(k, now) { // also when the table is full and remembers nothing
+	k, now := kind+auth.EncodeKey(key), s.now()
+	if s.onceSeen.Has(k, now) {
+		return e // already paid for in this window (the entry is not renewed)
+	}
+	s.onceSeen.Add(k, now, true)
+	// A full table remembers nothing: then nobody is charged, or one
+	// client's repeats would be charged to its network every time.
+	if s.onceSeen.Has(k, now) {
 		s.chargeNetwork(st.addr)
 	}
-	s.staleSeen.Add(k, now, true)
 	return e
 }
 
 // noMailbox handles a request that was properly signed (and no replay) by
 // a key that has no mailbox. The key is remembered and held, for longer
-// each time it comes back (the middleware then refuses it by its header
-// alone, heldKey); its network is charged once, when the key is first
-// seen, not on every repeat. So one client whose mailbox is gone costs its
-// network one unit however long it keeps asking, and someone making fresh
-// keys still pays the network for each.
+// each time it comes back (held); its network is charged once, when the
+// key is first seen, not on every repeat. So one client whose mailbox is
+// gone costs its network one unit however long it keeps asking, and
+// someone making fresh keys still pays the network for each.
 func (s *Server) noMailbox(w http.ResponseWriter, e *apiError, key []byte) *apiError {
 	st := stateOf(w)
 	if st.addr == "" {
 		return e
 	}
-	now := s.now()
-	if s.orphans.Fail(auth.EncodeKey(key), now) {
+	if s.orphans.Fail(auth.EncodeKey(key), s.now()) {
 		s.chargeNetwork(st.addr)
 	}
 	return e
 }
 
-// heldKey refuses a request naming a key that is held for having no
-// mailbox, by reading one header. Registration is exempt: it is the way
-// out. The header is not verified: only properly signed requests ever put
-// a key here, and all the answer says is what anyone who knows a public
-// key can ask the relay anyway (§5.3 step 1).
-func (s *Server) heldKey(r *http.Request) *apiError {
-	k := headerKey(r)
-	if k == "" || r.Method == http.MethodPost && r.URL.Path == "/v1/register" {
+// held refuses a properly signed request by a key that is held for having
+// no mailbox. Registration is exempt: it is the way out. Because the key
+// may have registered on another relay process since, its mailbox is
+// looked up again every holdRecheck before a refusal. The caller has
+// verified the signature, so only the key's holder is ever answered from
+// this table.
+func (s *Server) held(r *http.Request, key []byte) *apiError {
+	if r.Method == http.MethodPost && r.URL.Path == "/v1/register" {
 		return nil
 	}
-	wait := s.orphans.Wait(k, s.now())
+	k, now := auth.EncodeKey(key), s.now()
+	wait := s.orphans.Wait(k, now)
 	if wait <= 0 {
+		return nil
+	}
+	if s.orphans.Recheck(k, now, holdRecheck) && s.hasMailbox(r.Context(), key) {
+		s.orphans.Clear(k)
 		return nil
 	}
 	s.rl.refused.With(limNoMailbox).Inc()
@@ -267,50 +298,110 @@ func (s *Server) hasMailbox(ctx context.Context, key []byte) bool {
 	return err == nil && subtle.ConstantTimeCompare(mb.PubKey, key) == 1
 }
 
+func pairKey(senderB64, mailbox string) string { return senderB64 + "|" + mailbox }
+
 // depositFailed charges a refused deposit (§5.3 steps 1–7) to whoever it
 // belongs to. Properly signed (a vault whose token expired, or whose peer
-// is gone): the key's own small budget of refused deposits; its network is
-// never charged if the key has a mailbox, and once per key otherwise. Not
-// properly signed: the network. signed is the verified
-// signature if the caller has checked it; if not, it is checked here when
-// the body has been read (bodyHash non-nil), one verification on a path
-// that is budgeted anyway.
-func (s *Server) depositFailed(w http.ResponseWriter, r *http.Request, e *apiError, signed *auth.SignedRequest, bodyHash *[32]byte) *apiError {
+// is gone): the sender key's own budgets of refused deposits, one per
+// mailbox and one overall; its network is never charged if the key has a
+// mailbox, and once per key otherwise. Not properly signed: the network.
+// signed is the verified signature if the caller has checked it; if not,
+// it is checked here when the body can be had (hash non-nil), and recorded
+// against replay, so that a captured failing deposit cannot be sent again
+// to run up its sender's budget.
+func (s *Server) depositFailed(w http.ResponseWriter, r *http.Request, e *apiError, mailboxID string, signed *auth.SignedRequest, hash func() *[32]byte) *apiError {
 	if stateOf(w).addr == "" {
 		return e
 	}
 	now := s.now()
-	if signed == nil && bodyHash != nil {
-		if sr, err := auth.ParseHeaders(r.Header); err == nil && sr.Verify(r.Method, r.URL.EscapedPath(), *bodyHash, now) == nil {
-			signed = &sr
+	if signed == nil && hash != nil {
+		// The body is read (for its hash) only for a request that at least
+		// carries well-formed signature headers.
+		if sr, err := auth.ParseHeaders(r.Header); err == nil {
+			if h := hash(); h != nil && sr.Verify(r.Method, r.URL.EscapedPath(), *h, now) == nil {
+				switch err := s.replay.Check(sr, now); {
+				case err == nil:
+					signed = &sr
+				case errors.Is(err, auth.ErrReplay):
+					return s.keyFailedOnce(w, e, onceReplay, sr.Key)
+				default: // cannot be recorded now: nobody is charged
+					return e
+				}
+			}
 		}
 	}
 	if signed == nil {
 		return s.authFailed(w, e)
 	}
-	// The key's own budget. Its network pays only for a key without a
+	// The key's own budgets. Its network pays only for a key without a
 	// mailbox (free to make), and then once, not per repeat.
-	if first := s.keyFails.Charge(auth.EncodeKey(signed.Key), now); first && !s.hasMailbox(r.Context(), signed.Key) {
+	k := auth.EncodeKey(signed.Key)
+	s.pairFails.Charge(pairKey(k, mailboxID), now)
+	if first := s.keyFails.Charge(k, now); first && !s.hasMailbox(r.Context(), signed.Key) {
 		s.chargeNetwork(stateOf(w).addr)
 	}
 	return e
 }
 
-// senderOverFailures refuses a deposit naming a sender key that has used
-// up its budget of refused deposits. The header is not verified here: only
-// properly signed failures were ever charged to the key, so nobody else
-// can run it up.
-func (s *Server) senderOverFailures(r *http.Request) *apiError {
+const (
+	onceStale  = "s|"
+	onceReplay = "r|"
+)
+
+// senderOverFailures is the 429 for a deposit by a sender key that has
+// used up its budget of refused deposits, to this mailbox or overall. It
+// reads the key from the header: the caller answers with it only once the
+// signature has verified.
+func (s *Server) senderOverFailures(r *http.Request, mailboxID string) *apiError {
 	k := headerKey(r)
 	if k == "" {
 		return nil
 	}
-	wait := s.keyFails.Wait(k, s.now())
+	now := s.now()
+	wait := max(s.keyFails.Wait(k, now), s.pairFails.Wait(pairKey(k, mailboxID), now))
 	if wait <= 0 {
 		return nil
 	}
-	s.rl.refused.With(limKeyFail).Inc()
 	return &apiError{code: CodeRateLimited, retryAfter: min(ratelimit.RetryAfterSeconds(wait), maxPenaltyRetry)}
+}
+
+// bodies counts request body bytes being read, per process and per client
+// network: a body that is announced and then stalls holds its buffer, and
+// nothing about the sender is known yet.
+type bodies struct {
+	mu     sync.Mutex
+	total  int64
+	perNet map[string]int64
+}
+
+// reserveBody admits n body bytes from the request's network, or returns
+// the 429. The caller releases them when the body has been read.
+func (s *Server) reserveBody(w http.ResponseWriter, n int64) (release func(), e *apiError) {
+	addr := stateOf(w).addr
+	b := &s.bodies
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.total+n > s.cfg.MaxBodyBytes || addr != "" && b.perNet[addr]+n > s.cfg.MaxBodyBytesPerNetwork {
+		s.rl.refused.With(limBodies).Inc()
+		return nil, &apiError{code: CodeRateLimited, retryAfter: 1 + s.jitter()}
+	}
+	b.total += n
+	if addr != "" {
+		b.perNet[addr] += n
+	}
+	if used := b.total * 1000 / s.cfg.MaxBodyBytes; used > s.bodiesPeak.Load() {
+		s.bodiesPeak.Store(used)
+	}
+	return func() {
+		b.mu.Lock()
+		b.total -= n
+		if addr != "" {
+			if b.perNet[addr] -= n; b.perNet[addr] <= 0 {
+				delete(b.perNet, addr)
+			}
+		}
+		b.mu.Unlock()
+	}, nil
 }
 
 // allowKey applies the per-key bucket to a caller that has proved it holds
@@ -326,26 +417,28 @@ func (s *Server) allowSender(sub string) *apiError {
 }
 
 // allowRegistration applies the per-network budget of new mailboxes. On a
-// penalised network new mailboxes wait.
+// penalised network they get through at a trickle only.
 func (s *Server) allowRegistration(w http.ResponseWriter) *apiError {
 	st := stateOf(w)
 	if st.addr == "" {
 		return nil
 	}
 	if st.penalised {
-		if e := s.penalty(st.addr); e != nil {
-			s.rl.refused.With(limAuthFail).Inc()
+		if e := s.take(limTrickle, s.trickle, st.addr, true); e != nil {
 			return e
 		}
 	}
 	return s.take(limRegister, s.regLimit, st.addr, false)
 }
 
-// refuseCollector is the answer when a mailbox already has its maximum of
-// concurrent collectors.
-func (s *Server) refuseCollector() *apiError {
+// refuseCollector is the answer when a mailbox, its network or this
+// process already has its maximum of concurrent collectors.
+func (s *Server) refuseCollector(why string) *apiError {
 	s.rl.refused.With(limCollectors).Inc()
-	return &apiError{code: CodeRateLimited, retryAfter: 1}
+	if why == fullMailbox {
+		return &apiError{code: CodeRateLimited, retryAfter: 1}
+	}
+	return &apiError{code: CodeRateLimited, retryAfter: 1 + s.jitter()} // many clients at once
 }
 
 // reportLimits publishes, once a minute, how close each limiter's busiest
@@ -357,13 +450,15 @@ func (s *Server) reportLimits() {
 	now := s.now()
 	peaks := map[string]float64{}
 	for name, l := range map[string]any{
-		limAddress: s.addrLimit, limVerify: s.verifyLimit, limAuthFail: s.fails, limKeyFail: s.keyFails, limKey: s.keyLimit, limSender: s.subLimit,
+		limAddress: s.addrLimit, limVerify: s.verifyLimit, limAuthFail: s.fails, limTrickle: s.trickle, limKeyFail: s.keyFails, limKey: s.keyLimit, limSender: s.subLimit,
 		limRegister: s.regLimit, limClaim: s.claimLimit, limWeb: s.webLimit,
 	} {
 		if p, ok := l.(interface{ Peak() float64 }); ok {
 			peaks[name] = p.Peak()
 		}
 	}
+	peaks[limBodies] = float64(s.bodiesPeak.Swap(0)) / 1000
+	peaks[limCollectors] = float64(s.hub.collectors()) / float64(s.cfg.MaxCollectors)
 	s.rl.penalised.Set(int64(s.fails.Exhausted(now)))
 	attrs := make([]any, 0, 4*len(allLimiters))
 	notable := false
@@ -373,7 +468,7 @@ func (s *Server) reportLimits() {
 		total := s.rl.refused.With(name).Value()
 		refused := total - s.rl.lastRef[name]
 		s.rl.lastRef[name] = total
-		if name != limCollectors && name != limNoMailbox {
+		if name != limNoMailbox {
 			attrs = append(attrs, name+"_peak", pm)
 		}
 		attrs = append(attrs, name+"_refused", refused)

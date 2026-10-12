@@ -41,17 +41,23 @@ type Server struct {
 
 	replay ReplayGuard
 	// Rate limits (limits.go). "Network" is an IPv4 address or an IPv6 /64.
-	addrLimit   RateLimiter       // flood guard on /v1/, per network, before any parsing
-	fails       *ratelimit.Debt   // failed authentications per network (always in-process)
-	verifyLimit RateLimiter       // signature checks per penalised network (always in-process)
-	orphans     *ratelimit.Hold   // keys that signed properly and had no mailbox (always in-process)
-	staleSeen   *ratelimit.Recent // keys already charged for a stale timestamp (always in-process)
-	keyFails    *ratelimit.Debt   // refused deposits per sender key with a mailbox (always in-process)
-	keyLimit    RateLimiter       // per authenticated key
-	subLimit    RateLimiter       // per sender key, on deposits and blob uploads
-	regLimit    RateLimiter       // new mailboxes per network
-	claimLimit  RateLimiter       // unauthenticated claim GETs per network
-	webLimit    RateLimiter       // everything outside /v1/ and /healthz, per network (always in-process)
+	addrLimit   RateLimiter                                    // flood guard on /v1/, per network, before any parsing
+	fails       *ratelimit.Debt                                // failed authentications per network (always in-process)
+	verifyLimit RateLimiter                                    // signature checks per penalised network (always in-process)
+	orphans     *ratelimit.Hold                                // keys that signed properly and had no mailbox (always in-process)
+	onceSeen    *ratelimit.Recent                              // keys already charged once for a stale timestamp or a replay (always in-process)
+	keyFails    *ratelimit.Debt                                // refused deposits per sender key (always in-process)
+	pairFails   *ratelimit.Debt                                // refused deposits per sender key and mailbox (always in-process)
+	trickle     RateLimiter                                    // new mailboxes and claim fetches let through per penalised network (always in-process)
+	bodies      bodies                                         // request body bytes being read
+	bodyTimeout time.Duration                                  // how long one body may take to arrive
+	bodiesPeak  atomic.Int64                                   // thousandths of the process cap, since the last report
+	timer       func(time.Duration) (<-chan time.Time, func()) // long-poll deadline (tests inject the clock)
+	keyLimit    RateLimiter                                    // per authenticated key
+	subLimit    RateLimiter                                    // per sender key, on deposits and blob uploads
+	regLimit    RateLimiter                                    // new mailboxes per network
+	claimLimit  RateLimiter                                    // unauthenticated claim GETs per network
+	webLimit    RateLimiter                                    // everything outside /v1/ and /healthz, per network (always in-process)
 	rl          *limiterMetrics
 	retryJitter func() int // extra retry_after seconds for crowd refusals (tests; nil: random 0..4)
 
@@ -151,15 +157,23 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		fails:       ratelimit.NewDebt(cfg.RateAuthFailPerSec, cfg.RateAuthFailBurst, cfg.AuthFailMaxPenalty, 200_000),
 		verifyLimit: ratelimit.New(cfg.RateVerifyPerSec, cfg.RateVerifyBurst, 200_000),
 		orphans:     ratelimit.NewHold(holdBase, cfg.AuthFailMaxPenalty, maxHeldKeys),
-		staleSeen:   ratelimit.NewRecent(cfg.AuthFailMaxPenalty, maxHeldKeys),
-		keyFails:    ratelimit.NewDebt(cfg.RateKeyFailPerSec, cfg.RateKeyFailBurst, cfg.AuthFailMaxPenalty, 200_000),
-		keyLimit:    ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, 200_000),
-		subLimit:    ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
-		regLimit:    ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, 200_000),
-		claimLimit:  ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
-		rl:          newLimiterMetrics(reg),
-		webLimit:    ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
-		hsts:        strings.HasPrefix(cfg.BaseURL, "https://"),
+		onceSeen:    ratelimit.NewRecent(cfg.AuthFailMaxPenalty, maxHeldKeys),
+		pairFails:   ratelimit.NewDebt(pairFailRate, pairFailBurst, cfg.AuthFailMaxPenalty, maxHeldKeys),
+		trickle:     ratelimit.New(cfg.RateTricklePerSec, cfg.RateTrickleBurst, 200_000),
+		bodies:      bodies{perNet: map[string]int64{}},
+		bodyTimeout: bodyReadTimeout,
+		timer: func(d time.Duration) (<-chan time.Time, func()) {
+			t := time.NewTimer(d)
+			return t.C, func() { t.Stop() }
+		},
+		keyFails:   ratelimit.NewDebt(cfg.RateKeyFailPerSec, cfg.RateKeyFailBurst, cfg.AuthFailMaxPenalty, maxHeldKeys),
+		keyLimit:   ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, 200_000),
+		subLimit:   ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
+		regLimit:   ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, 200_000),
+		claimLimit: ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
+		rl:         newLimiterMetrics(reg),
+		webLimit:   ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
+		hsts:       strings.HasPrefix(cfg.BaseURL, "https://"),
 	}
 	web, err := newWebDocs(cfg.AndroidPackage, cfg.AndroidCertFingerprints, s.hsts)
 	if err != nil {
@@ -187,7 +201,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
 			c.Sweep(now)
 		}
-		for _, l := range []any{s.addrLimit, s.verifyLimit, s.fails, s.orphans, s.staleSeen, s.keyFails, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
+		for _, l := range []any{s.addrLimit, s.verifyLimit, s.fails, s.orphans, s.onceSeen, s.keyFails, s.pairFails, s.trickle, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
 			if p, ok := l.(interface{ Prune(time.Time) }); ok {
 				p.Prune(now)
 			}

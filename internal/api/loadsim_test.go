@@ -66,6 +66,7 @@ const (
 	evOrphan  // a client whose mailbox is gone, asking again
 	evUnlock  // a vault that was locked is unlocked: register, then collect
 	evGarbage // a request with a wrong signature, from the host's own address
+	evEnrol   // a new client: registers a new mailbox
 )
 
 type simQueue []*simEvent
@@ -95,14 +96,16 @@ type simVault struct {
 
 type simResult struct {
 	// Blast-radius scenarios.
-	unlocks, unlocks4          int // requests of vaults unlocked mid-run, and their 429s
-	orphanAnswered, orphanHeld int // an orphan's requests answered mailbox_unknown, and refused by its key
-	orphanMaxRetry             int // the longest retry_after an orphan was told
-	stale                      int // requests answered timestamp_stale
-	afterSkew, afterSkew4      int // requests in the first seconds after a clock was put right, and their 429s
-	garbage, garbageChecked    int // wrongly signed requests sent, and those whose signature was checked
-	penalisedSeconds           int // seconds (sampled at each event) the host's address was out of failure budget
-	networkCharges             int // units of the address's failure budget used
+	unlocks, unlocks4          int           // requests of vaults unlocked mid-run, and their 429s
+	orphanAnswered, orphanHeld int           // an orphan's requests answered mailbox_unknown, and refused by its key
+	orphanMaxRetry             int           // the longest retry_after an orphan was told
+	stale                      int           // requests answered timestamp_stale
+	afterSkew, afterSkew4      int           // requests in the first seconds after a clock was put right, and their 429s
+	garbage, garbageChecked    int           // wrongly signed requests sent, and those whose signature was checked
+	enrolled, enrol4           int           // new mailboxes registered, and 429s on the way
+	enrolWorst                 time.Duration // the longest a new client waited for its mailbox
+	penalisedSeconds           int           // seconds (sampled at each event) the host's address was out of failure budget
+	networkCharges             int           // units of the address's failure budget used
 	requests, limited          int
 	collects, collects4        int
 	deposits, deposits4        int
@@ -128,17 +131,18 @@ func simPrincipal(kind string, i int) principal {
 
 // scenario is one simulated vault host.
 type scenario struct {
-	limits   func(*config.Config)
-	jitter   bool
-	n        int     // unlocked vaults
-	perMin   float64 // messages each receives (and sends) a minute
-	synced   bool    // all long-polls issued in the same instant
-	dur      time.Duration
-	orphans  int // clients whose mailbox is gone, retrying
-	unlock   int // further vaults, locked until unlockAt
-	unlockAt time.Duration
-	skew     time.Duration // the host's clock is 5 minutes slow for this long from the start
-	garbage  int           // wrongly signed requests a second from the host's own address
+	limits     func(*config.Config)
+	jitter     bool
+	n          int     // unlocked vaults
+	perMin     float64 // messages each receives (and sends) a minute
+	synced     bool    // all long-polls issued in the same instant
+	dur        time.Duration
+	orphans    int // clients whose mailbox is gone, retrying
+	unlock     int // further vaults, locked until unlockAt
+	unlockAt   time.Duration
+	skew       time.Duration // the host's clock is 5 minutes slow for this long from the start
+	garbage    int           // wrongly signed requests a second from the host's own address
+	enrolEvery time.Duration // a new client registers a new mailbox this often
 }
 
 // oldLimits is the limiter this change replaces: one bucket of 20/s, burst
@@ -161,6 +165,7 @@ func newLimits(c *config.Config) {
 	c.RateAuthFailPerSec, c.RateAuthFailBurst, c.AuthFailMaxPenalty = d.RateAuthFailPerSec, d.RateAuthFailBurst, d.AuthFailMaxPenalty
 	c.RateKeyFailPerSec, c.RateKeyFailBurst = d.RateKeyFailPerSec, d.RateKeyFailBurst
 	c.RateVerifyPerSec, c.RateVerifyBurst = d.RateVerifyPerSec, d.RateVerifyBurst
+	c.RateTricklePerSec, c.RateTrickleBurst = d.RateTricklePerSec, d.RateTrickleBurst
 	c.RateRegisterPerSec, c.RateRegisterBurst = d.RateRegisterPerSec, d.RateRegisterBurst
 	c.RateSenderPerSec, c.RateSenderBurst = d.RateSenderPerSec, d.RateSenderBurst
 	c.RateClaimPerSec, c.RateClaimBurst = d.RateClaimPerSec, d.RateClaimBurst
@@ -188,7 +193,11 @@ func newSim(t *testing.T, limits func(*config.Config), seed uint64, jitter bool)
 		if !jitter { // the old limiter: no holds either
 			hold = 0
 		}
-		return []Option{WithNoMailboxHold(hold), WithRetryJitter(func() int {
+		pairRate, pairBurst := pairFailRate, pairFailBurst
+		if !jitter {
+			pairRate, pairBurst = 1e6, 1_000_000
+		}
+		return []Option{WithNoMailboxHold(hold), WithPairFailBudget(pairRate, pairBurst), WithRetryJitter(func() int {
 			if !jitter {
 				return 0
 			}
@@ -279,6 +288,11 @@ func runScenario(t *testing.T, sc scenario) simResult {
 	if sc.garbage > 0 {
 		push(&simEvent{at: start, kind: evGarbage})
 	}
+	if sc.enrolEvery > 0 {
+		for i, at := 0, start.Add(sc.enrolEvery); at.Before(end); i, at = i+1, at.Add(sc.enrolEvery) {
+			push(&simEvent{at: at, kind: evEnrol, v: i, sent: at})
+		}
+	}
 	for i := range vaults[:n] {
 		at := start
 		if !synced {
@@ -333,6 +347,20 @@ func runScenario(t *testing.T, sc scenario) simResult {
 				push(&simEvent{at: e.at.Add(s.retryWait(e.try+1, ra, time.Second)), kind: evOrphan, v: e.v, try: e.try + 1})
 			default:
 				t.Fatalf("orphan collect: %d %s", code, body)
+			}
+			continue
+		case evEnrol:
+			p := simPrincipal("enrol", e.v)
+			code, ra, body := s.do(simHost, registerReq(p))
+			switch code {
+			case http.StatusCreated:
+				res.enrolled++
+				res.enrolWorst = max(res.enrolWorst, e.at.Sub(e.sent))
+			case http.StatusTooManyRequests:
+				res.enrol4++
+				push(&simEvent{at: e.at.Add(s.retryWait(e.try+1, ra, time.Second)), kind: evEnrol, v: e.v, try: e.try + 1, sent: e.sent})
+			default:
+				t.Fatalf("enrol: %d %s", code, body)
 			}
 			continue
 		case evGarbage:
@@ -745,7 +773,11 @@ func TestLoadBlastRadius(t *testing.T) {
 	case os.Getenv("RELAY_LOADSIM") == "long": // an hour; the vaults unlocked were locked for 30 minutes
 		dur, unlockAt, skew = time.Hour, 30*time.Minute, 2*time.Minute
 	}
-	var orphan1, orphan10, skewed, attacked simResult
+	natDur := 10 * time.Minute
+	if raceEnabled || testing.Short() {
+		natDur = 3 * time.Minute
+	}
+	var orphan1, orphan10, skewed, attacked, nat simResult
 	t.Run("sims", func(t *testing.T) {
 		t.Run("one orphan", func(t *testing.T) {
 			t.Parallel()
@@ -758,6 +790,10 @@ func TestLoadBlastRadius(t *testing.T) {
 		t.Run("wrong clock", func(t *testing.T) {
 			t.Parallel()
 			skewed = runScenario(t, scenario{limits: newLimits, jitter: true, n: n, dur: skew + time.Minute, skew: skew})
+		})
+		t.Run("phones behind one NAT address", func(t *testing.T) {
+			t.Parallel()
+			nat = runScenario(t, scenario{limits: newLimits, jitter: true, n: 200, perMin: 0.2, dur: natDur, orphans: 1, garbage: 2, enrolEvery: 15 * time.Second})
 		})
 		t.Run("attacker on the host's address", func(t *testing.T) {
 			t.Parallel()
@@ -783,16 +819,16 @@ func TestLoadBlastRadius(t *testing.T) {
 			t.Errorf("%s: address penalised %d s, %d units of its failure budget used (want 0 and %d)", c.name, r.penalisedSeconds, r.networkCharges, c.orphans)
 		}
 		// Each orphan is answered from the store once per hold: 1 s, 2 s,
-		// 4 s, ... 512 s, then every 10 minutes; never once a second.
-		if r.orphanAnswered > c.orphans*(12+int(dur/(10*time.Minute))) || r.orphanMaxRetry < 30 {
+		// 4 s, ... 32 s, then once a minute; never once a second.
+		if r.orphanAnswered > c.orphans*(8+int(dur/time.Minute)) || r.orphanMaxRetry < 30 {
 			t.Errorf("%s: orphans answered %d times, longest retry_after %d", c.name, r.orphanAnswered, r.orphanMaxRetry)
 		}
 	}
 	r := skewed
 	fmt.Fprintf(&b, "(c) the host's clock 5 min slow for %s, then right:\n", skew)
-	fmt.Fprintf(&b, "    answered timestamp_stale: %d; refused 429: %d; failure budget units used: %d (one per vault); address penalised for %d s\n", r.stale, r.limited, r.networkCharges, r.penalisedSeconds)
+	fmt.Fprintf(&b, "    answered timestamp_stale: %d; refused 429: %d; failure budget units used: %d (one per vault and minute); address penalised for %d s\n", r.stale, r.limited, r.networkCharges, r.penalisedSeconds)
 	fmt.Fprintf(&b, "    first 5 s after the clock was put right: %d requests, %d refused\n", r.afterSkew, r.afterSkew4)
-	if r.afterSkew < n || r.afterSkew4 != 0 || r.networkCharges != n || r.stale < n {
+	if r.afterSkew < n || r.afterSkew4 != 0 || r.limited != 0 || r.networkCharges < n || r.networkCharges > n*(1+int(skew/time.Minute)) || r.stale < n {
 		t.Errorf("wrong clock: after recovery %d requests, %d refused; %d units used (want %d); %d stale answers", r.afterSkew, r.afterSkew4, r.networkCharges, n, r.stale)
 	}
 	r = attacked
@@ -801,6 +837,13 @@ func TestLoadBlastRadius(t *testing.T) {
 		r.garbage, r.garbageChecked, r.requests, r.limited, r.unlocks, r.unlocks4, r.delivered, r.sent)
 	if r.limited != 0 || r.unlocks4 != 0 || r.unlocks < 2*unlock || r.delivered != r.sent {
 		t.Errorf("attacker on the host's address: vaults refused %d, unlocked vaults refused %d of %d, messages %d/%d", r.limited, r.unlocks4, r.unlocks, r.delivered, r.sent)
+	}
+	r = nat
+	fmt.Fprintf(&b, "(f) 200 phones behind one NAT address for %s; one client sends 2 wrong signatures a second, one keeps asking for a mailbox it has not got, a new phone enrols every 15 s:\n", natDur)
+	fmt.Fprintf(&b, "    phones: %d requests, %d refused; messages %d/%d; address penalised for %d s; new mailboxes: %d created, %d times told to wait, longest wait %.0f s\n",
+		r.requests, r.limited, r.delivered, r.sent, r.penalisedSeconds, r.enrolled, r.enrol4, r.enrolWorst.Seconds())
+	if r.limited != 0 || r.delivered != r.sent || r.enrolled < int(natDur/(15*time.Second))-2 || r.enrolWorst > 30*time.Second {
+		t.Errorf("phones behind NAT: %d refused, messages %d/%d, %d enrolled, longest wait %v", r.limited, r.delivered, r.sent, r.enrolled, r.enrolWorst)
 	}
 	t.Log(b.String())
 }
