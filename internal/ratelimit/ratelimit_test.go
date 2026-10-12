@@ -82,3 +82,23 @@ func TestRetryAfterSeconds(t *testing.T) {
 		}
 	}
 }
+
+func TestPeak(t *testing.T) {
+	l := New(1, 4, 10)
+	now := time.Unix(1_700_000_000, 0)
+	l.Allow("a", now)
+	l.Allow("a", now)
+	l.Allow("b", now)
+	if p := l.Peak(); p != 0.5 {
+		t.Fatalf("peak %v, want 0.5 (two of four)", p)
+	}
+	if p := l.Peak(); p != 0 {
+		t.Fatalf("peak not reset: %v", p)
+	}
+	for i := 0; i < 5; i++ {
+		l.Allow("a", now)
+	}
+	if p := l.Peak(); p != 1 {
+		t.Fatalf("peak after a refusal %v, want 1", p)
+	}
+}

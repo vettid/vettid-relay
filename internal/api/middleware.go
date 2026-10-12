@@ -9,8 +9,6 @@ import (
 	"net/netip"
 	"strings"
 	"time"
-
-	"github.com/vettid/vettid-relay/internal/ratelimit"
 )
 
 // recorder captures status, error code and bytes for the access log. It
@@ -154,7 +152,8 @@ func clientIP(r *http.Request, trustProxy bool) netip.Addr {
 	return netip.Addr{}
 }
 
-// rateKey is the per-IP rate-limit key: the full IPv4 address or the IPv6 /64.
+// rateKey is the rate-limit key of a client network: the full IPv4 address
+// or the IPv6 /64.
 func rateKey(a netip.Addr) string {
 	if !a.IsValid() {
 		return "unknown"
@@ -166,38 +165,31 @@ func rateKey(a netip.Addr) string {
 	return p.String()
 }
 
-// withIPRateLimit applies a per-source-IP token bucket before anything else
-// (headers, tokens, bodies) is examined (spec §8.5): the API bucket to /v1/,
-// and a separate, always in-process web bucket to everything else (/connect,
-// /.well-known/, /robots.txt and every unknown path), so scanners spend
-// their own budget and never the mailbox traffic's (§6.11). /healthz is
-// exempt so load-balancer probes never starve.
+// withIPRateLimit applies a per-network token bucket before anything else
+// (headers, tokens, bodies) is examined (spec §7.2, §8.5): the flood guard
+// to /v1/, and a separate, always in-process web bucket to everything else
+// (/connect, /.well-known/, /robots.txt and every unknown path), so
+// scanners spend their own budget and never the mailbox traffic's (§6.11).
+// /healthz is exempt so load-balancer probes never starve.
+//
+// The flood guard is the first thing a /v1/ request meets, so every
+// signature check, replay record and store read is bounded by it.
 func (s *Server) withIPRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var l RateLimiter
 		switch {
 		case isAPIPath(r.URL.Path):
-			l = s.ipLimit
+			if e := s.take(limAddress, s.ipLimit, rateKey(clientIP(r, s.cfg.TrustProxy))); e != nil {
+				s.refuseUnread(w, r, e)
+				return
+			}
 		case r.URL.Path != "/healthz":
-			l = s.webLimit
-		}
-		if l != nil {
-			if ok, wait := l.Allow(rateKey(clientIP(r, s.cfg.TrustProxy)), s.now()); !ok {
-				s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)})
+			if e := s.take(limWeb, s.webLimit, rateKey(clientIP(r, s.cfg.TrustProxy))); e != nil {
+				s.writeError(w, e)
 				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// allowSender applies the per-sender bucket once a deposit token has been
-// parsed (keyed by the token's sub).
-func (s *Server) allowSender(sub string) *apiError {
-	if ok, wait := s.subLimit.Allow(sub, s.now()); !ok {
-		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
-	}
-	return nil
 }
 
 // emptyCollect reports whether a collect response delivered no messages.

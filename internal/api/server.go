@@ -18,7 +18,7 @@ import (
 )
 
 // ProtocolVersion is the docs/RELAY-PROTOCOL.md version this relay implements.
-const ProtocolVersion = "0.6.0"
+const ProtocolVersion = "0.7.0"
 
 // Server is the relay API.
 type Server struct {
@@ -40,8 +40,11 @@ type Server struct {
 	bg       sync.WaitGroup
 
 	replay     ReplayGuard
-	ipLimit    RateLimiter // per source IP (IPv4 / IPv6 /64), before any parsing
-	subLimit   RateLimiter // per sender key, after token parse
+	ipLimit    RateLimiter // flood guard per client network (IPv4 / IPv6 /64), before any parsing
+	keyLimit   RateLimiter // per signing key, after authentication
+	subLimit   RateLimiter // per sender key, on deposits after the signature
+	regLimit   RateLimiter // new mailboxes per client network
+	rl         *limiterMetrics
 	claimLimit RateLimiter // unauthenticated claim GETs, per IPv4 / IPv6 /64
 	webLimit   RateLimiter // everything outside /v1/ and /healthz, per IPv4 / IPv6 /64 (always in-process)
 
@@ -136,6 +139,9 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 
 		replay:     auth.NewReplayCache(cfg.ReplayCacheMax),
 		ipLimit:    ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
+		keyLimit:   ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, 200_000),
+		regLimit:   ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, 200_000),
+		rl:         newLimiterMetrics(reg),
 		subLimit:   ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
 		claimLimit: ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
 		webLimit:   ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
@@ -167,12 +173,13 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
 			c.Sweep(now)
 		}
-		for _, l := range []RateLimiter{s.ipLimit, s.subLimit, s.claimLimit, s.webLimit} {
+		for _, l := range []RateLimiter{s.ipLimit, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
 			if p, ok := l.(interface{ Prune(time.Time) }); ok {
 				p.Prune(now)
 			}
 		}
 	})
+	s.every(time.Minute, func(time.Time) { s.reportLimits() })
 	return s
 }
 

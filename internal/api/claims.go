@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/vettid/vettid-relay/internal/ratelimit"
 	"github.com/vettid/vettid-relay/internal/store"
 	auth "github.com/vettid/vettid-relay/relayauth"
 )
@@ -76,8 +75,8 @@ func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 // GET /v1/claim/{claim_id} — unauthenticated, rate-limited per client
 // network, single fetch. Every miss is the same 404 claim_unknown.
 func (s *Server) handleClaimGet(w http.ResponseWriter, r *http.Request) {
-	if ok, wait := s.claimLimit.Allow(rateKey(clientIP(r, s.cfg.TrustProxy)), s.now()); !ok {
-		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)})
+	if e := s.take(limClaim, s.claimLimit, rateKey(clientIP(r, s.cfg.TrustProxy))); e != nil {
+		s.writeError(w, e)
 		return
 	}
 	id := r.PathValue("claim_id")

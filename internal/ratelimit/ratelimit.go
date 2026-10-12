@@ -20,6 +20,7 @@ type Limiter struct {
 
 	mu      sync.Mutex
 	buckets map[string]*bucket
+	peak    float64 // highest fraction of a bucket in use since the last Peak call
 }
 
 type bucket struct {
@@ -45,6 +46,7 @@ func (l *Limiter) Allow(key string, now time.Time) (bool, time.Duration) {
 		if len(l.buckets) >= l.maxKeys {
 			l.pruneLocked(now)
 			if len(l.buckets) >= l.maxKeys {
+				l.peak = 1
 				return false, time.Second
 			}
 		}
@@ -57,8 +59,12 @@ func (l *Limiter) Allow(key string, now time.Time) (bool, time.Duration) {
 	}
 	if b.tokens >= 1 {
 		b.tokens--
+		if used := 1 - b.tokens/l.burst; used > l.peak {
+			l.peak = used
+		}
 		return true, 0
 	}
+	l.peak = 1
 	wait := time.Duration((1 - b.tokens) / l.rate * float64(time.Second))
 	if wait < time.Second {
 		wait = time.Second
@@ -81,6 +87,17 @@ func (l *Limiter) Prune(now time.Time) {
 	l.mu.Lock()
 	l.pruneLocked(now)
 	l.mu.Unlock()
+}
+
+// Peak returns the highest fraction (0..1) of any one bucket that was in use
+// since the previous call, and resets it. 1 means a request was refused.
+// It says how close the busiest key came to its limit, without naming it.
+func (l *Limiter) Peak() float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	p := l.peak
+	l.peak = 0
+	return p
 }
 
 // Len returns the number of tracked keys.

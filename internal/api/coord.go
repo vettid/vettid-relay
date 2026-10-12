@@ -66,18 +66,33 @@ func WithEmptyHints(h EmptyHints) Option { return func(s *Server) { s.hints = h 
 // WithReplayGuard replaces the in-memory replay cache.
 func WithReplayGuard(g ReplayGuard) Option { return func(s *Server) { s.replay = g } }
 
-// WithRateLimiters replaces the in-memory per-IP, per-sender and claim-GET
-// limiters (nil keeps the default for that one).
-func WithRateLimiters(ip, sender, claim RateLimiter) Option {
+// Limiters are the rate limiters that several relay processes share (nil
+// keeps the in-memory default for that one).
+type Limiters struct {
+	Address  RateLimiter // flood guard per client network
+	Key      RateLimiter // per authenticated key
+	Sender   RateLimiter // per sender key
+	Register RateLimiter // new mailboxes per client network
+	Claim    RateLimiter // unauthenticated claim GETs per client network
+}
+
+// WithRateLimiters replaces in-memory limiters with shared ones.
+func WithRateLimiters(l Limiters) Option {
 	return func(s *Server) {
-		if ip != nil {
-			s.ipLimit = ip
+		if l.Address != nil {
+			s.ipLimit = l.Address
 		}
-		if sender != nil {
-			s.subLimit = sender
+		if l.Key != nil {
+			s.keyLimit = l.Key
 		}
-		if claim != nil {
-			s.claimLimit = claim
+		if l.Sender != nil {
+			s.subLimit = l.Sender
+		}
+		if l.Register != nil {
+			s.regLimit = l.Register
+		}
+		if l.Claim != nil {
+			s.claimLimit = l.Claim
 		}
 	}
 }

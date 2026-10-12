@@ -34,7 +34,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// Size limit before any verification (spec §8.5); a declared length over
 	// the limit is refused without reading.
 	if r.ContentLength > limit {
-		s.writeError(w, fail(CodePayloadTooLarge))
+		s.refuseUnread(w, r, fail(CodePayloadTooLarge))
 		return
 	}
 	mailboxID := r.PathValue("mailbox_id")
@@ -42,21 +42,21 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// before their body is read.
 	da, e := s.authorizeDepositToken(r.Context(), r, mailboxID)
 	if e != nil {
-		s.writeError(w, e)
+		s.refuseUnread(w, r, e)
 		return
 	}
 	// One-shot open tokens permit exactly one *message* deposit (§5.6); they
 	// are not accepted for blob uploads (see README interpretation notes).
 	if da.claims.Open() {
-		s.writeError(w, fail(CodeTokenInvalid))
+		s.refuseUnread(w, r, fail(CodeTokenInvalid))
 		return
 	}
 	if e := s.allowSender(da.claims.Sub); e != nil {
-		s.writeError(w, e)
+		s.refuseUnread(w, r, e)
 		return
 	}
 	if !s.tryBlobSlot() {
-		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 2})
+		s.refuseUnread(w, r, &apiError{code: CodeRateLimited, retryAfter: 2})
 		return
 	}
 	defer s.releaseBlobSlot()

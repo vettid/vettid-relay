@@ -465,6 +465,72 @@ func TestMultiProcessRateLimitShared(t *testing.T) {
 	}
 }
 
+// The flood guard is shared (§7.2): one client network's budget is the same
+// however the load balancer spreads its requests over processes.
+func TestMultiProcessFloodGuardShared(t *testing.T) {
+	cl := newCluster(t, "RELAY_RATE_IP_RPS=0.05", "RELAY_RATE_IP_BURST=6")
+	a, b := cl.start(), cl.start()
+	ctx := context.Background()
+	limited := 0
+	for i := 0; i < 10; i++ {
+		url := a.url
+		if i%2 == 1 {
+			url = b.url
+		}
+		c := principal(t, url) // a fresh key each time: it is the address that is limited
+		c.MaxAttempts = 1
+		switch _, err := c.Collect(ctx, 0, 1); {
+		case client.IsCode(err, "mailbox_unknown"):
+		case client.IsCode(err, "rate_limited"):
+			limited++
+		default:
+			t.Fatal(err)
+		}
+	}
+	if limited != 4 {
+		t.Fatalf("burst 6 over two processes: %d of 10 limited (want 4)", limited)
+	}
+}
+
+// The per-key limit follows the key across processes (§7.2), and another
+// key behind the same address has its own.
+func TestMultiProcessKeyLimitShared(t *testing.T) {
+	cl := newCluster(t, "RELAY_RATE_KEY_RPS=0.05", "RELAY_RATE_KEY_BURST=5")
+	a, b := cl.start(), cl.start()
+	ctx := context.Background()
+	owner, other := principal(t, a.url), principal(t, a.url)
+	for _, p := range []*client.Client{owner, other} {
+		p.MaxAttempts = 1
+		if _, err := p.Register(ctx); err != nil { // one of each key's five
+			t.Fatal(err)
+		}
+	}
+	limited := 0
+	for i := 0; i < 8; i++ {
+		url := a.url
+		if i%2 == 1 {
+			url = b.url
+		}
+		c := as(owner, url)
+		c.MaxAttempts = 1
+		switch _, err := c.Collect(ctx, 0, 1); {
+		case err == nil:
+		case client.IsCode(err, "rate_limited"):
+			limited++
+		default:
+			t.Fatal(err)
+		}
+	}
+	if limited != 4 {
+		t.Fatalf("burst 5 (one used) over two processes: %d of 8 limited (want 4)", limited)
+	}
+	c := as(other, b.url)
+	c.MaxAttempts = 1
+	if _, err := c.Collect(ctx, 0, 1); err != nil {
+		t.Fatalf("another key behind the same address was limited: %v", err)
+	}
+}
+
 // Mailbox deletion (protocol 0.5.0, §6.10) across processes: deleted on A,
 // the mailbox is gone on B at once — deposits and blob uploads refused even
 // though B has it cached, B's parked long-poll and WebSocket ended, B's

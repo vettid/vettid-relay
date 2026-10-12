@@ -1,6 +1,6 @@
 # VettID Relay Protocol
 
-**Version:** 0.6.0 (draft)
+**Version:** 0.7.0 (draft)
 **Status:** Pre-implementation draft for review
 
 ## 1. Purpose & design principles
@@ -150,7 +150,9 @@ backdated `iat`.
 ### 5.3 Relay-side validation order
 
 On `POST /v1/mailbox/{mailbox_id}` the relay MUST first enforce the body size
-limit (`payload_too_large`, §8.5), then verify, in order:
+limit (`payload_too_large`, §8.5; on the declared length before anything
+is read, and again while reading), then verify, in order (steps 1–6 need
+only headers, and the relay SHOULD NOT read the body before them, §7.2):
 
 1. Mailbox exists → else `mailbox_unknown`
 2. Token parses as PASETO v4.public and its signature verifies against the
@@ -168,6 +170,8 @@ limit (`payload_too_large`, §8.5), then verify, in order:
    → else `quota_exceeded`
 
 A leaked token without the sender's private key MUST be unusable (step 7).
+It SHOULD NOT be able to use up the sender's rate limit either: the
+per-sender limit applies after step 7 (§7.2).
 
 ### 5.4 Token transport
 
@@ -257,6 +261,10 @@ blob transfer, §6.8.)
 - Re-registering an existing pubkey is idempotent → `200` with same body.
 - Registration is open by default. Relay operators MAY require an invite token
   (operator policy; mechanism reserved for a future minor version).
+- Keys are free to make, so a relay SHOULD limit the mailboxes one client
+  network can create (§7.2). Registering an existing key again is not a
+  creation and is not limited that way: clients MAY register at every
+  start (VettID vaults do at every unlock).
 
 ### 6.2 Deposit
 
@@ -693,6 +701,178 @@ relay signalling overload MUST use `429` + `rate_limited` and SHOULD include
 backoff with jitter on `429` and `5xx`. The web endpoints (§6.11) are limited
 with a separate budget.
 
+The rest of this section (0.7.0) says how a relay SHOULD limit, and gives
+the reference relay's numbers. None of it is visible to a client except as
+fewer or more `429`s.
+
+**Principle.** A client's address is the right key for a limit only while
+the caller is unauthenticated. Addresses are shared: every vault on a vault
+host reaches the relay from that host's one address (hundreds of vaults),
+and phones behind a carrier NAT share theirs. So once a request is
+attributed to a key, the relay limits the **key**. "Network" below means
+the IPv4 address or the IPv6 /64.
+
+**The limits.**
+
+| | Limit | Key | vettid-relay default | Applies |
+|---|---|---|---|---|
+| 1 | flood guard | network | 100/s, burst 1,000 | to every `/v1` request, first, before anything is parsed |
+| 2 | per key | signing key | 20/s, burst 100 | once the request is authenticated: on owner routes after the signature verified, was no replay, and the signer's mailbox exists; on registration and mailbox deletion after the signature verified |
+| 3 | new mailboxes | network | 1/s, burst 30 | to a registration that creates a mailbox, and to a rotation (§6.7). Registering an existing key again draws nothing (clients do that routinely, §6.1) |
+| 4 | per sender | token `sub` (an open token's `jti`, §5.6) | 5/s, burst 20 | to deposits, after §5.3 step 7; to blob uploads after step 6, before their body |
+| 5 | claim fetches | network | 1/s, burst 10 | to `GET /v1/claim/{id}` (§6.9), the one unauthenticated operation |
+| 6 | collectors | mailbox | 4 | to parked long-polls and WebSocket sessions together |
+
+Nothing else is keyed on a network. A request that is properly signed by a
+key with a mailbox can be refused on account of its network only by the
+flood guard (1) and, if it would create a mailbox, by the new-mailbox
+budget (3): no client is refused for what another client behind its
+address did, beyond those two. There is no penalty state: a relay that
+refuses a network does so only for as long as its bucket is empty.
+
+**Order of checks.** The flood guard comes before everything a request
+can cost: every signature verification, replay record (§4.1) and store
+read happens after it, so the guard bounds them all. Then, per request:
+the body size limit; for deposits and blob uploads the header-only steps
+of §5.3 (1–6) **before the body is read**; the signature and the replay
+check; the mailbox lookup; the per-key or per-sender limit. A request that
+is refused before its body has been read SHOULD be answered at once with
+`Connection: close`, not after waiting for the body.
+
+**No oracles.** A limit MUST NOT answer differently depending on whether a
+mailbox, key, token or claim exists, except to the holder of the key
+concerned. The network limits never look at a request's target (the
+new-mailbox budget is consulted only for the holder of the key being
+registered). The key and sender limits apply only after the caller has
+proved the key is its own.
+
+**`retry_after`** is the whole seconds until one request is allowed, at
+least 1. A mailbox at its collector maximum gets 1; a relay that cannot
+reach its replay store sheds signed requests with 5.
+
+**Where the numbers come from (informative).** One unlocked vault, read
+from vettid-vault (`vault/relay.go`, `vault/inbound.go`, relayclient),
+makes one long-poll collect every 25 s while idle (0.04 requests a
+second); per message received, one ack and the next collect; per message
+sent, one deposit; at unlock, one registration of its existing key, a
+collect and about one deposit per device. The Android app's collector
+does the same on its own mailbox.
+
+- *Flood guard, 100/s.* Deliberately conservative for the first
+  deployment: five times the old single bucket (20/s, burst 40), enough
+  for the hosts expected in the coming months, and to be raised from
+  measurement. A host's steady traffic reaches 100/s at about **2,500 idle
+  vaults**, about **1,100 vaults** that each receive and send a message a
+  minute, or about **700** at two messages a minute. A host of 900 vaults
+  (the projected size) is 36/s idle and about 81/s at a message a minute
+  each.
+- *Burst 1,000.* All long-polls of a host re-issued in the same instant (a
+  relay deploy ends them together) fit up to 1,000 vaults. An unlock is
+  three requests, so about **330 vaults can unlock in the same instant**;
+  the next is answered `429` with `retry_after` 1 and gets through a
+  second later.
+- *Per key, 20/s, burst 100.* 500 times an idle vault; a message costs its
+  recipient two requests, so 10 messages a second sustained; the burst is
+  three full batches of 32 with their acks.
+- *New mailboxes, 1/s, burst 30.* Members enrolling on one host or behind
+  one NAT are a few an hour; 30 covers a batch (a test run, a small
+  migration). The burst matters only for the first seconds: the rate is
+  what bounds how many mailboxes one address can accumulate (86,400 a
+  day). A host unlocking many vaults at once does not draw on it:
+  re-registration is free.
+
+**What this fixes.** A host's vaults no longer share 20 requests a second:
+each key has its own budget, and the host as a whole 100/s. No client is
+refused because of another client behind its address, except by the flood
+guard and the new-mailbox budget. A leaked deposit token cannot use up its
+sender's budget, and an unauthorized deposit's body is not read.
+
+**What does not hold (this version is the core; see "Later").**
+
+- **One address can make the relay do five times what it could before:**
+  100 signature checks, replay records and store reads a second (20
+  before), and a burst of 1,000 (40 before). Requests that fail are not
+  refused any more cheaply than requests that succeed: garbage from an
+  address costs a signature check each, a properly signed request under a
+  fresh key a replay record and a store read each, up to the guard.
+- **A client whose mailbox is gone and that keeps asking** (a vault retries
+  a collect answered `mailbox_unknown` every second) costs a signature
+  check, a replay record and a store read per retry, and one request a
+  second of its host's flood guard: 1% of it per such vault, where a
+  900-vault host idle uses 36%.
+- **Parked collectors are bounded only per mailbox** (4) and by what the
+  flood guard and the new-mailbox budget let one address build up. Long
+  polls have to be re-issued every 25 s, so one address can keep about
+  2,500 parked (100/s × 25 s; 500 before), plus a burst: at a measured 42
+  KiB each, about 105 to 150 MiB across the relay's processes. WebSocket
+  sessions cost one request each and do not end: an address can hold 4 per
+  mailbox it registered, 30 mailboxes at once and one more a second, so
+  about 14,500 sessions after an hour (640 MiB at a measured 45 KiB): more
+  than a process has. (Before, registrations were not budgeted at all and
+  this took minutes.)
+- **Bodies that are announced and then stall** behave as before: a small
+  body (registration, rotation, denylist, claim: at most 16 KiB) is read
+  before the signature can be checked and holds its connection until the
+  server's or the load balancer's timeout. With the flood guard at 100/s
+  one address can hold five times as many such connections as before.
+  Deposit bodies are no longer part of this: they are read only after the
+  token verified.
+- **Many addresses at once:** no per-network limit helps; that is the load
+  balancer's, the scaling policy's and, if ever needed, a web ACL's job.
+
+**Later (designed and reviewed, not in this version).** Each returns when
+the measurement named says it is needed; the relay reports all of them
+(Observability).
+
+| Mechanism | What it adds | Measurement that justifies it |
+|---|---|---|
+| a higher flood guard (200/s, burst 4,000) | hosts of 1,000 to 2,000 vaults | the busiest address at half the guard for minutes: 3,000 requests a minute, or its bucket half used |
+| caps on parked collectors per network and process, with the first collector of a mailbox always admitted; a maximum lifetime for WebSocket sessions | bounded memory for parked connections | collectors per process against its memory; any WebSocket use |
+| body memory counted as it arrives, a pace for bodies, separate pools | bounded memory and time for stalled bodies | connections held open in body reads; process memory under stalled requests |
+| a per-network budget of failed authentications, with signature-first handling for a network that used it up | garbage refused cheaply | refusals and error rates by code from single addresses |
+| holding a key that signs properly but has no mailbox, with a growing `retry_after` | an orphaned client stops costing a store read per retry | `mailbox_unknown` answers per minute |
+| refused-deposit budgets per sender and per (sender, mailbox) | a sender spraying refused deposits | refused deposits by code |
+
+**No allowlist.** The relay does not exempt known addresses (vault hosts).
+An allowlist would be a second configuration to keep right as hosts come
+and go, and would give whoever gains use of a listed address an unlimited
+relay.
+
+**Shared state.** With several relay processes, limits 1 to 5 are shared
+(their observable budget is the same however requests are spread); limit
+6 is per process. If the shared store cannot be reached, the shared limits
+fall back to per-process buckets (limits are best-effort policy;
+availability matters more), while signed requests are shed with `429` as
+long as replays cannot be recorded (§4.1).
+
+**Observability.** A relay SHOULD report, with no dimension that
+identifies a client (no address, key or mailbox): per limit, the requests
+allowed and refused and how full its busiest bucket got; the number of
+requests made by the busiest single network and the busiest single key;
+the number of networks the flood guard refused; and the parked collectors
+and WebSocket sessions it carries. These are what the limits above are to
+be re-sized from. vettid-relay exports `relay_ratelimit_allowed_total`,
+`relay_ratelimit_refused_total`, `relay_ratelimit_peak_permille` (by
+limiter: `address`, `key`, `sender`, `register`, `claim`, `web`),
+`relay_ratelimit_busiest_per_minute` (`address`, `key`),
+`relay_active_collectors`, `relay_parked_collectors` and
+`relay_ws_sessions`, and logs all of it once a minute in one `rate limits`
+line.
+
+**Configuration (informative).** vettid-relay reads, each as `_RPS` and
+`_BURST`: `RELAY_RATE_IP` (1), `RELAY_RATE_KEY` (2),
+`RELAY_RATE_REGISTER` (3), `RELAY_RATE_SENDER` (4),
+`RELAY_RATE_CLAIM_GET` (5), `RELAY_RATE_WEB` (§6.11); and
+`RELAY_MAX_COLLECTORS_PER_MAILBOX` (6). Every rate and burst must be
+greater than zero.
+
+**Clients.** Nothing changes on the wire. Clients SHOULD retry a `429` no
+sooner than `retry_after`, with their own jitter; SHOULD treat
+`mailbox_unknown` on their **own** mailbox as final until they have
+registered again (stop collecting, register, resume; or stop, if the
+mailbox was deleted on purpose) instead of asking again every second; and
+SHOULD treat `timestamp_stale` as a wrong local clock and back off.
+
 ### 7.3 Versioning
 
 The URL prefix (`/v1`) is the major version. Backward-compatible additions
@@ -718,8 +898,13 @@ prefix change. This document carries a semver and a changelog (§10).
    on the cache. Duplicate deposits that do occur are absorbed by receiver-side
    ULID dedupe.
 5. **DoS.** Body-size limits MUST be enforced before signature verification;
-   per-IP rate limits SHOULD apply before token parsing; signature verification
-   (cheap for Ed25519) precedes any database write.
+   the per-network flood guard (§7.2) SHOULD apply before token parsing;
+   signature verification (cheap for Ed25519) precedes any database write.
+   A client's address is a limit's key only while the caller is
+   unauthenticated; authenticated callers are limited per key (§7.2), so
+   that many clients behind one address (a vault host, a carrier NAT) are
+   not one bucket. §7.2 "What does not hold" lists what one address can
+   still cost the relay.
 6. **Relay compromise** yields: stored ciphertext, registration pubkeys,
    denylists, and the ability to drop or delay messages. It yields no plaintext
    and no ability to forge deposits as an authorized sender (no private keys on
@@ -835,12 +1020,32 @@ Properties:
 - **Connected clients never need it**: a foregrounded app or an always-on
   desktop/agent uses long-poll/WebSocket and achieves sub-second delivery via
   wake-on-deposit (§6.2). Android implementations MAY use a persistent
-  background service in lieu of the gateway, though FCM via the gateway is
-  recommended for battery and Doze-mode resilience.
+  background service in lieu of the gateway. VettID's app makes that
+  on-phone service the default and offers FCM via the gateway as an
+  option (ANDROID-PLAN D7, owner decision 2026-10-09).
 
 The push gateway API is specified separately.
 
 ## 10. Changelog
+
+- **0.7.0** — rate limiting by key (§7.2, rewritten; §8 item 5). The
+  single per-address bucket in front of `/v1` (20 requests a second in the
+  reference relay) counted every client behind an address as one: about 500
+  idle vaults on one vault host used all of it. Now: a per-network flood
+  guard (100/s, burst 1,000 in the reference relay), first, bounding every
+  signature check, replay record and store read; a per-key limit once a
+  request is authenticated, and no network-keyed limit after that except
+  a budget of new mailboxes (re-registration is free, §6.1); the
+  per-sender limit moves after the deposit's signature check, and a
+  deposit's body is read only after its token verified (§5.3); limits are
+  no oracle; what a relay should measure; what this version does not
+  protect against, and the mechanisms left for later. No allowlist of
+  vault hosts. **Nothing changes on the wire**: no new endpoint, field or
+  error code; clients need no change and see fewer `429`s.
+
+- **0.6.1** — Appendix A: the on-phone background service is VettID's
+  default; FCM via the gateway is an option (ANDROID-PLAN D7, owner
+  decision 2026-10-09). Informative only.
 
 - **0.6.0** — web endpoints (§6.11): `/connect` (the invitation landing page
   of VAULT-MESSAGING §6.4), `/.well-known/assetlinks.json` (the VettID

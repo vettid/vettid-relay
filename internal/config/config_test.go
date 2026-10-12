@@ -131,3 +131,40 @@ func TestDynamoStoreConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRateLimitConfig(t *testing.T) {
+	d := Defaults()
+	if d.RateIPPerSec != 100 || d.RateIPBurst != 1000 || d.RateKeyPerSec != 20 || d.RateKeyBurst != 100 ||
+		d.RateRegisterPerSec != 1 || d.RateRegisterBurst != 30 || d.RateSenderPerSec != 5 || d.RateSenderBurst != 20 ||
+		d.RateClaimPerSec != 1 || d.RateClaimBurst != 10 {
+		t.Fatalf("defaults differ from docs/RELAY-PROTOCOL.md §7.2: %+v", d)
+	}
+	c, err := Load(env(map[string]string{
+		"RELAY_RATE_IP_RPS":         "50",
+		"RELAY_RATE_IP_BURST":       "500",
+		"RELAY_RATE_KEY_RPS":        "2.5",
+		"RELAY_RATE_KEY_BURST":      "30",
+		"RELAY_RATE_REGISTER_RPS":   "0.1",
+		"RELAY_RATE_REGISTER_BURST": "7",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RateIPPerSec != 50 || c.RateIPBurst != 500 || c.RateKeyPerSec != 2.5 || c.RateKeyBurst != 30 ||
+		c.RateRegisterPerSec != 0.1 || c.RateRegisterBurst != 7 {
+		t.Fatalf("%+v", c)
+	}
+	// Every rate and every burst must be greater than zero.
+	for _, name := range []string{"IP", "KEY", "REGISTER", "SENDER", "CLAIM_GET", "WEB"} {
+		for _, suffix := range []string{"_RPS", "_BURST"} {
+			if _, err := Load(env(map[string]string{"RELAY_RATE_" + name + suffix: "0"})); err == nil {
+				t.Errorf("RELAY_RATE_%s%s=0: expected an error", name, suffix)
+			}
+		}
+	}
+	for _, bad := range []map[string]string{{"RELAY_RATE_KEY_BURST": "-1"}, {"RELAY_RATE_REGISTER_RPS": "x"}} {
+		if _, err := Load(env(bad)); err == nil {
+			t.Errorf("%v: expected an error", bad)
+		}
+	}
+}

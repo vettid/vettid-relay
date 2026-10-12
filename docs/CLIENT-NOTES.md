@@ -166,7 +166,7 @@ uses two 0.3 features.
 | `409 token_used` | The one-shot open token was already used. Ask the owner for a new invitation. |
 | `claim_unknown` | The claim expired or was already fetched (single fetch). Get a fresh claim id. |
 | `payload_too_large` | Use the claim-check blob flow (§7) or split at the E2E layer. |
-| `mailbox_unknown` | Wrong address, the mailbox isn't registered, it was rotated away, or its owner deleted it. Re-resolve over E2E. For your own collect, it means your mailbox no longer exists. |
+| `mailbox_unknown` | Wrong address, the mailbox isn't registered, it was rotated away, or its owner deleted it. Re-resolve over E2E. For your own collect, it means your mailbox no longer exists: stop collecting, and register again (`POST /v1/register`) before you resume, or stop for good if the mailbox was deleted on purpose. Don't ask again every second. |
 
 Never retry 4xx errors other than 429 unchanged. Never automatically retry
 a claim `GET`: the first response may have consumed the claim.

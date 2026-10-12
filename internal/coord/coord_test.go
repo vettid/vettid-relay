@@ -106,8 +106,15 @@ func TestLimiterShared(t *testing.T) {
 	if ok || wait < time.Second {
 		t.Fatalf("refusal: %v %v", ok, wait)
 	}
+	if p := a.Peak(); p != 1 {
+		t.Fatalf("peak after a refusal: %v", p)
+	}
+	b.Peak()
 	if ok, _ := b.Allow("198.51.100.1", now); !ok {
 		t.Fatal("other keys are independent")
+	}
+	if p := b.Peak(); p != 0.25 {
+		t.Fatalf("peak after one of four: %v", p)
 	}
 	time.Sleep(1100 * time.Millisecond) // one token refills (Valkey's clock)
 	if ok, _ := b.Allow("203.0.113.7", time.Now()); !ok {

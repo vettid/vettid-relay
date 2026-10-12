@@ -131,7 +131,21 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeSignatureInvalid))
 		return
 	}
+	if e := s.allowKey(sr.Key); e != nil {
+		s.writeError(w, e)
+		return
+	}
 	id := auth.MailboxID(pub)
+	// A new mailbox draws on its network's registration budget; registering
+	// an existing one again (every vault does at unlock) does not. Only the
+	// holder of the key gets this far, so the difference tells nobody
+	// anything.
+	if _, err := s.st.Mailbox(r.Context(), id); errors.Is(err, store.ErrNotFound) {
+		if e := s.allowRegistration(r); e != nil {
+			s.writeError(w, e)
+			return
+		}
+	}
 	created, err := s.st.Register(r.Context(), id, pub)
 	if err != nil {
 		s.log.Error("register failed", "err", err)
@@ -150,23 +164,32 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 // POST /v1/mailbox/{mailbox_id} (spec §6.2, validation order §5.3)
 func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
+	// A declared length over the limit is refused without reading.
+	if r.ContentLength > s.depositBodyLimit() {
+		s.refuseUnread(w, r, fail(CodePayloadTooLarge))
+		return
+	}
+	mailboxID := r.PathValue("mailbox_id")
+	// §5.3 steps 1–6 need only headers: an unauthorized deposit is refused
+	// before its body is read (as a blob upload is).
+	da, e := s.authorizeDepositToken(r.Context(), r, mailboxID)
+	if e != nil {
+		s.refuseUnread(w, r, e)
+		return
+	}
 	body, e := s.readBody(w, r, s.depositBodyLimit())
 	if e != nil {
 		s.writeError(w, e)
 		return
 	}
-	mailboxID := r.PathValue("mailbox_id")
-	da, e := s.authorizeDepositToken(r.Context(), r, mailboxID) // steps 1–6
-	if e != nil {
-		s.writeError(w, e)
-		return
-	}
-	if e := s.allowSender(senderRateKey(da)); e != nil {
-		s.writeError(w, e)
-		return
-	}
 	sender, e := s.verifySender(r, da, auth.BodyHash(body)) // step 7
 	if e != nil {
+		s.writeError(w, e)
+		return
+	}
+	// The per-sender limit comes after step 7: a token without its
+	// sender's key (a leaked one) cannot use up the sender's budget.
+	if e := s.allowSender(senderRateKey(da)); e != nil {
 		s.writeError(w, e)
 		return
 	}
@@ -219,8 +242,7 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 }
 
 // senderRateKey keys the per-sender bucket: the bound sender's key, or the
-// open token's jti (the signer is only known after step 7, and an open token
-// is single-use anyway).
+// open token's jti (an open token is single-use, and its signer is anyone).
 func senderRateKey(da *depositAuth) string {
 	if da.claims.Open() {
 		return "open:" + da.mailbox.ID + ":" + da.claims.Jti
@@ -539,6 +561,11 @@ func (s *Server) handleRotate(w http.ResponseWriter, r *http.Request) {
 	// of the current mailbox_id.
 	if err != nil || len(proof) != ed25519.SignatureSize || !ed25519.Verify(newPub, []byte(mb.ID), proof) {
 		s.writeError(w, fail(CodeSignatureInvalid))
+		return
+	}
+	// The successor is a new mailbox: it draws on the registration budget.
+	if e := s.allowRegistration(r); e != nil {
+		s.writeError(w, e)
 		return
 	}
 	newID := auth.MailboxID(newPub)

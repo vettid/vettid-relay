@@ -7,7 +7,7 @@ keys to payload content: a compromised relay can drop or delay messages, but
 can't read or forge them.
 
 - **Protocol:** [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md)
-  (**v0.6.0**, reported by `relay -version` and `/healthz`). This repository
+  (**v0.7.0**, reported by `relay -version` and `/healthz`). This repository
   implements all of it:
   - registration
   - deposit tokens (PASETO v4.public, sender-bound), plus one-shot open
@@ -123,8 +123,10 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_OPEN_TOKEN_MAX_LIFETIME` | `600s` | `open_token_max_lifetime_seconds` (§5.6). This is the cap on `exp − iat` for one-shot open tokens. Up to 7 days is recommended for remote invitations. |
 | `RELAY_MAX_CLAIM_BYTES` | `16384` | `max_claim_bytes` (§6.9). This is the maximum claim body. |
 | `RELAY_CLAIM_TTL` | `900s` | `claim_ttl_seconds` (§6.9). It's the longest TTL a creator may request with `PUT /v1/claim/ttl/<seconds>`. Up to 7 days is recommended. A bare `PUT /v1/claim` gets min(900 s, this). |
-| `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `20` / `40` | Per-source-IP token bucket on `/v1/*`, applied before any parsing. The key is the IPv4 address or the IPv6 /64. |
-| `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits and blob uploads. It's keyed by token `sub`, or by `jti` for open tokens. |
+| `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `100` / `1000` | Flood guard on `/v1/*` per client network (the IPv4 address or the IPv6 /64), applied before any parsing. One address may carry a whole vault host: see [Rate limiting](#rate-limiting) for when to raise it. |
+| `RELAY_RATE_KEY_RPS` / `RELAY_RATE_KEY_BURST` | `20` / `100` | Per-key bucket, applied once a request is authenticated: owner routes, registration and mailbox deletion. Keyed by the signing key. |
+| `RELAY_RATE_REGISTER_RPS` / `RELAY_RATE_REGISTER_BURST` | `1` / `30` | New mailboxes (registrations that create one, and rotations) per client network. Registering an existing key again is free. |
+| `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits after the request signature verifies (§5.3 step 7) and to blob uploads before their body is read. It's keyed by token `sub`, or by `jti` for open tokens. |
 | `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
 | `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | Per-source-IP bucket for the web endpoints (§6.11) and every other path outside `/v1/` except `/healthz`. It's separate from the API bucket, so scanners never use up mailbox traffic's budget, and always in-process (per relay process, no Valkey round trip). |
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
@@ -133,6 +135,60 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_REPLAY_CACHE_MAX` | `1000000` | Replay-cache capacity. When it's full, requests are shed with `rate_limited` and no live entries are evicted. |
 | `RELAY_SWEEP_INTERVAL` | `60s` | TTL sweeper period. The first pass is jittered. |
 | `RELAY_SHUTDOWN_TIMEOUT` | `20s` | Bound on the graceful drain after SIGTERM. |
+
+## Rate limiting
+
+Spec §7.2 has the rules, where each number comes from, and what this
+version does not protect against. In short:
+
+- An address is not a client. Every vault on a vault host reaches the relay
+  from that host's one address, and phones behind a carrier NAT share
+  theirs. So an address is a limit's key only while the caller is
+  unauthenticated; after that the **key** is limited (`RELAY_RATE_KEY_*`,
+  `RELAY_RATE_SENDER_*`).
+- Per network there is the **flood guard** (`RELAY_RATE_IP_*`), first,
+  before anything is parsed, so it bounds every signature check, replay
+  record and store read; and the budget of **new mailboxes**
+  (`RELAY_RATE_REGISTER_*`). Nothing else keyed on a network can refuse a
+  request that is properly signed by a key with a mailbox. There is no
+  penalty state.
+- A deposit's body is read only after its token has verified (§5.3 steps
+  1–6 need only headers). A request refused before its body was read is
+  answered at once with `Connection: close`.
+- No limit is an oracle; there is no allowlist.
+- With Valkey the buckets are shared by all relay processes (the web bucket
+  and the per-mailbox collector cap are per process). If Valkey is
+  unreachable they fall back to per-process ones.
+
+**When to raise the flood guard.** A host's steady traffic reaches 100/s at
+about 2,500 idle vaults, 1,100 at a message a minute each, 700 at two; 330
+vaults can unlock in the same instant against the burst of 1,000. Watch
+`address_busiest_per_min` (raise at 3,000, half the guard) and
+`address_peak` in the log line below.
+
+Metrics (on the metrics listener; the only label is the limiter's name,
+nothing identifies a client): `relay_ratelimit_allowed_total`,
+`relay_ratelimit_refused_total`, `relay_ratelimit_peak_permille` (how full
+the busiest bucket of each limiter got in the last full minute; 1000 means
+something was refused), `relay_ratelimit_busiest_per_minute` (requests of
+the busiest single network and of the busiest single key). Limiters:
+`address`, `key`, `sender`, `register`, `claim`, `web`. Each process logs
+one `rate limits` line a minute with the same figures, the number of
+networks the flood guard refused, and `collectors`, `parked` and
+`ws_sessions`: this line is what the limits are to be re-sized from.
+
+The simulation behind the numbers is a test:
+
+```sh
+go test ./internal/api -run 'TestLoad|TestUnlockStorm' -v
+```
+
+It puts 100, 500, 900 and 2,000 vaults behind one address, each behaving as
+vettid-vault does (a long-poll every 25 s, an ack and a new collect per
+message, a deposit per message sent, and the client's retries on 429),
+against the real handler chain with a simulated clock, under a single
+bucket of 20/s, burst 40 ("old": this code with `main`'s limits, not
+`main`'s code) and under the defaults.
 
 ## Deployment notes
 
@@ -305,11 +361,12 @@ keep them in step:
 ## Security notes (spec §8)
 
 - **Order of checks.** Body-size limits apply before signature
-  verification, and the per-IP rate limit applies before any header, token
-  or body parsing. Deposits follow §5.3 exactly. Blob uploads run §5.3
-  steps 1–6 on headers alone, so unauthorized uploads are refused before
-  their body is read, and the body is then streamed with the limit enforced
-  while reading.
+  verification, and the per-network flood guard applies before any header,
+  token or body parsing. Deposits follow §5.3 exactly, and like blob
+  uploads run steps 1–6 on headers alone, so unauthorized deposits and
+  uploads are refused before their body is read (with `Connection:
+  close`); the body is then read with the limit enforced while reading.
+  Per-key limits apply only after authentication.
 - **Signature before writes.** Signatures, sender binding
   (`X-VettID-Key == sub`), the ±90 s freshness window and the replay cache
   all come before any database write. Key comparisons are constant-time.
@@ -372,8 +429,8 @@ implementation chooses as follows:
   bearer token upload a large blob is not needed for first contact, so the
   relay refuses it.
 - **Open tokens and rate limits.** For open tokens, the per-sender rate
-  bucket is keyed by the token's `jti`, because the signer is known only
-  after §5.3 step 7.
+  bucket is keyed by the token's `jti`: an open token has no fixed sender
+  and is single-use.
 - **Claim TTL.** The TTL is part of the signed path
   (`PUT /v1/claim/ttl/<seconds>`, canonical decimal between 1 and
   `claim_ttl_seconds`). Anything else is `bad_request`; it is not clamped.
@@ -409,7 +466,8 @@ coordination tests, the whole API suite on DynamoDB, and a two-process e2e
 (the relay binary started twice on one table and one Valkey): wake-on-deposit
 across processes for long-poll and WebSocket, one open token raced from both
 processes, one claim fetched concurrently from both, a request replayed to
-the other process, a shared rate limit, and a process stopping mid-test.
+the other process, shared rate limits (the flood guard, the per-key limit,
+claim fetches), and a process stopping mid-test.
 
 Layout:
 
