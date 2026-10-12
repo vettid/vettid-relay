@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -272,8 +273,10 @@ func TestRefusedUnreadRequestIsAnsweredAtOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer c.Close()
-		// Announces a full deposit body and sends none of it.
-		fmt.Fprintf(c, "POST /v1/mailbox/%s HTTP/1.1\r\nHost: relay\r\nContent-Length: %d\r\n\r\n", nobody.mbx, f.s.depositBodyLimit())
+		// Announces a deposit body and sends none of it. 100 KiB: under the
+		// 256 KiB above which net/http closes the connection by itself,
+		// so that it is this relay's Connection: close that is tested.
+		fmt.Fprintf(c, "POST /v1/mailbox/%s HTTP/1.1\r\nHost: relay\r\nContent-Length: %d\r\n\r\n", nobody.mbx, 100<<10)
 		c.SetReadDeadline(time.Now().Add(3 * time.Second))
 		began := time.Now()
 		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
@@ -355,10 +358,10 @@ func lastLine(t *testing.T, logs, containing string) string {
 	return ""
 }
 
-// An unlock storm at the conservative flood guard (100/s, burst 1,000). A
+// An unlock storm at the conservative flood guard (100/s, burst 300). A
 // vault that is unlocked sends three requests: it registers its (existing)
-// key, starts collecting, and deposits to a device. 333 vaults of one host
-// can do that in the same instant; the 334th is refused with a 429 and
+// key, starts collecting, and deposits to a device. 100 vaults of one host
+// can do that in the same instant; the 101st is refused with a 429 and
 // retry_after, and gets through when it comes back as told (relayclient
 // waits retry_after and tries again, three times in all).
 func TestUnlockStormAtTheFloodGuard(t *testing.T) {
@@ -374,7 +377,7 @@ func TestUnlockStormAtTheFloodGuard(t *testing.T) {
 		json.Unmarshal(rec.Body.Bytes(), &e)
 		return rec.Code, e.RetryAfter
 	}
-	const n = 400
+	const n = 150
 	vaults := make([]principal, n)
 	for i := range vaults {
 		vaults[i] = simPrincipal("vault", i)
@@ -417,5 +420,84 @@ func TestUnlockStormAtTheFloodGuard(t *testing.T) {
 	f.clk.add(time.Second)
 	if served, _ := unlock(firstRefused); served != 3 {
 		t.Fatalf("the refused vault's retry after retry_after: %d of 3 served", served)
+	}
+}
+
+// Small bodies (register, rotate, denylist, claim) are read before the
+// request can be authenticated, so they have a deadline: one that is
+// announced and then stalls is released, with the connection closed,
+// instead of holding it until the server's read timeout.
+func TestStalledSmallBodyIsReleased(t *testing.T) {
+	f := newFixtureWith(t, nil, func(*fixture) []Option { return []Option{WithSmallBodyTimeout(300 * time.Millisecond)} })
+	before := runtime.NumGoroutine()
+	const n = 50
+	var conns []net.Conn
+	for i := 0; i < n; i++ {
+		c, err := net.Dial("tcp", f.ts.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		// A registration that announces 1,000 bytes and sends one.
+		fmt.Fprint(c, "POST /v1/register HTTP/1.1\r\nHost: relay\r\nContent-Length: 1000\r\n\r\n{")
+		conns = append(conns, c)
+	}
+	for _, c := range conns {
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		began := time.Now()
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil || resp.StatusCode != http.StatusBadRequest || !resp.Close {
+			t.Fatalf("stalled small body: %v %v", resp, err)
+		}
+		if time.Since(began) > 2*time.Second {
+			t.Fatalf("released after %v", time.Since(began))
+		}
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for runtime.NumGoroutine() > before+5 {
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines: %d before, %d after the stalled bodies were released", before, runtime.NumGoroutine())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if smallBodyTimeout != 10*time.Second {
+		t.Fatalf("default deadline %v", smallBodyTimeout)
+	}
+}
+
+// The deadline is cleared once a small body has been read: an honest
+// client's keep-alive connection is good for the next request, also after
+// longer than the deadline.
+func TestSmallBodyDeadlineLeavesKeepAliveConnectionsAlone(t *testing.T) {
+	f := newFixtureWith(t, nil, func(*fixture) []Option { return []Option{WithSmallBodyTimeout(200 * time.Millisecond)} })
+	p := newPrincipal(1)
+	c, err := net.Dial("tcp", f.ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	br := bufio.NewReader(c)
+	for i, want := range []int{201, 200, 200} {
+		hr := f.build(registerReq(p))
+		if err := hr.Write(c); err != nil {
+			t.Fatal(err)
+		}
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		resp, err := http.ReadResponse(br, hr)
+		if err != nil || resp.StatusCode != want || resp.Close {
+			t.Fatalf("registration %d on one connection: %v %v", i+1, resp, err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		time.Sleep(350 * time.Millisecond) // longer than the body deadline
+	}
+	// A long-poll on the same connection is not cut short by it either.
+	hr := f.build(req{method: "GET", path: "/v1/mailbox?wait=1", signer: &p})
+	if err := hr.Write(c); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if resp, err := http.ReadResponse(br, hr); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("long-poll after registrations on the same connection: %v %v", resp, err)
 	}
 }

@@ -150,7 +150,7 @@ func Defaults() Config {
 		ClaimTTL:      900 * time.Second,
 
 		RateIPPerSec:       100,
-		RateIPBurst:        1000,
+		RateIPBurst:        300,
 		RateKeyPerSec:      20,
 		RateKeyBurst:       100,
 		RateRegisterPerSec: 1,

@@ -716,7 +716,7 @@ the IPv4 address or the IPv6 /64.
 
 | | Limit | Key | vettid-relay default | Applies |
 |---|---|---|---|---|
-| 1 | flood guard | network | 100/s, burst 1,000 | to every `/v1` request, first, before anything is parsed |
+| 1 | flood guard | network | 100/s, burst 300 | to every `/v1` request, first, before anything is parsed |
 | 2 | per key | signing key | 20/s, burst 100 | once the request is authenticated: on owner routes after the signature verified, was no replay, and the signer's mailbox exists; on registration and mailbox deletion after the signature verified |
 | 3 | new mailboxes | network | 1/s, burst 30 | to a registration that creates a mailbox, and to a rotation (§6.7). Registering an existing key again draws nothing (clients do that routinely, §6.1) |
 | 4 | per sender | token `sub` (an open token's `jti`, §5.6) | 5/s, burst 20 | to deposits, after §5.3 step 7; to blob uploads after step 6, before their body |
@@ -737,7 +737,12 @@ the body size limit; for deposits and blob uploads the header-only steps
 of §5.3 (1–6) **before the body is read**; the signature and the replay
 check; the mailbox lookup; the per-key or per-sender limit. A request that
 is refused before its body has been read SHOULD be answered at once with
-`Connection: close`, not after waiting for the body.
+`Connection: close`, not after waiting for the body. A small body that
+has to be read before the request can be authenticated (registration,
+rotation, denylist, claim: at most 16 KiB) SHOULD have a short deadline
+(10 s in the reference relay: 13 kbit/s is the slowest link served for
+these requests), after which the request is refused and the connection
+closed.
 
 **No oracles.** A limit MUST NOT answer differently depending on whether a
 mailbox, key, token or claim exists, except to the holder of the key
@@ -766,11 +771,17 @@ does the same on its own mailbox.
   minute, or about **700** at two messages a minute. A host of 900 vaults
   (the projected size) is 36/s idle and about 81/s at a message a minute
   each.
-- *Burst 1,000.* All long-polls of a host re-issued in the same instant (a
-  relay deploy ends them together) fit up to 1,000 vaults. An unlock is
-  three requests, so about **330 vaults can unlock in the same instant**;
-  the next is answered `429` with `retry_after` 1 and gets through a
-  second later.
+- *Burst 300.* Steady traffic needs the rate; the burst is what a single
+  instant may bring, and also what makes every memory cost below
+  instantaneous, so it is kept small. About **100 vaults can unlock in the
+  same instant** (three requests each); the next are answered `429` with
+  `retry_after` 1 and get through a second later (the vault's relay client
+  waits and retries). When a relay deploy ends every long-poll of a host
+  together, up to 300 vaults re-poll without a refusal; of 500, 276
+  requests are refused once and all are polling again after 2.5 s; of 900,
+  about 1,800 refusals over 7 s; in neither case do refusals recur
+  (simulated, with the client's retries; the same with and without the 20
+  to 25 s poll jitter of newer vaults).
 - *Per key, 20/s, burst 100.* 500 times an idle vault; a message costs its
   recipient two requests, so 10 messages a second sustained; the burst is
   three full batches of 32 with their acks.
@@ -791,7 +802,7 @@ sender's budget, and an unauthorized deposit's body is not read.
 
 - **One address can make the relay do five times what it could before:**
   100 signature checks, replay records and store reads a second (20
-  before), and a burst of 1,000 (40 before). Requests that fail are not
+  before), and a burst of 300 (40 before). Requests that fail are not
   refused any more cheaply than requests that succeed: garbage from an
   address costs a signature check each, a properly signed request under a
   fresh key a replay record and a store read each, up to the guard.
@@ -800,23 +811,36 @@ sender's budget, and an unauthorized deposit's body is not read.
   check, a replay record and a store read per retry, and one request a
   second of its host's flood guard: 1% of it per such vault, where a
   900-vault host idle uses 36%.
-- **Parked collectors are bounded only per mailbox** (4) and by what the
-  flood guard and the new-mailbox budget let one address build up. Long
-  polls have to be re-issued every 25 s, so one address can keep about
-  2,500 parked (100/s × 25 s; 500 before), plus a burst: at a measured 42
-  KiB each, about 105 to 150 MiB across the relay's processes. WebSocket
-  sessions cost one request each and do not end: an address can hold 4 per
-  mailbox it registered, 30 mailboxes at once and one more a second, so
-  about 14,500 sessions after an hour (640 MiB at a measured 45 KiB): more
+- **Parked collectors are bounded only per mailbox** (4, per relay
+  process) and by what the flood guard and the new-mailbox budget let one
+  address build up. Long polls have to be re-issued every 25 s, so one
+  address can keep about 2,500 parked (100/s × 25 s; 500 before), plus the
+  burst: at a measured 42 KiB each, about 105 to 120 MiB across the
+  relay's processes. WebSocket sessions cost one request each and do not
+  end: an address can hold 4 per mailbox it registered **on each relay
+  process**, 30 mailboxes at once and one more a second, so about 14,500
+  sessions per process after an hour (640 MiB at a measured 45 KiB): more
   than a process has. (Before, registrations were not budgeted at all and
   this took minutes.)
-- **Bodies that are announced and then stall** behave as before: a small
-  body (registration, rotation, denylist, claim: at most 16 KiB) is read
-  before the signature can be checked and holds its connection until the
-  server's or the load balancer's timeout. With the flood guard at 100/s
-  one address can hold five times as many such connections as before.
-  Deposit bodies are no longer part of this: they are read only after the
-  token verified.
+- **A deposit's body can still be made to stall.** It is read after the
+  deposit token verified but before the request signature and the
+  per-sender limit, and it has no deadline of its own. Anyone with one
+  registered mailbox can mint tokens of its own for fresh sender keys and
+  send deposits to itself whose bodies stop one byte short: each holds
+  its buffer (up to about 380 KiB) until the server's or the load
+  balancer's timeout, refused by no limiter but the flood guard. In the
+  review that was 112 MiB for 300 such deposits from one address, which
+  is the burst: about 110 MiB at once, then 38 MiB a second. Before this
+  version the same needed no credential at all and reached about 580 MiB
+  inside the load balancer's 75 s (40 at once, then 20 a second). The
+  remedy is the body pace under "Later".
+- **Small bodies that are announced and then stall** (registration,
+  rotation, denylist, claim) are read before the signature can be
+  checked; with the 10 s deadline one address can hold about 1,300 such
+  connections (100/s × 10 s, plus the burst).
+- **The new-mailbox budget is per address** (1/s): anyone behind an
+  address can use it up, and other enrolments and rotations from that
+  address then wait their turn.
 - **Many addresses at once:** no per-network limit helps; that is the load
   balancer's, the scaling policy's and, if ever needed, a web ACL's job.
 
@@ -826,9 +850,9 @@ the measurement named says it is needed; the relay reports all of them
 
 | Mechanism | What it adds | Measurement that justifies it |
 |---|---|---|
-| a higher flood guard (200/s, burst 4,000) | hosts of 1,000 to 2,000 vaults | the busiest address at half the guard for minutes: 3,000 requests a minute, or its bucket half used |
+| a higher flood guard (rate and burst: 200/s, burst 4,000 was reviewed for hosts of 1,000 to 2,000 vaults) | larger hosts | rate: the busiest address at half the guard for minutes (3,000 requests a minute). Burst: refusals of a known host after relay deploys or mass unlocks |
 | caps on parked collectors per network and process, with the first collector of a mailbox always admitted; a maximum lifetime for WebSocket sessions | bounded memory for parked connections | collectors per process against its memory; any WebSocket use |
-| body memory counted as it arrives, a pace for bodies, separate pools | bounded memory and time for stalled bodies | connections held open in body reads; process memory under stalled requests |
+| body memory counted as it arrives, a pace for bodies (deposits included), separate pools | bounded memory and time for stalled bodies: the follow-up for the deposit case above | connections held open in body reads; process memory under stalled requests |
 | a per-network budget of failed authentications, with signature-first handling for a network that used it up | garbage refused cheaply | refusals and error rates by code from single addresses |
 | holding a key that signs properly but has no mailbox, with a growing `retry_after` | an orphaned client stops costing a store read per retry | `mailbox_unknown` answers per minute |
 | refused-deposit budgets per sender and per (sender, mailbox) | a sender spraying refused deposits | refused deposits by code |
@@ -1032,14 +1056,18 @@ The push gateway API is specified separately.
   single per-address bucket in front of `/v1` (20 requests a second in the
   reference relay) counted every client behind an address as one: about 500
   idle vaults on one vault host used all of it. Now: a per-network flood
-  guard (100/s, burst 1,000 in the reference relay), first, bounding every
+  guard (100/s, burst 300 in the reference relay), first, bounding every
   signature check, replay record and store read; a per-key limit once a
   request is authenticated, and no network-keyed limit after that except
   a budget of new mailboxes (re-registration is free, §6.1); the
   per-sender limit moves after the deposit's signature check, and a
   deposit's body is read only after its token verified (§5.3); limits are
   no oracle; what a relay should measure; what this version does not
-  protect against, and the mechanisms left for later. No allowlist of
+  protect against, and the mechanisms left for later. Behaviour a client
+  may notice against 0.6: the per-sender limit on deposits now follows
+  the body, the signature and the replay record, so a sender over its
+  limit signs its retry afresh (clients do); small bodies have 10 s to
+  arrive; refused requests with an unread body close the connection. No allowlist of
   vault hosts. **Nothing changes on the wire**: no new endpoint, field or
   error code; clients need no change and see fewer `429`s.
 

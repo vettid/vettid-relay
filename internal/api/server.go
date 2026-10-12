@@ -39,14 +39,16 @@ type Server struct {
 	bgCancel context.CancelFunc
 	bg       sync.WaitGroup
 
-	replay     ReplayGuard
-	ipLimit    RateLimiter // flood guard per client network (IPv4 / IPv6 /64), before any parsing
-	keyLimit   RateLimiter // per signing key, after authentication
-	subLimit   RateLimiter // per sender key, on deposits after the signature
-	regLimit   RateLimiter // new mailboxes per client network
-	rl         *limiterMetrics
-	claimLimit RateLimiter // unauthenticated claim GETs, per IPv4 / IPv6 /64
-	webLimit   RateLimiter // everything outside /v1/ and /healthz, per IPv4 / IPv6 /64 (always in-process)
+	replay   ReplayGuard
+	ipLimit  RateLimiter // flood guard per client network (IPv4 / IPv6 /64), before any parsing
+	keyLimit RateLimiter // per signing key, after authentication
+	subLimit RateLimiter // per sender key, on deposits after the signature
+	regLimit RateLimiter // new mailboxes per client network
+	rl       *limiterMetrics
+
+	smallBodyTimeout time.Duration // how long a small body has to arrive (handlers.go)
+	claimLimit       RateLimiter   // unauthenticated claim GETs, per IPv4 / IPv6 /64
+	webLimit         RateLimiter   // everything outside /v1/ and /healthz, per IPv4 / IPv6 /64 (always in-process)
 
 	web  *webDocs // /connect, /.well-known/assetlinks.json, /robots.txt (§6.11)
 	hsts bool     // public base URL is https: send Strict-Transport-Security
@@ -137,15 +139,17 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 
 		blobSlots: make(chan struct{}, cfg.MaxConcurrentBlobTransfers),
 
-		replay:     auth.NewReplayCache(cfg.ReplayCacheMax),
-		ipLimit:    ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
-		keyLimit:   ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, 200_000),
-		regLimit:   ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, 200_000),
-		rl:         newLimiterMetrics(reg),
-		subLimit:   ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
-		claimLimit: ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
-		webLimit:   ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
-		hsts:       strings.HasPrefix(cfg.BaseURL, "https://"),
+		replay:   auth.NewReplayCache(cfg.ReplayCacheMax),
+		ipLimit:  ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
+		keyLimit: ratelimit.New(cfg.RateKeyPerSec, cfg.RateKeyBurst, 200_000),
+		regLimit: ratelimit.New(cfg.RateRegisterPerSec, cfg.RateRegisterBurst, 200_000),
+		rl:       newLimiterMetrics(reg),
+
+		smallBodyTimeout: smallBodyTimeout,
+		subLimit:         ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
+		claimLimit:       ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
+		webLimit:         ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
+		hsts:             strings.HasPrefix(cfg.BaseURL, "https://"),
 	}
 	web, err := newWebDocs(cfg.AndroidPackage, cfg.AndroidCertFingerprints, s.hsts)
 	if err != nil {

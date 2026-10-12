@@ -26,19 +26,37 @@ const (
 	timeFormat       = "2006-01-02T15:04:05Z" // RFC 3339 UTC, second precision (spec examples)
 )
 
+// smallBodyTimeout is how long a small body (register, rotate, denylist,
+// claim: at most smallBodyLimit) has to arrive. It is read before the
+// request can be authenticated, so a client that announces one and stalls
+// would otherwise hold its connection until the server's read timeout
+// (minutes). 16 KiB in 10 s is 13 kbit/s.
+const smallBodyTimeout = 10 * time.Second
+
 // readBody reads the whole body, enforcing limit while reading (spec §8.5:
 // size limits precede signature verification).
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, *apiError) {
 	if r.ContentLength > limit {
 		return nil, fail(CodePayloadTooLarge)
 	}
+	// Small bodies are read before authentication: they get a deadline.
+	// (A deposit's body is read after its token verified and keeps the
+	// server's read timeout.)
+	rc := http.NewResponseController(w)
+	timed := r.ContentLength != 0 && limit <= smallBodyLimit && rc.SetReadDeadline(time.Now().Add(s.smallBodyTimeout)) == nil
 	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	var mbe *http.MaxBytesError
 	switch {
 	case errors.As(err, &mbe):
 		return nil, fail(CodePayloadTooLarge)
 	case err != nil:
+		// The rest of the body is not coming (or not in time): close the
+		// connection with the answer, or net/http waits for it once more.
+		w.Header().Set("Connection", "close")
 		return nil, fail(CodeBadRequest)
+	}
+	if timed {
+		rc.SetReadDeadline(time.Time{})
 	}
 	return b, nil
 }

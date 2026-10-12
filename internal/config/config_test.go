@@ -134,7 +134,7 @@ func TestDynamoStoreConfig(t *testing.T) {
 
 func TestRateLimitConfig(t *testing.T) {
 	d := Defaults()
-	if d.RateIPPerSec != 100 || d.RateIPBurst != 1000 || d.RateKeyPerSec != 20 || d.RateKeyBurst != 100 ||
+	if d.RateIPPerSec != 100 || d.RateIPBurst != 300 || d.RateKeyPerSec != 20 || d.RateKeyBurst != 100 ||
 		d.RateRegisterPerSec != 1 || d.RateRegisterBurst != 30 || d.RateSenderPerSec != 5 || d.RateSenderBurst != 20 ||
 		d.RateClaimPerSec != 1 || d.RateClaimBurst != 10 {
 		t.Fatalf("defaults differ from docs/RELAY-PROTOCOL.md §7.2: %+v", d)

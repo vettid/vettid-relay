@@ -123,7 +123,7 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_OPEN_TOKEN_MAX_LIFETIME` | `600s` | `open_token_max_lifetime_seconds` (§5.6). This is the cap on `exp − iat` for one-shot open tokens. Up to 7 days is recommended for remote invitations. |
 | `RELAY_MAX_CLAIM_BYTES` | `16384` | `max_claim_bytes` (§6.9). This is the maximum claim body. |
 | `RELAY_CLAIM_TTL` | `900s` | `claim_ttl_seconds` (§6.9). It's the longest TTL a creator may request with `PUT /v1/claim/ttl/<seconds>`. Up to 7 days is recommended. A bare `PUT /v1/claim` gets min(900 s, this). |
-| `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `100` / `1000` | Flood guard on `/v1/*` per client network (the IPv4 address or the IPv6 /64), applied before any parsing. One address may carry a whole vault host: see [Rate limiting](#rate-limiting) for when to raise it. |
+| `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `100` / `300` | Flood guard on `/v1/*` per client network (the IPv4 address or the IPv6 /64), applied before any parsing. One address may carry a whole vault host: see [Rate limiting](#rate-limiting) for when to raise it. |
 | `RELAY_RATE_KEY_RPS` / `RELAY_RATE_KEY_BURST` | `20` / `100` | Per-key bucket, applied once a request is authenticated: owner routes, registration and mailbox deletion. Keyed by the signing key. |
 | `RELAY_RATE_REGISTER_RPS` / `RELAY_RATE_REGISTER_BURST` | `1` / `30` | New mailboxes (registrations that create one, and rotations) per client network. Registering an existing key again is free. |
 | `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits after the request signature verifies (§5.3 step 7) and to blob uploads before their body is read. It's keyed by token `sub`, or by `jti` for open tokens. |
@@ -154,17 +154,22 @@ version does not protect against. In short:
   penalty state.
 - A deposit's body is read only after its token has verified (§5.3 steps
   1–6 need only headers). A request refused before its body was read is
-  answered at once with `Connection: close`.
+  answered at once with `Connection: close`. Small bodies (register,
+  rotate, denylist, claim: at most 16 KiB), which are read before the
+  signature can be checked, have 10 s to arrive (13 kbit/s).
 - No limit is an oracle; there is no allowlist.
 - With Valkey the buckets are shared by all relay processes (the web bucket
   and the per-mailbox collector cap are per process). If Valkey is
   unreachable they fall back to per-process ones.
 
-**When to raise the flood guard.** A host's steady traffic reaches 100/s at
-about 2,500 idle vaults, 1,100 at a message a minute each, 700 at two; 330
-vaults can unlock in the same instant against the burst of 1,000. Watch
-`address_busiest_per_min` (raise at 3,000, half the guard) and
-`address_peak` in the log line below.
+**When to raise the flood guard.** A host's steady traffic reaches the
+rate (100/s) at about 2,500 idle vaults, 1,100 at a message a minute each,
+700 at two: watch `address_busiest_per_min` in the log line below and
+raise the rate at 3,000 (half the guard). The burst (300) lets about 100
+vaults unlock, or 300 re-poll, in the same instant; more are refused once
+and are back within seconds (500 re-polling: 2.5 s; 900: 7 s). It is also
+the size of every instantaneous memory cost, so raise it only if
+`address_refused` shows for a known host after deploys or mass unlocks.
 
 Metrics (on the metrics listener; the only label is the limiter's name,
 nothing identifies a client): `relay_ratelimit_allowed_total`,
@@ -182,6 +187,11 @@ The simulation behind the numbers is a test:
 ```sh
 go test ./internal/api -run 'TestLoad|TestUnlockStorm' -v
 ```
+
+The two-process tests (`TestMultiProcess*`: the flood guard and the
+per-key limit shared across processes) need DynamoDB Local and Valkey:
+they run under `make test-dynamo` and in CI's `shared-backend` job, and a
+plain `go test ./...` skips them on purpose.
 
 It puts 100, 500, 900 and 2,000 vaults behind one address, each behaving as
 vettid-vault does (a long-poll every 25 s, an ack and a new collect per

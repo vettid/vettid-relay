@@ -97,6 +97,12 @@ func WithRateLimiters(l Limiters) Option {
 	}
 }
 
+// WithSmallBodyTimeout replaces how long a small request body has to
+// arrive (tests).
+func WithSmallBodyTimeout(d time.Duration) Option {
+	return func(s *Server) { s.smallBodyTimeout = d }
+}
+
 // WithWakeBus publishes every deposit's mailbox to other relay processes.
 // Signals they publish are delivered here through Server.Wake.
 func WithWakeBus(b WakeBus) Option { return func(s *Server) { s.bus = b } }

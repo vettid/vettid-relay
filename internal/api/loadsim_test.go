@@ -88,6 +88,7 @@ type simVault struct {
 	tok     string // deposit token for the next vault's mailbox (this vault as sender)
 	gen     int
 	limited bool
+	polled  bool
 }
 
 type simResult struct {
@@ -98,6 +99,8 @@ type simResult struct {
 	sent, delivered     int
 	worstDelay          time.Duration
 	limitedVaults       int
+	allPolling          time.Duration // when the last vault had its first collect served
+	limitedLate         int           // 429s in the last 30 s of the run
 }
 
 func (r simResult) rate() float64 {
@@ -186,6 +189,15 @@ func (s *sim) retryWait(try, retryAfter int, afterThree time.Duration) time.Dura
 // they are spread over the 25 s period.
 func runHost(t *testing.T, limits func(*config.Config), jitter bool, n int, perMin float64, synced bool, dur time.Duration) simResult {
 	t.Helper()
+	return runHostSpread(t, limits, jitter, n, perMin, synced, dur, 0)
+}
+
+// runHostSpread is runHost with the poll jitter of vettid-vault from its
+// staging release 11 on: each long-poll waits a random whole number of
+// seconds from 25 s minus spread up to 25 s (spread 5 s there; 0: always
+// 25 s, as before it).
+func runHostSpread(t *testing.T, limits func(*config.Config), jitter bool, n int, perMin float64, synced bool, dur time.Duration, spread time.Duration) simResult {
+	t.Helper()
 	s := newSim(t, limits, uint64(n), jitter)
 	f := s.f
 	ctx := context.Background()
@@ -234,6 +246,9 @@ func runHost(t *testing.T, limits func(*config.Config), jitter bool, n int, perM
 		*n++
 		if code == http.StatusTooManyRequests {
 			res.limited++
+			if f.clk.now().After(end.Add(-30 * time.Second)) {
+				res.limitedLate++
+			}
 			*n4++
 			if !v.limited {
 				v.limited = true
@@ -266,7 +281,14 @@ func runHost(t *testing.T, limits func(*config.Config), jitter bool, n int, perM
 					}
 					push(&simEvent{at: e.at, kind: evAck, v: e.v, id: m.MsgID})
 				}
+				if !v.polled {
+					v.polled = true
+					res.allPolling = max(res.allPolling, e.at.Sub(start))
+				}
 				next := e.at.Add(25 * time.Second)
+				if spread > 0 {
+					next = next.Add(-time.Duration(s.rng.Int64N(int64(spread/time.Second)+1)) * time.Second)
+				}
 				if len(out.Messages) == 32 {
 					next = e.at
 				}
@@ -351,13 +373,27 @@ func TestLoadVaultHost(t *testing.T) {
 		cases = append(cases, &hostCase{n: n, label: "idle"}, &hostCase{n: n, perMin: 1, label: "1 msg/min each"})
 	}
 	// The worst moment for a host: every long-poll ended together (a relay
-	// deploy drains them) and all are re-issued in the same instant, then
-	// stay in step.
-	var sync1000 simResult
-	syncN := 900
-	if raceEnabled || testing.Short() {
-		syncN = 600
+	// deploy drains them) and all are re-issued in the same instant. The
+	// burst of the flood guard (300) is smaller than a host of a few
+	// hundred vaults, so some are refused and come back a second later;
+	// what matters is how long until all are polling again, and whether
+	// the refusals stop. Without poll jitter the vaults stay in step and
+	// meet the guard together again every 25 s; with it (vettid-vault from
+	// staging release 11: 20 to 25 s) they spread out.
+	type syncCase struct {
+		n      int
+		spread time.Duration
+		r      simResult
 	}
+	var syncs []*syncCase
+	syncSizes := []int{300, 500, 900}
+	if raceEnabled || testing.Short() {
+		syncSizes = []int{300}
+	}
+	for _, n := range syncSizes {
+		syncs = append(syncs, &syncCase{n: n}, &syncCase{n: n, spread: 5 * time.Second})
+	}
+	syncDur := 3 * time.Minute
 	t.Run("sims", func(t *testing.T) { // returns when its parallel subtests are done
 		for _, c := range cases {
 			t.Run(fmt.Sprintf("old/%d/%s", c.n, c.label), func(t *testing.T) {
@@ -369,10 +405,12 @@ func TestLoadVaultHost(t *testing.T) {
 				c.cur = runHost(t, newLimits, true, c.n, c.perMin, false, dur)
 			})
 		}
-		t.Run("new/synchronised", func(t *testing.T) {
-			t.Parallel()
-			sync1000 = runHost(t, newLimits, true, syncN, 1, true, dur)
-		})
+		for _, c := range syncs {
+			t.Run(fmt.Sprintf("new/synchronised/%d/%s", c.n, c.spread), func(t *testing.T) {
+				t.Parallel()
+				c.r = runHostSpread(t, newLimits, true, c.n, 0, true, syncDur, c.spread)
+			})
+		}
 	})
 	for _, c := range cases {
 		row("old 20/s, "+c.label, c.n, c.old)
@@ -391,9 +429,22 @@ func TestLoadVaultHost(t *testing.T) {
 			t.Errorf("old limiter, %d vaults, %s: %.1f%% refused; the simulation does not show the problem", c.n, c.label, c.old.rate())
 		}
 	}
-	row("new, synchronised polls", syncN, sync1000)
-	if sync1000.limited != 0 {
-		t.Errorf("synchronised polls: %d refused", sync1000.limited)
+	fmt.Fprintf(&b, "\nall polls of a host in the same instant (after a relay deploy), idle vaults, %s of simulated time, new limits\n", syncDur)
+	fmt.Fprintf(&b, "%-8s %-22s %9s %9s %18s %22s\n", "vaults", "poll wait", "requests", "429", "all polling after", "429s in the last 30 s")
+	for _, c := range syncs {
+		wait := "25 s (before S11)"
+		if c.spread > 0 {
+			wait = "20 to 25 s (S11)"
+		}
+		fmt.Fprintf(&b, "%-8d %-22s %9d %9d %17.1fs %22d\n", c.n, wait, c.r.requests, c.r.limited, c.r.allPolling.Seconds(), c.r.limitedLate)
+		// Whatever is refused at first, every vault must be polling again
+		// within seconds, not minutes.
+		if c.r.allPolling > 15*time.Second {
+			t.Errorf("%d vaults re-polling at once: %v until all were polling", c.n, c.r.allPolling)
+		}
+		if c.n <= 300 && c.r.limited != 0 {
+			t.Errorf("%d vaults re-polling at once fit the burst, yet %d were refused", c.n, c.r.limited)
+		}
 	}
 	t.Log(b.String())
 }
