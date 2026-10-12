@@ -400,51 +400,139 @@ func (s *Server) senderOverFailures(r *http.Request, mailboxID string) *apiError
 //	        a refused deposit is. A small share per network.
 //	keyed   deposit bodies read after the deposit token has verified
 //	        (§5.3 steps 1–6): nothing unauthenticated ever counts here.
+//
+// Each pool has a cap per network and one for the process. A network over
+// its own share is refused. When the process cap is reached, a body of the
+// network that holds the most is ended to make room: the heaviest holder
+// is shed, the newcomer is not refused.
 type bodyPool struct {
 	max, maxNet int64
 
-	mu     sync.Mutex
-	total  int64
-	perNet map[string]int64
-	peak   int64 // thousandths of max, since the last report
+	mu    sync.Mutex
+	total int64
+	nets  map[string]*bodyNet
+	peak  int64 // thousandths of max, since the last report
 }
+
+type bodyNet struct {
+	bytes   int64
+	readers map[*bodyRead]struct{}
+}
+
+// bodyRead is one body being read.
+type bodyRead struct {
+	net    string
+	held   int64  // bytes counted for it
+	cancel func() // ends its read now
+	shed   bool   // it was ended to make room
+}
+
+// maxBodyReaders is how many bodies one network may have in the reading at
+// once, per pool. A body normally arrives with its headers and is read in
+// no time; this bounds the connections of those that stall.
+const maxBodyReaders = 256
 
 func newBodyPool(max, maxNet int64) *bodyPool {
-	return &bodyPool{max: max, maxNet: maxNet, perNet: map[string]int64{}}
+	return &bodyPool{max: max, maxNet: maxNet, nets: map[string]*bodyNet{}}
 }
 
-func (p *bodyPool) take(net string, n int64) bool {
+// enter registers a body about to be read; false if its network already
+// has its maximum in the reading.
+func (p *bodyPool) enter(b *bodyRead) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.total+n > p.max || net != "" && p.perNet[net]+n > p.maxNet {
+	n := p.nets[b.net]
+	if n == nil {
+		n = &bodyNet{readers: map[*bodyRead]struct{}{}}
+		p.nets[b.net] = n
+	}
+	if b.net != "" && len(n.readers) >= maxBodyReaders {
+		if len(n.readers) == 0 {
+			delete(p.nets, b.net)
+		}
 		p.peak = 1000
 		return false
 	}
-	p.total += n
-	if net != "" {
-		p.perNet[net] += n
+	n.readers[b] = struct{}{}
+	return true
+}
+
+// grow counts n more bytes for b. Over its network's share: refused. Over
+// the pool: room is made by ending a body of the network that holds the
+// most, unless that is b's own network (the heaviest holder is shed, the
+// newcomer is not refused).
+func (p *bodyPool) grow(b *bodyRead, n int64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	own := p.nets[b.net]
+	if b.shed || own == nil {
+		return false
 	}
+	if b.net != "" && own.bytes+n > p.maxNet {
+		p.peak = 1000
+		return false
+	}
+	for p.total+n > p.max {
+		p.peak = 1000
+		var heavy *bodyNet
+		for _, c := range p.nets {
+			if heavy == nil || c.bytes > heavy.bytes {
+				heavy = c
+			}
+		}
+		if heavy == nil || heavy == own || heavy.bytes <= own.bytes+n {
+			return false
+		}
+		var victim *bodyRead
+		for r := range heavy.readers {
+			if r.held > 0 && (victim == nil || r.held > victim.held) {
+				victim = r
+			}
+		}
+		if victim == nil {
+			return false
+		}
+		victim.shed = true
+		heavy.bytes -= victim.held
+		p.total -= victim.held
+		victim.held = 0
+		if victim.cancel != nil {
+			victim.cancel()
+		}
+	}
+	b.held += n
+	own.bytes += n
+	p.total += n
 	if used := p.total * 1000 / p.max; used > p.peak {
 		p.peak = used
 	}
 	return true
 }
 
-func (p *bodyPool) give(net string, n int64) {
+// leave gives back what b held.
+func (p *bodyPool) leave(b *bodyRead) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.total -= n
-	if net != "" {
-		if p.perNet[net] -= n; p.perNet[net] <= 0 {
-			delete(p.perNet, net)
-		}
+	n := p.nets[b.net]
+	if n == nil {
+		return
+	}
+	n.bytes -= b.held
+	p.total -= b.held
+	b.held = 0
+	delete(n.readers, b)
+	if len(n.readers) == 0 {
+		delete(p.nets, b.net)
 	}
 }
 
-func (p *bodyPool) inFlight() (total int64, nets int) {
+func (p *bodyPool) inFlight() (total int64, readers int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.total, len(p.perNet)
+	for _, n := range p.nets {
+		readers += len(n.readers)
+	}
+	return p.total, readers
 }
 
 func (p *bodyPool) takePeak() int64 {
@@ -469,10 +557,12 @@ var (
 	paceKeyed = bodyPace{idle: 30 * time.Second, total: 5 * time.Minute}
 )
 
-const bodyChunk = 4096
+// bodyChunk is the first buffer of a body; it doubles as the body grows.
+const bodyChunk = 512
 
 // readBodyFrom reads a request body of at most limit bytes, counting the
 // memory it holds against pool as it grows and holding the sender to pace.
+// Nothing is counted, and nothing allocated, before the first byte.
 func (s *Server) readBodyFrom(w http.ResponseWriter, r *http.Request, limit int64, pool *bodyPool, pace bodyPace) ([]byte, *apiError) {
 	if r.ContentLength > limit {
 		return nil, fail(CodePayloadTooLarge)
@@ -484,34 +574,35 @@ func (s *Server) readBodyFrom(w http.ResponseWriter, r *http.Request, limit int6
 	if r.ContentLength > 0 {
 		want = r.ContentLength
 	}
-	addr := stateOf(w).addr
-	held := min(bodyChunk, want)
 	refuse := func() ([]byte, *apiError) {
 		s.rl.refused.With(limBodies).Inc()
 		return nil, &apiError{code: CodeRateLimited, retryAfter: 1 + s.jitter()}
 	}
-	if !pool.take(addr, held) {
+	rc := http.NewResponseController(w)
+	b := &bodyRead{net: stateOf(w).addr, cancel: func() { rc.SetReadDeadline(time.Now()) }}
+	if !pool.enter(b) {
 		return refuse()
 	}
-	defer func() { pool.give(addr, held) }()
-	buf := make([]byte, 0, held)
+	defer pool.leave(b)
 	src := http.MaxBytesReader(w, r.Body, limit)
-	rc := http.NewResponseController(w)
 	start, timed := time.Now(), true
+	var first [1]byte
+	var buf []byte
 	for {
 		if len(buf) == cap(buf) {
-			if int64(cap(buf)) >= want && r.ContentLength > 0 {
+			if buf != nil && int64(cap(buf)) >= want && r.ContentLength > 0 {
 				break
 			}
-			grown := min(2*int64(cap(buf)), want)
+			grown := min(max(2*int64(cap(buf)), bodyChunk), want)
 			if grown == int64(cap(buf)) {
 				grown++ // length not declared and limit reached: room for the byte that proves it too long
 			}
-			if !pool.take(addr, grown-held) {
-				return refuse()
+			if buf != nil { // before the first byte nothing is held
+				if !pool.grow(b, grown-int64(cap(buf))) {
+					return refuse()
+				}
+				buf = append(make([]byte, 0, grown), buf...)
 			}
-			held = grown
-			buf = append(make([]byte, 0, grown), buf...)
 		}
 		if timed {
 			deadline := start.Add(pace.total)
@@ -520,14 +611,29 @@ func (s *Server) readBodyFrom(w http.ResponseWriter, r *http.Request, limit int6
 			}
 			timed = rc.SetReadDeadline(deadline) == nil
 		}
-		n, err := src.Read(buf[len(buf):cap(buf)])
-		buf = buf[:len(buf)+n]
+		var n int
+		var err error
+		if buf == nil {
+			if n, err = src.Read(first[:]); n > 0 {
+				c := min(int64(bodyChunk), want)
+				if !pool.grow(b, c) {
+					return refuse()
+				}
+				buf = append(make([]byte, 0, c), first[0])
+			}
+		} else {
+			n, err = src.Read(buf[len(buf):cap(buf)])
+			buf = buf[:len(buf)+n]
+		}
 		var mbe *http.MaxBytesError
 		switch {
 		case err == io.EOF:
 		case errors.As(err, &mbe):
 			return nil, fail(CodePayloadTooLarge)
 		case err != nil:
+			if b.shed { // ended to make room for another network's
+				return refuse()
+			}
 			return nil, fail(CodeBadRequest) // also: too slow
 		default:
 			continue
@@ -539,6 +645,9 @@ func (s *Server) readBodyFrom(w http.ResponseWriter, r *http.Request, limit int6
 	}
 	if r.ContentLength > 0 && int64(len(buf)) != r.ContentLength {
 		return nil, fail(CodeBadRequest)
+	}
+	if buf == nil {
+		buf = []byte{}
 	}
 	return buf, nil
 }

@@ -121,6 +121,10 @@ func WithBodyPace(idle, total time.Duration) Option {
 	return func(s *Server) { s.paceOpen = bodyPace{idle: idle, total: total} }
 }
 
+// WithDrainTimeout replaces how long a refused request's unread body may
+// still take to arrive before its answer is sent (tests).
+func WithDrainTimeout(d time.Duration) Option { return func(s *Server) { s.drain = d } }
+
 // WithWebSocketLifetime replaces the maximum life of a WebSocket session.
 func WithWebSocketLifetime(d time.Duration) Option { return func(s *Server) { s.wsLifetime = d } }
 

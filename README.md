@@ -188,9 +188,12 @@ Spec §7.2 has the rules and where each number comes from. In short:
   others. A wrong clock or a client sending requests twice costs the
   network one unit per key and minute, and holds nobody.
 - Request bodies: memory is counted as bytes arrive, never by the
-  announced length, in three pools (small bodies; deposits before
-  authentication; deposits after the token verified), and a body has to
-  keep arriving (5 s without a byte before authentication, 30 s after). A
+  announced length (nothing before the first byte), in three pools (small
+  bodies; deposits before authentication; deposits after the token
+  verified), and a body has to keep arriving (5 s without a byte before
+  authentication, 30 s after). A network over its share of a pool (bytes,
+  or 256 bodies being read) is refused; when a pool is full, a stalled
+  body of the network holding the most is ended to make room. A
   deposit's body is read after §5.3 steps 1–6, except on a penalised
   network and to attribute a refused deposit whose named key has a mailbox.
 - Parked collectors are capped per network and per process, but a

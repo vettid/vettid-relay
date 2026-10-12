@@ -53,6 +53,7 @@ type Server struct {
 	smallBodies, openBodies, keyedBodies *bodyPool                                      // memory held by request bodies being read (limits.go)
 	paceOpen                             bodyPace                                       // how fast a body has to arrive before its request is authenticated
 	wsLifetime                           time.Duration                                  // a WebSocket session's maximum life
+	drain                                time.Duration                                  // how long a refused request\'s unread body may still take (middleware.go)
 	timer                                func(time.Duration) (<-chan time.Time, func()) // long-poll deadline (tests inject the clock)
 	keyLimit                             RateLimiter                                    // per authenticated key
 	subLimit                             RateLimiter                                    // per sender key, on deposits and blob uploads
@@ -169,6 +170,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		keyedBodies:  newBodyPool(cfg.MaxBodyBytes, cfg.MaxBodyBytesPerNetwork),
 		paceOpen:     paceOpen,
 		wsLifetime:   wsMaxLifetime,
+		drain:        refusedDrainTimeout,
 		timer: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTimer(d)
 			return t.C, func() { t.Stop() }

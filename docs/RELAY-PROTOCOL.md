@@ -838,7 +838,11 @@ how for each pool.
      never by the announced length: a request that announces a body and
      sends nothing holds nothing, and a body has to keep arriving (a pace:
      something every few seconds, all of it within a deadline). There are
-     separate pools, each with a cap per network and per process: small
+     separate pools, each with a cap per network (in bytes, and in bodies
+     being read at once) and one per process; a network over its own
+     share is refused, but when the **process** cap is reached a body of
+     the network holding the most is ended (`429`) to make room, and the
+     newcomer is read. The pools: small
      bodies (registration, rotation, denylist, claims: at most 16 KiB
      each); deposit bodies read **before** the request is authenticated;
      and deposit bodies read **after** the deposit token has verified,
@@ -937,7 +941,7 @@ projected to hold about 900 vaults; the numbers are sized for 2,000.
 | 6 claim fetches | 1/s, burst 10; per network | unchanged |
 | 7 collectors per mailbox | 4, per relay process | unchanged |
 | 8 parked collectors | 2,500 per network, 4,000 in all; per relay process; WebSocket sessions live at most 1 h | 2,000 vaults of one host on one process (a deploy) with a quarter more. Measured: a parked long-poll holds 42 KiB of the process, a WebSocket session 45 KiB, so 4,000 are 180 MiB. |
-| 8 body bytes being read | small bodies: 512 KiB per network, 4 MiB in all. Deposits before authentication: 1 MiB per network, 8 MiB in all; 5 s without a byte or 20 s in all ends them. Deposits after the token verified: 8 MiB per network, 24 MiB in all; 30 s without a byte or 5 min in all | A deposit is at most about 350 KiB and usually a few. Unauthenticated bodies get a share that takes eight networks to fill and that authenticated ones never touch. Slowest link served: about 10 kbit/s for a deposit whose token verified; 140 kbit/s for a largest deposit from a penalised network. |
+| 8 body bytes being read | at most 256 bodies being read per network and pool. Small bodies: 512 KiB per network, 4 MiB in all. Deposits before authentication: 1 MiB per network, 8 MiB in all; 5 s without a byte or 20 s in all ends them. Deposits after the token verified: 8 MiB per network, 24 MiB in all; 30 s without a byte or 5 min in all | A deposit is at most about 350 KiB and usually a few. Unauthenticated bodies get a share that takes eight networks to fill and that authenticated ones never touch. Slowest link served: about 10 kbit/s for a deposit whose token verified; 140 kbit/s for a largest deposit from a penalised network. |
 | 8 tables | 50,000 keys each, 2,500 per network (per-key tables); 20,000 (bucket tables) | Measured: 110 to 140 bytes a key, 5 to 7 MiB a full per-key table. |
 
 **Memory budget (reference relay, 512 MiB task).** Parked collectors 180
@@ -984,10 +988,16 @@ MiB. The task SHOULD run with a Go memory limit of 400 MiB
   The host's vaults then lose places and come back: churn, and beyond
   the cap refusals for the heaviest network. The remedy is capacity:
   scale on the number of parked collectors.
-- **Unauthenticated deposit bodies** share 8 MiB per process, 1 MiB per
-  network: eight networks sending stalled bodies fill it, and then
-  deposits *from penalised networks* and the attribution of refused
-  deposits wait (`429`); deposits whose token verified are not affected.
+- **Memory for unauthenticated bodies** (small bodies; deposits before
+  authentication) can be filled by eight networks sending bodies and
+  stalling. A newcomer is then still read, at the expense of the
+  heaviest network's stalled bodies; what is lost is those networks' own
+  requests, and a newcomer whose network is itself the heaviest (a host
+  with many slow uploads in flight at that moment) is refused (`429`).
+  Deposits whose token verified are in a pool none of this touches.
+- **Stalled requests hold a connection each** until the pace ends them
+  (5 s without a byte): per network at most 256 per pool. Against many
+  networks that is the load balancer's to bound.
 - **The per-key tables** take twenty networks to fill (a share each). The
   held-keys table needs about 40 fresh signed keys a second from each to
   stay full; orphans are then not held (each ask is a store read, after

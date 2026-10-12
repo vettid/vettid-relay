@@ -116,7 +116,7 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 		// finishes and reads its answer; a slower one sees the connection
 		// close and retries.
 		if rec.status >= 400 && r.ContentLength != 0 && !rec.hijacked {
-			http.NewResponseController(w).SetReadDeadline(time.Now().Add(refusedDrainTimeout))
+			http.NewResponseController(w).SetReadDeadline(time.Now().Add(s.drain))
 		}
 	})
 }

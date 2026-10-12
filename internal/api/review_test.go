@@ -136,15 +136,50 @@ func TestBodiesCountAsTheyArriveAndStalledOnesEnd(t *testing.T) {
 
 func TestBodyPools(t *testing.T) {
 	p := newBodyPool(100, 40)
-	if !p.take("a", 40) || p.take("a", 1) || !p.take("b", 40) || !p.take("c", 20) || p.take("d", 1) {
-		t.Fatal("caps per network and in all")
+	reader := func(net string) *bodyRead {
+		b := &bodyRead{net: net}
+		if !p.enter(b) {
+			t.Fatal("enter")
+		}
+		return b
 	}
-	p.give("a", 40)
-	if total, nets := p.inFlight(); total != 60 || nets != 2 {
-		t.Fatalf("after give: %d bytes, %d networks", total, nets)
+	a, a2, b, c := reader("a"), reader("a"), reader("b"), reader("c")
+	if !p.grow(a, 30) || !p.grow(a2, 10) || p.grow(a, 1) {
+		t.Fatal("a network's own share")
+	}
+	if !p.grow(b, 40) || !p.grow(c, 20) {
+		t.Fatal("room for the others")
+	}
+	// The pool is full (100). A newcomer from a fourth network is not
+	// refused: the heaviest network's largest body is ended instead.
+	ended := false
+	a.cancel = func() { ended = true }
+	d := reader("d")
+	if !p.grow(d, 10) || !ended || !a.shed || a.held != 0 {
+		t.Fatalf("newcomer refused, or nobody shed (ended %v)", ended)
+	}
+	if total, readers := p.inFlight(); total != 10+40+20+10 || readers != 5 {
+		t.Fatalf("after the shed: %d bytes, %d readers", total, readers)
+	}
+	// The heaviest network itself gets no such favour.
+	if p.grow(b, 30) {
+		t.Fatal("the heaviest network grew past the pool's cap by shedding others")
+	}
+	for _, r := range []*bodyRead{a, a2, b, c, d} {
+		p.leave(r)
+	}
+	if total, readers := p.inFlight(); total != 0 || readers != 0 || len(p.nets) != 0 {
+		t.Fatalf("after all left: %d bytes, %d readers", total, readers)
 	}
 	if p.takePeak() != 1000 || p.takePeak() != 0 {
 		t.Fatal("peak")
+	}
+	// One network cannot have more than maxBodyReaders bodies in the reading.
+	for i := 0; i < maxBodyReaders; i++ {
+		reader("x")
+	}
+	if p.enter(&bodyRead{net: "x"}) || !p.enter(&bodyRead{net: "y"}) {
+		t.Fatal("readers per network")
 	}
 	// The relay's pools are separate: deposits being read before
 	// authentication, deposits whose token has verified, small bodies.
@@ -152,9 +187,62 @@ func TestBodyPools(t *testing.T) {
 	if f.s.openBodies == f.s.keyedBodies || f.s.smallBodies == f.s.openBodies {
 		t.Fatal("pools are shared")
 	}
-	d := config.Defaults()
-	if d.MaxOpenBodyBytesPerNetwork*8 > d.MaxOpenBodyBytes || d.MaxOpenBodyBytes+d.MaxBodyBytes+smallBodyPool > 36<<20 {
-		t.Fatalf("body budget: open %d (per network %d), keyed %d", d.MaxOpenBodyBytes, d.MaxOpenBodyBytesPerNetwork, d.MaxBodyBytes)
+	d0 := config.Defaults()
+	if d0.MaxOpenBodyBytesPerNetwork*8 > d0.MaxOpenBodyBytes || d0.MaxOpenBodyBytes+d0.MaxBodyBytes+smallBodyPool > 36<<20 {
+		t.Fatalf("body budget: open %d (per network %d), keyed %d", d0.MaxOpenBodyBytes, d0.MaxOpenBodyBytesPerNetwork, d0.MaxBodyBytes)
+	}
+}
+
+// N1: when the pool for small bodies is full of stalled ones, an honest
+// registration from another network is still read: a stalled body of the
+// network holding the most is ended (429) to make room.
+func TestFullBodyPoolShedsTheHeaviestNetwork(t *testing.T) {
+	f := newFixtureWith(t, func(c *config.Config) { c.TrustProxy = true },
+		func(*fixture) []Option { return []Option{WithDrainTimeout(200 * time.Millisecond)} })
+	f.s.smallBodies = newBodyPool(3*bodyChunk, 2*bodyChunk)
+	stall := func(from string) *bufio.Reader {
+		c, err := net.Dial("tcp", f.ts.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		fmt.Fprintf(c, "POST /v1/register HTTP/1.1\r\nHost: relay\r\nX-Forwarded-For: %s\r\nContent-Length: %d\r\n\r\n{", from, smallBodyLimit)
+		return bufio.NewReader(c)
+	}
+	heavy := []*bufio.Reader{stall("198.51.100.1"), stall("198.51.100.1")}
+	stall("198.51.100.2")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if total, _ := f.s.smallBodies.inFlight(); total == 3*bodyChunk {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the pool did not fill")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	honest := newPrincipal(1)
+	r := registerReq(honest)
+	r.header = http.Header{"X-Forwarded-For": {"203.0.113.9"}}
+	if code, b := f.do(r); code != 201 {
+		t.Fatalf("honest registration with the pool full: %d %s", code, b)
+	}
+	// One of the heaviest network's stalled bodies was ended, at once.
+	got := make(chan int, 2)
+	for _, h := range heavy {
+		go func() {
+			if resp, err := http.ReadResponse(h, nil); err == nil {
+				got <- resp.StatusCode
+			}
+		}()
+	}
+	select {
+	case code := <-got:
+		if code != http.StatusTooManyRequests {
+			t.Fatalf("the shed body was answered %d", code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no body of the heaviest network was ended")
 	}
 }
 
@@ -657,9 +745,9 @@ func TestBodyPoolsCannotBeHeldByUnauthenticatedAddresses(t *testing.T) {
 	h := http.Header{}
 	auth.SetHeaders(h, target.priv, "POST", "/v1/elsewhere", f.sigTime(), auth.BodyHash(nil))
 	sig := fmt.Sprintf("X-VettID-Key: %s\r\nX-VettID-Timestamp: %s\r\nX-VettID-Sig: %s\r\nAuthorization: VettID-Deposit x\r\n", h.Get(auth.HeaderKey), h.Get(auth.HeaderTimestamp), h.Get(auth.HeaderSig))
-	// (a) 400 deposits and 400 registrations that announce a full body and
+	// (a) 100 deposits and 100 registrations that announce a full body and
 	// send none; with well-formed signature headers naming a real key.
-	for i := 0; i < 400; i++ {
+	for i := 0; i < 100; i++ {
 		send("/v1/mailbox/"+target.mbx, sig, limit, 0)
 		send("/v1/register", "", smallBodyLimit, 0)
 	}
@@ -667,8 +755,8 @@ func TestBodyPoolsCannotBeHeldByUnauthenticatedAddresses(t *testing.T) {
 	open, _ := f.s.openBodies.inFlight()
 	keyed, _ := f.s.keyedBodies.inFlight()
 	small, _ := f.s.smallBodies.inFlight()
-	t.Logf("800 requests announcing %d MiB in all, no body sent: bytes held: open %d, keyed %d, small %d", (400*limit+400*smallBodyLimit)>>20, open, keyed, small)
-	if keyed != 0 || open > 400*bodyChunk || small > 400*bodyChunk {
+	t.Logf("200 requests announcing %d MiB in all, no body sent: bytes held: open %d, keyed %d, small %d", (100*limit+100*smallBodyLimit)>>20, open, keyed, small)
+	if keyed != 0 || open != 0 || small != 0 {
 		t.Fatalf("announced bodies hold memory: open %d, keyed %d, small %d", open, keyed, small)
 	}
 	// (b) The same deposits, now sending all but the last byte, to hold
