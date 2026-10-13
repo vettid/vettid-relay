@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/oklog/ulid/v2"
+
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/store"
 	auth "github.com/vettid/vettid-relay/relayauth"
@@ -442,8 +444,28 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	setLog(w, "msg_id", msgID)
+	setLog(w, "msg_id", logID(msgID))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// validID reports whether s is an id as the relay issues them for messages
+// and blobs: a ULID in its canonical form (26 characters of Crockford
+// base32, upper case). Nothing else can name a stored item, so nothing
+// else is passed to the store or written to the log.
+func validID(s string) bool {
+	id, err := ulid.ParseStrict(s)
+	return err == nil && id.String() == s
+}
+
+// logID is the value logged for a caller-supplied message or blob id: the
+// id itself when it is well-formed, a fixed word otherwise. The path
+// segment is the caller's text, of any length and content, until it has
+// been checked.
+func logID(s string) string {
+	if validID(s) {
+		return s
+	}
+	return "invalid"
 }
 
 // ack is shared by DELETE and WebSocket ack frames. Spec §6.5 (0.3.0):
@@ -451,8 +473,8 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 // belongs to another mailbox (then nothing happens) — so ack cannot be used
 // to probe which message ids exist.
 func (s *Server) ack(ctx context.Context, mailbox, msgID string) *apiError {
-	if len(msgID) != 26 {
-		return nil // cannot exist
+	if !validID(msgID) {
+		return nil // cannot exist: nothing to ask the store
 	}
 	deleted, err := s.st.Ack(ctx, mailbox, msgID)
 	if err != nil {

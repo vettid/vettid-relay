@@ -508,3 +508,34 @@ func TestLongLifetimePolicy(t *testing.T) {
 	}
 	f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("x")), signer: &sender, token: reconnect}, 403, CodeTokenRevoked)
 }
+
+// malformedIDs are caller-supplied values that cannot be a message or blob
+// id (a ULID in canonical form): wrong length, a letter outside Crockford
+// base32, lower case, and a value beyond 128 bits.
+var malformedIDs = []string{
+	"nope",
+	"UUUUUUUUUUUUUUUUUUUUUUUUUU",
+	"01j00000000000000000000000",
+	"80000000000000000000000000",
+	strings.Repeat("A", 4000),
+}
+
+// Ack is always 204 (§6.5), but only a well-formed id is looked up: nothing
+// else can name a message, so nothing else costs a store call.
+func TestAckMalformedIDSkipsStore(t *testing.T) {
+	f := newFixture(t, nil)
+	cs := f.countStore()
+	owner := newPrincipal(1)
+	f.register(owner)
+	for _, id := range malformedIDs {
+		if code, b := f.ack(owner, id); code != http.StatusNoContent {
+			t.Fatalf("ack %.30q: %d %s", id, code, b)
+		}
+	}
+	if n := cs.acks.Load(); n != 0 {
+		t.Fatalf("%d malformed acks reached the store", n)
+	}
+	if code, _ := f.ack(owner, unknownID(0)); code != http.StatusNoContent || cs.acks.Load() != 1 {
+		t.Fatalf("well-formed unknown id: %d, %d store calls", code, cs.acks.Load())
+	}
+}

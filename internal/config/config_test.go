@@ -44,6 +44,50 @@ func TestLoadOverrides(t *testing.T) {
 	}
 }
 
+func TestWebSocketSessionCapConfig(t *testing.T) {
+	if d := Defaults(); d.MaxWebSocketSessions != 4000 {
+		t.Fatalf("default %d", d.MaxWebSocketSessions)
+	}
+	c, err := Load(env(map[string]string{"RELAY_MAX_WS_SESSIONS": "5000"}))
+	if err != nil || c.MaxWebSocketSessions != 5000 {
+		t.Fatalf("%d %v", c.MaxWebSocketSessions, err)
+	}
+	// Per network: 1024, and a ceiling of 2000 that first sessions do not
+	// pass. Per-network maximum <= ceiling <= process maximum.
+	if d := Defaults(); d.MaxWebSocketSessionsPerNetworkHard != 2000 {
+		t.Fatalf("default ceiling %d", d.MaxWebSocketSessionsPerNetworkHard)
+	}
+	c, err = Load(env(map[string]string{"RELAY_MAX_WS_SESSIONS": "150", "RELAY_MAX_WS_SESSIONS_PER_NETWORK": "40", "RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD": "150"}))
+	if err != nil || c.MaxWebSocketSessions != 150 || c.MaxWebSocketSessionsPerNetwork != 40 || c.MaxWebSocketSessionsPerNetworkHard != 150 {
+		t.Fatalf("%+v %v", c, err)
+	}
+	for name, bad := range map[string]map[string]string{
+		"ceiling below the per-network maximum": {"RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD": "1000"},
+		"ceiling above the process maximum":     {"RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD": "4001"},
+		"process maximum below the ceiling":     {"RELAY_MAX_WS_SESSIONS": "1500"},
+		"per-network maximum above the ceiling": {"RELAY_MAX_WS_SESSIONS_PER_NETWORK": "2001"},
+		"ceiling zero":                          {"RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD": "0"},
+	} {
+		if _, err := Load(env(bad)); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+	if d := Defaults(); d.MaxWebSocketSessionsPerNetwork != 1024 {
+		t.Fatalf("default per network %d", d.MaxWebSocketSessionsPerNetwork)
+	}
+	c, err = Load(env(map[string]string{"RELAY_MAX_WS_SESSIONS_PER_NETWORK": "40"}))
+	if err != nil || c.MaxWebSocketSessionsPerNetwork != 40 {
+		t.Fatalf("%d %v", c.MaxWebSocketSessionsPerNetwork, err)
+	}
+	for _, name := range []string{"RELAY_MAX_WS_SESSIONS", "RELAY_MAX_WS_SESSIONS_PER_NETWORK"} {
+		for _, bad := range []string{"0", "-1", "many"} {
+			if _, err := Load(env(map[string]string{name: bad})); err == nil {
+				t.Errorf("%s=%s: expected an error", name, bad)
+			}
+		}
+	}
+}
+
 func TestLoadRejects(t *testing.T) {
 	for name, m := range map[string]map[string]string{
 		"trailing slash": {"RELAY_BASE_URL": "https://relay.vettid.org/"},

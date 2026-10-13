@@ -26,6 +26,10 @@ import (
 //	claim     unauthenticated claim fetches per network. Shared.
 //	web       everything outside /v1/, per network. Per process.
 //
+// A WebSocket session passes address and key once, at its upgrade. Its ack
+// frames are requests too: those that do not answer a message the relay
+// sent on that session draw on address and key again (ws.go).
+//
 // Nothing else is keyed on a network. A request properly signed by a key
 // with a mailbox can be refused on account of its network only by the
 // flood guard and, if it would create a mailbox, by the registration
@@ -38,6 +42,21 @@ const (
 	limClaim    = "claim"
 	limWeb      = "web"
 )
+
+// limWSSessions labels the upgrades refused because the process carries
+// its maximum of WebSocket sessions (cfg.MaxWebSocketSessions). It is a
+// count, not a bucket: it has a refused series and nothing else.
+const limWSSessions = "ws_sessions"
+
+// limWSNetwork labels the upgrades refused because the caller's network
+// holds its maximum of WebSocket sessions on this process
+// (cfg.MaxWebSocketSessionsPerNetwork). Likewise a count.
+const limWSNetwork = "ws_network"
+
+// limWSNetworkHard labels the upgrades refused because the caller's
+// network holds as many sessions as any network may on this process
+// (cfg.MaxWebSocketSessionsPerNetworkHard), a mailbox's first included.
+const limWSNetworkHard = "ws_network_hard"
 
 var allLimiters = []string{limAddress, limKey, limSender, limRegister, limClaim, limWeb}
 
@@ -74,6 +93,9 @@ func newLimiterMetrics(reg *metrics.Registry) *limiterMetrics {
 	}
 	m.busiest.With(limAddress)
 	m.busiest.With(limKey)
+	m.refused.With(limWSSessions)
+	m.refused.With(limWSNetwork)
+	m.refused.With(limWSNetworkHard)
 	return m
 }
 
@@ -170,6 +192,11 @@ func (s *Server) reportLimits() {
 	attrs = append(attrs, "addresses_refused", len(s.rl.hit),
 		"collectors", s.hub.collectors(), "parked", s.m.parked.Value(), "ws_sessions", s.m.wsSessions.Value())
 	s.rl.hit = map[string]struct{}{}
+	for _, name := range []string{limWSSessions, limWSNetwork, limWSNetworkHard} { // appended last, in this order
+		total := s.rl.refused.With(name).Value()
+		attrs = append(attrs, name+"_refused", total-s.rl.lastRef[name])
+		s.rl.lastRef[name] = total
+	}
 	// At info level every minute: this line is what the limits are sized
 	// from (how close a vault host is to the flood guard, how many
 	// collectors a process carries). One line a minute per process.

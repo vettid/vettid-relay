@@ -54,6 +54,9 @@ type Server struct {
 	hsts bool     // public base URL is https: send Strict-Transport-Security
 
 	hub       *hub
+	wsOpen    atomic.Int64  // WebSocket sessions holding a slot (cfg.MaxWebSocketSessions)
+	health    storeHealth   // /healthz: the last store ping
+	healthTO  time.Duration // how long that ping may take (healthPingTimeout; tests shorten it)
 	bus       WakeBus       // cross-process wake-on-deposit (nil: single process)
 	hints     EmptyHints    // known-empty mailboxes (nil: always query)
 	forceGen  atomic.Uint64 // bumped by WakeAll: collectors then query for real
@@ -146,6 +149,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		rl:       newLimiterMetrics(reg),
 
 		smallBodyTimeout: smallBodyTimeout,
+		healthTO:         healthPingTimeout,
 		subLimit:         ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
 		claimLimit:       ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
 		webLimit:         ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
@@ -224,6 +228,49 @@ func (s *Server) Handler() http.Handler {
 	}))))
 }
 
+// healthPingTTL is how long /healthz answers from its last look at the
+// store. /healthz is public and outside every rate limit (load balancers
+// and vault hosts probe it), so what a request to it can cost is bounded
+// here: one store read per interval per process, however many ask. A
+// store that fails turns the answer within the interval (plus the read's
+// own timeout); so does one that recovers.
+const (
+	healthPingTTL     = 2 * time.Second
+	healthPingTimeout = 2 * time.Second
+)
+
+// storeHealth is the last store ping and when it finished.
+type storeHealth struct {
+	mu     sync.Mutex
+	at     time.Time
+	err    error
+	looked bool
+}
+
+// storeReachable returns the outcome of a store ping no older than
+// healthPingTTL. One caller at a time looks; the others wait for its
+// answer and share it. The ping is not bound to the caller's request: a
+// caller that goes away must not leave a failure behind for the others.
+func (s *Server) storeReachable() error {
+	h := &s.health
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// A negative age is a clock set back: look again.
+	if age := s.now().Sub(h.at); h.looked && age >= 0 && age < healthPingTTL {
+		return h.err
+	}
+	// With its own deadline: a store that hangs must turn the answer to
+	// unhealthy, not hold every /healthz caller behind this one.
+	ctx, cancel := context.WithTimeout(context.Background(), s.healthTO)
+	defer cancel()
+	h.err = s.st.Ping(ctx)
+	h.at, h.looked = s.now(), true
+	if h.err != nil {
+		s.log.Error("healthz: database unreachable", "err", h.err)
+	}
+	return h.err
+}
+
 // handleHealthz reports 200 when the database is reachable and the server is
 // not draining; 503 otherwise (so load balancers stop routing during drain).
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -231,10 +278,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "draining"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-	defer cancel()
-	if err := s.st.Ping(ctx); err != nil {
-		s.log.Error("healthz: database unreachable", "err", err)
+	if err := s.storeReachable(); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "db_unreachable"})
 		return
 	}

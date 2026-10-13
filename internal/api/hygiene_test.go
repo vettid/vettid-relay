@@ -122,3 +122,37 @@ func TestEmptyCollectLogsAtDebug(t *testing.T) {
 		t.Fatalf("collect log levels: %v", levels)
 	}
 }
+
+// The id in an ack or blob delete path is the caller's text until it has
+// been checked: the log carries it only when it is a well-formed id, and a
+// fixed word otherwise (spec §8.2: message ids, not whatever was sent).
+func TestLogsCarryOnlyWellFormedIDs(t *testing.T) {
+	var logs syncBuf
+	f := newFixtureLog(t, nil, &logs)
+	owner := newPrincipal(1)
+	f.register(owner)
+	junk := []string{"CALLER-CHOSEN-TEXT-IN-THE-LOG", strings.Repeat("Z", 26), strings.Repeat("LONG", 1000)}
+	for _, id := range junk {
+		f.ack(owner, id)
+		f.do(req{method: "DELETE", path: "/v1/blob/" + id, signer: &owner})
+	}
+	f.ack(owner, unknownID(1))
+	f.do(req{method: "DELETE", path: "/v1/blob/" + unknownID(2), signer: &owner})
+	want := []string{`"msg_id":"` + unknownID(1) + `"`, `"blob_id":"` + unknownID(2) + `"`}
+	waitFor(t, func() bool {
+		out := logs.String()
+		return strings.Contains(out, want[0]) && strings.Contains(out, want[1])
+	})
+	out := logs.String()
+	for _, id := range junk {
+		if strings.Contains(out, id) {
+			t.Errorf("log contains the caller's text %.30q", id)
+		}
+	}
+	if n := strings.Count(out, `"msg_id":"invalid"`); n != len(junk) {
+		t.Errorf("%d ack lines with a fixed word, want %d", n, len(junk))
+	}
+	if n := strings.Count(out, `"blob_id":"invalid"`); n != len(junk) {
+		t.Errorf("%d blob delete lines with a fixed word, want %d", n, len(junk))
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -86,6 +87,8 @@ func Run(t *testing.T, h Harness) {
 	}{
 		{"RegisterIdempotent", testRegisterIdempotent},
 		{"DepositCollectAck", testDepositCollectAck},
+		{"CollectRange", testCollectRange},
+		{"IDsOnlyGrow", testIDsOnlyGrow},
 		{"MessageExpiry", testMessageExpiry},
 		{"Quotas", testQuotas},
 		{"QuotaRecoversAfterAckAndExpiry", testQuotaRecovers},
@@ -193,6 +196,105 @@ func testDepositCollectAck(t *testing.T, h Harness) {
 	}
 	if got, next, _ := s.Collect(ctx, "b", 10, time.Minute); len(got) != 0 || !next.IsZero() {
 		t.Fatal("mailbox b must be empty")
+	}
+}
+
+// CollectRange leases the messages of an id range only, oldest first, and
+// reports the next lease end of that range only; Collect is the range
+// without bounds.
+func testCollectRange(t *testing.T, h Harness) {
+	a, b, c := h.pair(t)
+	mustRegister(t, a, "a", 1)
+	mustRegister(t, a, "other", 2)
+	var id []string
+	for i := 0; i < 80; i++ { // more than a query page of leases and of messages
+		m, err := a.Deposit(ctx, "a", "s", []byte{byte(i)}, time.Hour, store.Limits{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		id = append(id, m.ID)
+	}
+	if _, err := a.Deposit(ctx, "other", "s", []byte("x"), time.Hour, store.Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	ids := func(msgs []store.Message) []string {
+		var out []string
+		for _, m := range msgs {
+			if m.Mailbox != "a" || len(m.Payload) != 1 || id[m.Payload[0]] != m.ID {
+				t.Fatalf("bad message %+v", m)
+			}
+			out = append(out, m.ID)
+		}
+		return out
+	}
+	want := func(what string, got []store.Message, err error, from, to int) {
+		t.Helper()
+		if g := ids(got); err != nil || !slices.Equal(g, id[from:to]) {
+			t.Fatalf("%s: got %d messages (%v), want ids %d..%d", what, len(g), err, from, to-1)
+		}
+	}
+	// after is exclusive, upTo inclusive, max limits, oldest first.
+	got, next, err := a.CollectRange(ctx, "a", id[9], id[49], 20, time.Minute)
+	want("inside", got, err, 10, 30)
+	if !next.IsZero() {
+		t.Fatalf("next %v with messages", next)
+	}
+	got, _, err = b.CollectRange(ctx, "a", id[9], id[49], 100, time.Minute)
+	want("rest of the range", got, err, 30, 50)
+	// The range is leased: nothing, and its next lease end.
+	got, next, err = a.CollectRange(ctx, "a", id[9], id[49], 100, time.Minute)
+	if err != nil || len(got) != 0 || next.Sub(c.Now()) < 50*time.Second || next.Sub(c.Now()) > 70*time.Second {
+		t.Fatalf("leased range: %d messages, next in %v, %v", len(got), next.Sub(c.Now()), err)
+	}
+	// Ranges without collectable or leased messages: nothing, no next.
+	for name, r := range map[string][2]string{
+		"after the last":   {id[79], ""},
+		"empty":            {id[20], id[20]},
+		"inverted":         {id[30], id[20]},
+		"before the first": {"", "00000000000000000000000000"},
+	} {
+		if got, next, err := b.CollectRange(ctx, "a", r[0], r[1], 100, time.Minute); err != nil || len(got) != 0 || !next.IsZero() {
+			t.Fatalf("%s range: %d messages, next %v, %v", name, len(got), next, err)
+		}
+	}
+	// Open-ended ranges; what is leased inside them is skipped.
+	got, _, err = a.CollectRange(ctx, "a", "", id[11], 100, time.Minute)
+	want("up to", got, err, 0, 10)
+	got, _, err = b.CollectRange(ctx, "a", id[69], "", 100, time.Minute)
+	want("after", got, err, 70, 80)
+	// Collect is the whole mailbox: what no range took.
+	got, _, err = a.Collect(ctx, "a", 100, time.Minute)
+	want("collect", got, err, 50, 70)
+	// When the leases end the range is collectable again, by either handle.
+	c.Add(61 * time.Second)
+	got, _, err = b.CollectRange(ctx, "a", id[39], id[44], 100, time.Minute)
+	want("after the leases ended", got, err, 40, 45)
+	if ok, err := a.Ack(ctx, "a", id[40]); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	c.Add(61 * time.Second)
+	got, _, err = a.CollectRange(ctx, "a", id[39], id[44], 100, time.Minute)
+	want("after an ack", got, err, 41, 45)
+}
+
+// A message deposited later never gets a smaller id, whatever the clock
+// does: collectors that have seen an id rely on new messages sorting after it.
+func testIDsOnlyGrow(t *testing.T, h Harness) {
+	a, b, c := h.pair(t)
+	mustRegister(t, a, "a", 1)
+	last := ""
+	for i, s := range []store.Backend{a, b, a, b, a} {
+		if i%2 == 1 {
+			c.Add(-time.Hour) // the clock is set back
+		}
+		m, err := s.Deposit(ctx, "a", "s", []byte("x"), 24*time.Hour, store.Limits{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.ID <= last {
+			t.Fatalf("deposit %d: id %s is not above the earlier %s", i, m.ID, last)
+		}
+		last = m.ID
 	}
 }
 

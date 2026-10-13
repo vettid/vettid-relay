@@ -148,3 +148,25 @@ func TestBlobsDisabled(t *testing.T) {
 	f.register(owner)
 	f.expectCode(req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: []byte("x"), signer: &sender, token: f.mint(owner, sender, nil)}, 404, CodeNotFound)
 }
+
+// Only a well-formed blob id is looked up; the answers are the same.
+func TestBlobMalformedIDSkipsStore(t *testing.T) {
+	f := newFixture(t, nil)
+	cs := f.countStore()
+	owner := newPrincipal(1)
+	f.register(owner)
+	for _, id := range malformedIDs {
+		f.expectCode(req{method: "GET", path: "/v1/blob/" + id, signer: &owner}, 404, CodeBlobUnknown)
+		if code, b := f.do(req{method: "DELETE", path: "/v1/blob/" + id, signer: &owner}); code != http.StatusNoContent {
+			t.Fatalf("delete %.30q: %d %s", id, code, b)
+		}
+	}
+	if o, d := cs.blobOpens.Load(), cs.blobDeletes.Load(); o != 0 || d != 0 {
+		t.Fatalf("malformed blob ids reached the store: %d opens, %d deletes", o, d)
+	}
+	f.expectCode(req{method: "GET", path: "/v1/blob/" + unknownID(0), signer: &owner}, 404, CodeBlobUnknown)
+	f.do(req{method: "DELETE", path: "/v1/blob/" + unknownID(0), signer: &owner})
+	if o, d := cs.blobOpens.Load(), cs.blobDeletes.Load(); o != 1 || d != 1 {
+		t.Fatalf("well-formed unknown blob id: %d opens, %d deletes", o, d)
+	}
+}

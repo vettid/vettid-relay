@@ -132,6 +132,9 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
 | `RELAY_ANDROID_CERT_SHA256` | the official VettID app's signing keys | Comma-separated SHA-256 certificate fingerprints for `assetlinks.json`, colon-separated or plain hex, any case (served in uppercase colon form). The built-in default (`config.DefaultAndroidCertFingerprints`: the production upload key and the two staging signers) lets a self-hosted relay open links in the official app with no configuration. Set but empty turns `assetlinks.json` off (404). |
 | `RELAY_MAX_COLLECTORS_PER_MAILBOX` | `4` | Concurrent long-polls plus WebSockets per mailbox. |
+| `RELAY_MAX_WS_SESSIONS` | `4000` | Open WebSocket collect sessions per relay process, over all mailboxes. An upgrade beyond it is answered `429 rate_limited` with `retry_after` 5; long-poll isn't affected. At about 45 KiB a session the default is about 176 MiB. |
+| `RELAY_MAX_WS_SESSIONS_PER_NETWORK` | `1024` | Of those, the sessions of one client network (the IPv4 address or the IPv6 /64) per relay process. The first session of a mailbox is always admitted, so a full network keeps no mailbox behind it from collecting; beyond the maximum a network gets one session per mailbox, up to the ceiling below. Other upgrades are answered `429 rate_limited` with `retry_after` 5. See [Rate limiting](#rate-limiting). |
+| `RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD` | `2000` | The most sessions of one client network per relay process, first sessions of mailboxes included: no network passes it, so one network can't take all of a process's sessions. Must be at least `RELAY_MAX_WS_SESSIONS_PER_NETWORK` and at most `RELAY_MAX_WS_SESSIONS` (set all three when lowering one). A vault host with more vaults than this behind one address on one process needs it raised, or its further vaults must collect by long-poll. |
 | `RELAY_REPLAY_CACHE_MAX` | `1000000` | Replay-cache capacity. When it's full, requests are shed with `rate_limited` and no live entries are evicted. |
 | `RELAY_SWEEP_INTERVAL` | `60s` | TTL sweeper period. The first pass is jittered. |
 | `RELAY_SHUTDOWN_TIMEOUT` | `20s` | Bound on the graceful drain after SIGTERM. |
@@ -152,6 +155,70 @@ version does not protect against. In short:
   (`RELAY_RATE_REGISTER_*`). Nothing else keyed on a network can refuse a
   request that is properly signed by a key with a mailbox. There is no
   penalty state.
+- A **WebSocket session** passes these limits once, at its upgrade. After
+  that:
+  - It has a window of 128 messages sent and not yet acked. The relay
+    leases the next batch of 32 only while it fits (so at least 97 are
+    outstanding before it pauses), and goes on when acks arrive or the
+    leases end. A session that doesn't ack costs at most 128 leases per
+    visibility timeout.
+  - A session that leaves messages unacked isn't sent the same ones
+    ahead of newer ones for ever. Until their first lease ends, the
+    window is what holds newer messages back (with 128 unacked there is
+    no room). From then on what it was sent before comes again in
+    passes: once per visibility timeout a batch, taken before anything
+    else when it is due, from the mailbox's oldest message to the newest
+    the session had been sent when the pass began; then the next pass.
+    New messages (those after the newest it was ever sent) go out the
+    rest of the time. A batch is as large as leaves one batch of the
+    window free for new messages, and at least 32: 96 when nothing else
+    is outstanding (which needs the previous batch to have been written
+    out promptly; a slow reader gets a smaller batch, never under 32).
+    So neither kind waits for the other: traffic that never pauses can't
+    put a due batch off, and new messages wait only for that batch's
+    frames, unless the session itself has left more than 64 unacked.
+    An unacked message comes again once in every pass, and a pass over n
+    collectable messages is at most ceil(n/32) batches. Batches are one
+    visibility timeout apart, or up to two for a session that keeps its
+    window full of unacked messages: a pass takes at most ceil(n/32)
+    visibility timeouts for a session that acks the new messages it
+    gets, 2 × ceil(n/32) in the worst case, and ceil(n/96) for a session
+    with nothing else outstanding (128 messages: 2 minutes at the
+    default 60 s; a full mailbox of 10,000: about 105 minutes), until
+    the message is acked or expires. Order across redelivery isn't
+    guaranteed. Another session or a long-poll on the same mailbox
+    collects those messages oldest first as always. When a whole pass
+    finds nothing to send again, the session is back to plain
+    oldest-first.
+  - An ack frame that names a message in the window is free, once. Every
+    other ack frame (a message received elsewhere, an id acked before or
+    after its lease ended, an id that names nothing) is charged like
+    `DELETE /v1/mailbox/{msg_id}`: a token of the flood guard and one of
+    the key's bucket. If either is empty the session is closed with
+    **1013** (try again later) and the reason `rate_limited`.
+  - A frame that isn't `{"ack":"<msg_id>"}` with a ULID in upper case
+    closes the session with **1008**.
+  - A process carries at most `RELAY_MAX_WS_SESSIONS` sessions. Of one
+    network it carries `RELAY_MAX_WS_SESSIONS_PER_NETWORK` (1,024), and
+    beyond that only the first session of a mailbox, up to
+    `RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD` (2,000), which nothing
+    passes. A vault host is one network and each of its vaults a
+    mailbox's first session: the projected 900 fit, with room for sessions
+    that overlap while clients reconnect; more than 2,000 vaults behind
+    one address on one process don't, until the number is raised: the
+    rest must collect by long-poll (a client whose upgrade is answered
+    `429` should fall back to it; one that only retries the WebSocket
+    stays without a collector). The ceiling is per process, so a host
+    can hold 2,000 on each. One address that registers mailboxes as
+    fast as the new-mailbox budget allows reaches 1,024 sessions on a
+    process in about 4 minutes and 2,000 (about 88 MiB) in about 20, and
+    no more: it can't fill a process by itself.
+  - Refused upgrades are counted in `relay_ratelimit_refused_total` under
+    `ws_sessions` (the process is full), `ws_network` (the network is at
+    its maximum and the mailbox has a session) and `ws_network_hard` (the
+    network is at its ceiling), and at the end of the `rate limits` line
+    as `ws_sessions_refused`, `ws_network_refused` and
+    `ws_network_hard_refused`.
 - A deposit's body is read only after its token has verified (§5.3 steps
   1–6 need only headers). A request refused before its body was read is
   answered at once with `Connection: close`. Small bodies (register,
@@ -301,8 +368,11 @@ other process sees, refuses or is woken by.
   `relay_collect_store_queries_total`, `relay_collect_store_skips_total`,
   `relay_empty_hint_bump_failures_total`.
 - **Per-process limits.** `RELAY_MAX_COLLECTORS_PER_MAILBOX`,
-  `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` and the replay-cache capacity bound
-  each process's own resources.
+  `RELAY_MAX_WS_SESSIONS`, `RELAY_MAX_WS_SESSIONS_PER_NETWORK`,
+  `RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD`,
+  `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` and the replay-cache capacity
+  bound each process's own resources. A client that reconnects to another
+  process is counted there afresh.
 - **Mailbox quotas** are counters updated in the same transaction as the
   write. Acks, expiry and TTL deletions can leave them high; a failing quota
   check recomputes them from the items (at most once a minute per
@@ -348,7 +418,7 @@ other process sees, refuses or is woken by.
 | `PUT /v1/claim` | signed by a registered mailbox key | `201 {claim_id, expires_at}` |
 | `GET /v1/claim/{claim_id}` | none (rate-limited) | `200 application/octet-stream`. Single fetch: the claim is deleted. |
 | `DELETE /v1/claim/{claim_id}` | the creating key | `204` (idempotent) |
-| `GET /healthz` | none | `200` when the DB is reachable and not draining, else `503` |
+| `GET /healthz` | none | `200` when the DB is reachable and not draining, else `503`. The DB is asked at most once every 2 s per process; requests in between get the last answer |
 | `GET /connect` | none (web bucket) | `200 text/html`: the invitation landing page (§6.11). Invitation URLs are `<relay>/connect#<link>`; the fragment never reaches the relay. |
 | `GET /.well-known/assetlinks.json` | none (web bucket) | `200 application/json`: Android App Links statement for the VettID app |
 | `GET /robots.txt` | none (web bucket) | `200 text/plain` |
