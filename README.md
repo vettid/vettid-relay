@@ -162,18 +162,25 @@ version does not protect against. In short:
     outstanding before it pauses), and goes on when acks arrive or the
     leases end. A session that doesn't ack costs at most 128 leases per
     visibility timeout.
-  - A session that lets a lease end isn't sent the same messages ahead
-    of newer ones from then on. New messages (those after the newest it
-    was ever sent) go out whenever the window has room; everything older
-    is sent again in turn, one batch of 32 per visibility timeout, from
-    the oldest to the newest and then over again. So a message it doesn't
-    ack comes again at least once every ceil(n/32) visibility timeouts (n:
-    the collectable messages up to the newest it was sent; 4 minutes for
-    128 at the default 60 s) until it is acked or expires, and order
-    across redelivery isn't guaranteed. Another session or a long-poll on
-    the same mailbox collects those messages oldest first as always. When
-    a whole pass finds nothing to send again, the session is back to
-    plain oldest-first.
+  - A session that leaves messages unacked isn't sent the same ones
+    ahead of newer ones for ever. Until their first lease ends, the
+    window is what holds newer messages back (with 128 unacked there is
+    no room). From then on new messages (those after the newest it was
+    ever sent) go out first whenever the window has room, and what it was
+    sent before comes again in passes: once per visibility timeout a
+    batch, from the mailbox's oldest message to the newest the session
+    had been sent when the pass began, then the next pass. A batch is as
+    large as leaves one batch of the window free for new messages, and
+    at least 32: 96 when nothing else is outstanding. So an unacked
+    message comes again once in every pass; a pass over n collectable
+    messages takes at most ceil(n/32) visibility timeouts and ceil(n/96)
+    when the session has nothing else outstanding (128 messages: 2
+    minutes at the default 60 s; a full mailbox of 10,000: about 105
+    minutes), until the message is acked or expires. Order across
+    redelivery isn't guaranteed. Another session or a long-poll on the
+    same mailbox collects those messages oldest first as always. When a
+    whole pass finds nothing to send again, the session is back to plain
+    oldest-first.
   - An ack frame that names a message in the window is free, once. Every
     other ack frame (a message received elsewhere, an id acked before or
     after its lease ended, an id that names nothing) is charged like

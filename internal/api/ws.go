@@ -68,63 +68,84 @@ func (a *ackWindow) room(now time.Time) (fits bool, next time.Time, lapsed int) 
 // acks what it is sent, that is simply the mailbox's oldest collectable
 // messages (one Collect, as for a long-poll). Once it has let a lease end
 // (lapsed), oldest-first would send it the same messages again and again,
-// ahead of everything newer. From then on:
+// ahead of everything newer. From then on, whenever the window has room:
 //
-//   - new messages, those after the greatest id the session was ever sent
-//     (high), are collected whenever the window has room;
-//   - everything up to high is sent again in turn, one batch per
-//     visibility timeout: the re-send pass walks from the oldest to high
-//     (retry is how far it has got) and then starts over.
+//   - New messages first: those after the greatest id the session was
+//     ever sent (high).
+//   - Then, once per visibility timeout, a batch of what it was sent
+//     before, again. These batches are a pass over the mailbox from its
+//     oldest message to passEnd, which is high as it was when the pass
+//     began; retry is how far the pass has got. When nothing is left of
+//     a pass the next one begins, up to the high of that moment: what
+//     the session was sent meanwhile joins the next pass and cannot
+//     prolong this one. A batch leaves one batch of the window free, so
+//     that a message arriving later is not held up behind it, and is at
+//     least wsBatch: wsWindow-wsBatch messages when nothing else is
+//     outstanding.
 //
-// So a message the session does not ack is sent to it again at least once
-// every ceil(n/wsBatch) visibility timeouts, n being the collectable
-// messages up to high, until it is acked or expires; and messages that
-// arrive meanwhile are not held up behind it. When a whole pass finds
-// nothing, the session is back to the single Collect. The cursor is the
-// session's own and lives as long as it does. Nothing here writes to the
-// store except the leases the window already allows.
+// So a message the session does not ack is sent to it again once in
+// every pass. A pass over n collectable messages takes at most
+// ceil(n/wsBatch) visibility timeouts (ceil(n/(wsWindow-wsBatch)) when
+// the session has nothing else outstanding), fewer batches if another
+// collector takes some. Two sendings of a message are therefore at most
+// ceil(n/wsBatch)+1 visibility timeouts apart, n being the collectable
+// messages up to the newest the session had been sent when the later
+// pass began, until the message is acked or expires.
+//
+// This begins when the first lease ends, not before: until then the
+// window is what holds newer messages back (with wsWindow unacked there
+// is no room, for anything). When a whole pass finds nothing, the session
+// is back to the single Collect. The cursor is the session's own and
+// lives as long as it does. Nothing here writes to the store except the
+// leases the window already allows.
 type wsCursor struct {
 	high    string    // the greatest id sent on the session
-	lapsed  bool      // the session let a lease end: re-sends are rationed
-	retry   string    // the re-send pass has done the ids up to here; "": at its start
-	retryAt time.Time // the next re-send batch is due
+	lapsed  bool      // the session let a lease end: see above
+	passEnd string    // the current pass goes up to this id
+	retry   string    // ... and has done the ids up to here; "": the next batch begins a pass
+	retryAt time.Time // the next batch of the pass is due
 }
 
-// wsLease leases the next batch for a session whose window has room. When
-// it returns no messages, next is when to look again (zero: on a wake).
-func (s *Server) wsLease(ctx context.Context, mailbox string, c *wsCursor, force bool) (msgs []store.Message, next time.Time, err error) {
+// wsLease leases the next batch for a session whose window has room and
+// holds outstanding messages. When it returns no messages, next is when to
+// look again (zero: on a wake).
+func (s *Server) wsLease(ctx context.Context, mailbox string, c *wsCursor, outstanding int, force bool) (msgs []store.Message, next time.Time, err error) {
 	defer func() {
 		if n := len(msgs); n > 0 && msgs[n-1].ID > c.high {
 			c.high = msgs[n-1].ID
 		}
 	}()
-	if c.lapsed && !s.now().Before(c.retryAt) {
-		// The re-send batch that is due. Two attempts: the rest of this
-		// pass, and, if that was empty, the start of the next one.
-		for attempt := 0; attempt < 2; attempt++ {
-			msgs, _, err = s.collectRange(ctx, mailbox, c.retry, c.high, wsBatch)
-			if err != nil {
-				return nil, time.Time{}, err
-			}
-			if len(msgs) > 0 {
-				c.retry, c.retryAt = msgs[len(msgs)-1].ID, s.now().Add(s.cfg.VisibilityTimeout)
-				if len(msgs) < wsBatch {
-					c.retry = "" // reached high: the next batch starts over
-				}
-				return msgs, time.Time{}, nil
-			}
-			if c.retry == "" {
-				c.lapsed = false // a whole pass with nothing to send again
-				break
-			}
-			c.retry = ""
-		}
-	}
 	if !c.lapsed {
 		return s.collectOnce(ctx, mailbox, wsBatch, force)
 	}
 	if msgs, next, err = s.collectRange(ctx, mailbox, c.high, "", wsBatch); err != nil || len(msgs) > 0 {
 		return msgs, time.Time{}, err
+	}
+	if !s.now().Before(c.retryAt) {
+		share := max(wsBatch, wsWindow-wsBatch-outstanding)
+		// Two attempts: the rest of this pass and, if nothing is left of
+		// it, the beginning of the next.
+		for attempt := 0; attempt < 2; attempt++ {
+			begins := c.retry == ""
+			if begins {
+				c.passEnd = c.high
+			}
+			if msgs, _, err = s.collectRange(ctx, mailbox, c.retry, c.passEnd, share); err != nil {
+				return nil, time.Time{}, err
+			}
+			if len(msgs) > 0 {
+				// However few they are (another collector may have taken
+				// some), the pass goes on after them: it ends when
+				// nothing is left, not on a short batch.
+				c.retry, c.retryAt = msgs[len(msgs)-1].ID, s.now().Add(s.cfg.VisibilityTimeout)
+				return msgs, time.Time{}, nil
+			}
+			c.retry = ""
+			if begins { // a whole pass with nothing to send again
+				c.lapsed = false
+				return s.collectOnce(ctx, mailbox, wsBatch, force)
+			}
+		}
 	}
 	if next.IsZero() || c.retryAt.Before(next) {
 		next = c.retryAt
@@ -132,15 +153,28 @@ func (s *Server) wsLease(ctx context.Context, mailbox string, c *wsCursor, force
 	return nil, next, nil
 }
 
+// len is the number of messages sent and not yet acked or lapsed.
+func (a *ackWindow) len() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.out)
+}
+
 // sent records a message about to be sent, leased until the given time.
-// Sending a message again that is still in the set adds nothing.
-func (a *ackWindow) sent(id string, until time.Time) {
+// Sending a message again that is still in the set adds nothing; again
+// reports that case. The store only hands a message out a second time
+// when its lease has ended, so it is the same news as a lapsed entry in
+// room: the session did not ack in time. (The store's lease ends a moment
+// before the entry made after it, so a collect can get there first.)
+func (a *ackWindow) sent(id string, until time.Time) (again bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.out == nil {
 		a.out = make(map[string]time.Time, wsBatch)
 	}
+	_, again = a.out[id]
 	a.out[id] = until
+	return again
 }
 
 // acked removes id. owed is false if the session was not sent that message
@@ -171,9 +205,9 @@ func (a *ackWindow) acked(id string) (owed, freed bool) {
 //     (ackWindow); the relay leases no more for it until it acks or their
 //     leases end. So a session that does not ack costs at most wsWindow
 //     leases per visibility timeout, not its whole mailbox again and again.
-//   - A session that lets leases end is sent what it did not ack again in
-//     turn, a batch per visibility timeout, and new messages meanwhile
-//     (wsCursor).
+//   - A session that lets leases end is, from the end of the first lease,
+//     sent new messages first and what it did not ack again in turn, a
+//     batch per visibility timeout (wsCursor).
 //   - An ack frame for one of those messages is not rate limited: the
 //     relay asked for it, and there is one per message, by id. A client
 //     that acks what it is sent never needs another kind, however fast it
@@ -315,13 +349,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		wake := s.hub.wait(mb.ID) // before leasing: no lost wakeups
 		var msgs []store.Message
 		fits, next, lapsed := win.room(s.now()) // if not: wait for acks, or for the next lease to end
-		if lapsed > 0 && !cur.lapsed {
-			cur.lapsed, cur.retry, cur.retryAt = true, "", time.Time{}
+		if lapsed > 0 {
+			cur.lapsed = true
 		}
 		if fits {
 			g := s.forceGen.Load()
 			var err error
-			msgs, next, err = s.wsLease(ctx, mb.ID, &cur, g != gen)
+			msgs, next, err = s.wsLease(ctx, mb.ID, &cur, win.len(), g != gen)
 			gen = g
 			if err != nil {
 				if ctx.Err() == nil {
@@ -335,7 +369,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			frame, _ := json.Marshal(toWire(m))
 			// Before the write: the ack may come back at once. The lease
 			// was taken a moment ago, so this is never earlier than its end.
-			win.sent(m.ID, s.now().Add(s.cfg.VisibilityTimeout))
+			if win.sent(m.ID, s.now().Add(s.cfg.VisibilityTimeout)) {
+				cur.lapsed = true
+			}
 			wctx, wcancel := context.WithTimeout(ctx, wsWriteTimeout)
 			err := conn.Write(wctx, websocket.MessageText, frame)
 			wcancel()
