@@ -1213,6 +1213,8 @@ func TestWebSocketUnackedGoToAnotherSession(t *testing.T) {
 	}
 	defer a.CloseNow()
 	readFrames(t, a, wsWindow)
+	// a has finished its turn and waits on its window before the clock moves
+	f.sent(wsWindow)
 	f.clk.add(f.cfg.VisibilityTimeout + time.Second) // a is not woken
 	b, _, err := f.dialWS(owner)
 	if err != nil {
