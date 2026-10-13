@@ -134,7 +134,7 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_MAX_COLLECTORS_PER_MAILBOX` | `4` | Concurrent long-polls plus WebSockets per mailbox. |
 | `RELAY_MAX_WS_SESSIONS` | `4000` | Open WebSocket collect sessions per relay process, over all mailboxes. An upgrade beyond it is answered `429 rate_limited` with `retry_after` 5; long-poll isn't affected. At about 45 KiB a session the default is about 176 MiB. |
 | `RELAY_MAX_WS_SESSIONS_PER_NETWORK` | `1024` | Of those, the sessions of one client network (the IPv4 address or the IPv6 /64) per relay process. The first session of a mailbox is always admitted, so a full network keeps no mailbox behind it from collecting; beyond the maximum a network gets one session per mailbox, up to the ceiling below. Other upgrades are answered `429 rate_limited` with `retry_after` 5. See [Rate limiting](#rate-limiting). |
-| `RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD` | `2000` | The most sessions of one client network per relay process, first sessions of mailboxes included: no network passes it, so one network can't take all of a process's sessions. Must be at least `RELAY_MAX_WS_SESSIONS_PER_NETWORK` and at most `RELAY_MAX_WS_SESSIONS` (set all three when lowering one). A vault host with more vaults than this behind one address needs it raised, or its further vaults collect by long-poll. |
+| `RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD` | `2000` | The most sessions of one client network per relay process, first sessions of mailboxes included: no network passes it, so one network can't take all of a process's sessions. Must be at least `RELAY_MAX_WS_SESSIONS_PER_NETWORK` and at most `RELAY_MAX_WS_SESSIONS` (set all three when lowering one). A vault host with more vaults than this behind one address on one process needs it raised, or its further vaults must collect by long-poll. |
 | `RELAY_REPLAY_CACHE_MAX` | `1000000` | Replay-cache capacity. When it's full, requests are shed with `rate_limited` and no live entries are evicted. |
 | `RELAY_SWEEP_INTERVAL` | `60s` | TTL sweeper period. The first pass is jittered. |
 | `RELAY_SHUTDOWN_TIMEOUT` | `20s` | Bound on the graceful drain after SIGTERM. |
@@ -165,21 +165,30 @@ version does not protect against. In short:
   - A session that leaves messages unacked isn't sent the same ones
     ahead of newer ones for ever. Until their first lease ends, the
     window is what holds newer messages back (with 128 unacked there is
-    no room). From then on new messages (those after the newest it was
-    ever sent) go out first whenever the window has room, and what it was
-    sent before comes again in passes: once per visibility timeout a
-    batch, from the mailbox's oldest message to the newest the session
-    had been sent when the pass began, then the next pass. A batch is as
-    large as leaves one batch of the window free for new messages, and
-    at least 32: 96 when nothing else is outstanding. So an unacked
-    message comes again once in every pass; a pass over n collectable
-    messages takes at most ceil(n/32) visibility timeouts and ceil(n/96)
-    when the session has nothing else outstanding (128 messages: 2
-    minutes at the default 60 s; a full mailbox of 10,000: about 105
-    minutes), until the message is acked or expires. Order across
-    redelivery isn't guaranteed. Another session or a long-poll on the
-    same mailbox collects those messages oldest first as always. When a
-    whole pass finds nothing to send again, the session is back to plain
+    no room). From then on what it was sent before comes again in
+    passes: once per visibility timeout a batch, taken before anything
+    else when it is due, from the mailbox's oldest message to the newest
+    the session had been sent when the pass began; then the next pass.
+    New messages (those after the newest it was ever sent) go out the
+    rest of the time. A batch is as large as leaves one batch of the
+    window free for new messages, and at least 32: 96 when nothing else
+    is outstanding (which needs the previous batch to have been written
+    out promptly; a slow reader gets a smaller batch, never under 32).
+    So neither kind waits for the other: traffic that never pauses can't
+    put a due batch off, and new messages wait only for that batch's
+    frames, unless the session itself has left more than 64 unacked.
+    An unacked message comes again once in every pass, and a pass over n
+    collectable messages is at most ceil(n/32) batches. Batches are one
+    visibility timeout apart, or up to two for a session that keeps its
+    window full of unacked messages: a pass takes at most ceil(n/32)
+    visibility timeouts for a session that acks the new messages it
+    gets, 2 × ceil(n/32) in the worst case, and ceil(n/96) for a session
+    with nothing else outstanding (128 messages: 2 minutes at the
+    default 60 s; a full mailbox of 10,000: about 105 minutes), until
+    the message is acked or expires. Order across redelivery isn't
+    guaranteed. Another session or a long-poll on the same mailbox
+    collects those messages oldest first as always. When a whole pass
+    finds nothing to send again, the session is back to plain
     oldest-first.
   - An ack frame that names a message in the window is free, once. Every
     other ack frame (a message received elsewhere, an id acked before or
@@ -196,8 +205,11 @@ version does not protect against. In short:
     passes. A vault host is one network and each of its vaults a
     mailbox's first session: the projected 900 fit, with room for sessions
     that overlap while clients reconnect; more than 2,000 vaults behind
-    one address on one process don't, until the number is raised (the
-    rest collect by long-poll). One address that registers mailboxes as
+    one address on one process don't, until the number is raised: the
+    rest must collect by long-poll (a client whose upgrade is answered
+    `429` should fall back to it; one that only retries the WebSocket
+    stays without a collector). The ceiling is per process, so a host
+    can hold 2,000 on each. One address that registers mailboxes as
     fast as the new-mailbox budget allows reaches 1,024 sessions on a
     process in about 4 minutes and 2,000 (about 88 MiB) in about 20, and
     no more: it can't fill a process by itself.

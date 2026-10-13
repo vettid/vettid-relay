@@ -483,13 +483,12 @@ func TestWebSocketWindow(t *testing.T) {
 		readFrame(t, c, 2*time.Second)
 	}
 	// The leases end: everything unacked is anyone's again. The session is
-	// sent the messages it has not been sent yet (the 40 that did not fit
-	// and the one deposited since), and of the unacked ones again as many
-	// as leave a batch of the window free.
+	// sent of the unacked ones again as many as leave a batch of the
+	// window free, and a batch of the messages it has not been sent yet
+	// (41 are waiting); then the window is full.
 	f.clk.add(f.cfg.VisibilityTimeout + time.Second)
 	f.s.hub.notify(owner.mbx)
-	const unsent = stored - wsWindow - wsBatch + 1
-	sentStays(wsWindow + wsBatch + unsent + (wsWindow - wsBatch - unsent))
+	sentStays(wsWindow + wsBatch + (wsWindow - wsBatch) + wsBatch)
 }
 
 // Sending a message again after its lease ended does not add to what the
@@ -779,10 +778,10 @@ func TestWebSocketWindowResumesAtLeaseEnd(t *testing.T) {
 	waitFor(t, func() bool { return f.s.m.collected.Value() == wsWindow })
 	// The session now waits `lease` (of real time) for the first lease to
 	// end. Let the leases end on the relay's clock and do nothing else.
-	// It is sent the batch it had not been sent yet, and of the unacked
-	// messages again as many as leave a batch of the window free.
+	// It is sent of the unacked messages again as many as leave a batch of
+	// the window free, and the batch it had not been sent yet.
 	f.clk.add(lease + time.Millisecond)
-	waitFor(t, func() bool { return f.s.m.collected.Value() == wsWindow+wsBatch+(wsWindow-2*wsBatch) })
+	waitFor(t, func() bool { return f.s.m.collected.Value() == 2*wsWindow })
 }
 
 // No network holds more than RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD
@@ -865,10 +864,12 @@ func readFrames(t *testing.T, c *websocket.Conn, n int) []string {
 
 // A session that leaves a full window unacked is not sent the same
 // messages ahead of newer ones for ever. Until the first leases end the
-// window holds everything back; from then on a message that arrived
-// meanwhile is sent first, and what was left unacked is sent again in
-// passes: as much per visibility timeout as leaves a batch of the window
-// free, and the late message with the others once it is unacked too.
+// window holds everything back; from then on what was left unacked is
+// sent again in passes, a batch per visibility timeout that leaves a
+// batch of the window free, and a message that arrived meanwhile is sent
+// right after the batch that is due. A pass ends where the session's
+// newest message was when it began, so the late message is sent again
+// with the next pass.
 func TestWebSocketUnackedDoNotBlockNewer(t *testing.T) {
 	f := newFixture(t, nil)
 	owner, sender := newPrincipal(1), newPrincipal(2)
@@ -889,32 +890,86 @@ func TestWebSocketUnackedDoNotBlockNewer(t *testing.T) {
 	late := f.mustDeposit(owner, sender, tok, []byte("late"))
 	f.sent(wsWindow) // the window is full: not before the first lease ends
 
-	// The leases end: the late one first, then the oldest again, leaving
-	// a batch of the window free.
-	const first = wsWindow - wsBatch - 1
-	f.lapse(owner.mbx)
-	f.sent(wsWindow + 1 + first)
-	if got := readFrames(t, c, 1+first); !slices.Equal(got, append([]string{late}, old[:first]...)) {
-		t.Fatalf("after the first leases ended: late message first: %v", got[0] == late)
+	const most = wsWindow - wsBatch
+	total := int64(wsWindow)
+	round := func(what string, want []string) {
+		t.Helper()
+		f.lapse(owner.mbx)
+		total += int64(len(want))
+		f.sent(total)
+		if got := readFrames(t, c, len(want)); !slices.Equal(got, want) {
+			t.Fatalf("%s: unexpected frames (late message at %d of %d)", what, slices.Index(got, late), len(got))
+		}
 	}
-	// The rest of the pass, which ends with the late message: it was the
-	// newest the session had been sent when the pass began.
-	f.lapse(owner.mbx)
-	f.sent(2*wsWindow + 2)
-	if got := readFrames(t, c, wsWindow-first+1); !slices.Equal(got, append(slices.Clone(old[first:]), late)) {
-		t.Fatal("second batch is not the rest of the pass")
-	}
-	// The next pass starts over, and acks still work by id.
-	f.lapse(owner.mbx)
-	f.sent(2*wsWindow + 2 + wsWindow - wsBatch)
-	got := readFrames(t, c, wsWindow-wsBatch)
-	if !slices.Equal(got, old[:wsWindow-wsBatch]) {
-		t.Fatal("the next pass did not start with the oldest")
-	}
-	for _, id := range got {
+	// The leases end: a batch of the oldest again, and the late message.
+	round("first pass, first batch", append(slices.Clone(old[:most]), late))
+	// The rest of the pass. It ends with the newest message the session
+	// had been sent when it began: the late one is not part of it.
+	round("first pass, rest", old[most:])
+	// The next pass starts over and includes the late message.
+	round("second pass, first batch", old[:most])
+	round("second pass, rest", append(slices.Clone(old[most:]), late))
+	// Acks still work by id.
+	for _, id := range old[most:] {
 		sendAck(c, id)
 	}
-	waitFor(t, func() bool { return f.s.m.acks.Value() == wsWindow-wsBatch })
+	waitFor(t, func() bool { return f.s.m.acks.Value() == wsBatch })
+}
+
+// The batch of re-sends that is due is taken before new messages, so
+// that traffic which never pauses cannot put it off; and it is rationed
+// (once per visibility timeout), so that new messages follow at once.
+// This drives the session's lease decisions directly, on the relay's
+// clock: one unacked message, and a new message deposited before every
+// single lease, through many visibility timeouts.
+func TestWebSocketLeaseOrderUnderUnbrokenTraffic(t *testing.T) {
+	f := newFixture(t, nil)
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	tok := f.mint(owner, sender, nil)
+	ctx := context.Background()
+	lease := func(cur *wsCursor) []string {
+		t.Helper()
+		msgs, _, err := f.s.wsLease(ctx, owner.mbx, cur, 0, f.clk.now(), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, m := range msgs {
+			ids = append(ids, m.ID)
+		}
+		return ids
+	}
+	stuck := f.mustDeposit(owner, sender, tok, []byte("never acked"))
+	var cur wsCursor
+	if got := lease(&cur); !slices.Equal(got, []string{stuck}) {
+		t.Fatalf("first lease: %v", got)
+	}
+	cur.lapsed = true // its lease will end unacked (what the window reports)
+	for timeout := 1; timeout <= 12; timeout++ {
+		f.clk.add(f.cfg.VisibilityTimeout + time.Second)
+		for turn := 0; turn < 20; turn++ {
+			id := f.mustDeposit(owner, sender, tok, []byte("new")) // traffic never pauses
+			got := lease(&cur)
+			if turn == 0 {
+				// Due: the unacked message again, before the new one.
+				if !slices.Equal(got, []string{stuck}) {
+					t.Fatalf("timeout %d: the due batch was put off by new messages: %v", timeout, got)
+				}
+				got = lease(&cur)
+			}
+			// Not due again in this timeout: the new message, at once.
+			if !slices.Equal(got, []string{id}) {
+				t.Fatalf("timeout %d turn %d: new message not next: %v", timeout, turn, got)
+			}
+			if ok, err := f.st.Ack(ctx, owner.mbx, id); err != nil || !ok {
+				t.Fatal(ok, err)
+			}
+		}
+	}
+	if !cur.lapsed {
+		t.Fatal("the session stopped sending the unacked message again")
+	}
 }
 
 // With messages left unacked and new ones arriving all the time, neither
@@ -958,55 +1013,50 @@ func TestWebSocketUnackedAndSteadyTraffic(t *testing.T) {
 	}
 }
 
-// drain reads the frames the relay has sent and the test has not read
-// yet, once it has stopped sending.
-func (f *fixture) drain(c *websocket.Conn, read *int64) []string {
-	f.t.Helper()
-	for last := int64(-1); ; {
-		time.Sleep(100 * time.Millisecond)
-		n := f.s.m.collected.Value()
-		if n == last {
-			break
-		}
-		last = n
-	}
-	ids := readFrames(f.t, c, int(f.s.m.collected.Value()-*read))
-	*read += int64(len(ids))
-	return ids
-}
-
 // A pass over the unacked messages ends where the session's newest
 // message was when the pass began. New messages that the client acks late
 // (after their lease) join the next pass; they cannot keep this one from
 // ever ending, so an old unacked message keeps coming back however much
-// arrives after it.
+// arrives after it. Driven through the session's lease decisions on the
+// relay's clock: one never-acked message, 40 new ones per visibility
+// timeout, each acked one lease late.
 func TestWebSocketPassEndsDespiteNewTraffic(t *testing.T) {
 	f := newFixture(t, nil)
 	owner, sender := newPrincipal(1), newPrincipal(2)
 	f.register(owner)
 	tok := f.mint(owner, sender, nil)
+	ctx := context.Background()
 	stuck := f.mustDeposit(owner, sender, tok, []byte("never acked"))
-	c, _, err := f.dialWS(owner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.CloseNow()
-	var read int64
-	var late []string // what arrived in the round before: acked one lease late
-	const rounds = 10
+	var cur wsCursor
+	var late []string // leased in the timeout before: acked now
+	const timeouts = 12
 	var seen []int
-	for round := 0; round < rounds; round++ {
+	for timeout := 0; timeout < timeouts; timeout++ {
 		for i := 0; i < 40; i++ {
 			f.mustDeposit(owner, sender, tok, []byte("x"))
 		}
-		got := f.drain(c, &read)
-		f.lapse(owner.mbx)
-		got = append(got, f.drain(c, &read)...)
-		if slices.Contains(got, stuck) {
-			seen = append(seen, round)
+		var got []string
+		for { // the session's turns of this timeout, until there is nothing to lease
+			msgs, _, err := f.s.wsLease(ctx, owner.mbx, &cur, len(got), f.clk.now(), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(msgs) == 0 {
+				break
+			}
+			cur.lapsed = true // none of it is acked in time
+			for _, m := range msgs {
+				got = append(got, m.ID)
+			}
 		}
+		if slices.Contains(got, stuck) {
+			seen = append(seen, timeout)
+		}
+		f.clk.add(f.cfg.VisibilityTimeout + time.Second)
 		for _, id := range late {
-			sendAck(c, id)
+			if _, err := f.st.Ack(ctx, owner.mbx, id); err != nil {
+				t.Fatal(err)
+			}
 		}
 		late = late[:0]
 		for _, id := range got {
@@ -1015,9 +1065,15 @@ func TestWebSocketPassEndsDespiteNewTraffic(t *testing.T) {
 			}
 		}
 	}
-	// It comes back in every pass; a pass is a round or two here.
-	if len(seen) < rounds/2 || seen[len(seen)-1] < rounds-2 {
-		t.Fatalf("the unacked message was sent in rounds %v of %d", seen, rounds)
+	// 41 to 81 messages are unacked at any time: a pass is at most three
+	// batches of 32, so the message comes back at least every third timeout.
+	for i, at := range seen {
+		if (i == 0 && at > 0) || (i > 0 && at-seen[i-1] > 3) {
+			t.Fatalf("the unacked message was leased in timeouts %v of %d", seen, timeouts)
+		}
+	}
+	if len(seen) == 0 || seen[len(seen)-1] < timeouts-3 {
+		t.Fatalf("the unacked message was leased in timeouts %v of %d", seen, timeouts)
 	}
 }
 
@@ -1080,15 +1136,12 @@ func TestWebSocketBackToPlainCollect(t *testing.T) {
 	}
 	sendAck(c, id)
 	waitFor(t, func() bool { return f.s.m.acks.Value() == 1 })
-	// The next pass finds nothing: back to plain collects.
+	// The next pass finds nothing: the session goes on with the plain
+	// collect that follows an empty pass, and with plain collects only.
+	before := cs.collects.Load()
 	f.lapse(owner.mbx)
-	var ranges int64
-	waitFor(t, func() bool {
-		ranges = cs.ranges.Load()
-		time.Sleep(50 * time.Millisecond)
-		return ranges == cs.ranges.Load()
-	})
-	plain := cs.collects.Load()
+	waitFor(t, func() bool { return cs.collects.Load() > before })
+	ranges, plain := cs.ranges.Load(), cs.collects.Load()
 	for i := 0; i < 5; i++ {
 		id := f.mustDeposit(owner, sender, tok, []byte("x"))
 		if m := readFrame(t, c, 2*time.Second); m.MsgID != id {
