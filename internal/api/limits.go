@@ -48,6 +48,11 @@ const (
 // count, not a bucket: it has a refused series and nothing else.
 const limWSSessions = "ws_sessions"
 
+// limWSNetwork labels the upgrades refused because the caller's network
+// holds its maximum of WebSocket sessions on this process
+// (cfg.MaxWebSocketSessionsPerNetwork). Likewise a count.
+const limWSNetwork = "ws_network"
+
 var allLimiters = []string{limAddress, limKey, limSender, limRegister, limClaim, limWeb}
 
 // maxCounted bounds the per-minute tally of requests per network and per
@@ -84,6 +89,7 @@ func newLimiterMetrics(reg *metrics.Registry) *limiterMetrics {
 	m.busiest.With(limAddress)
 	m.busiest.With(limKey)
 	m.refused.With(limWSSessions)
+	m.refused.With(limWSNetwork)
 	return m
 }
 
@@ -180,9 +186,11 @@ func (s *Server) reportLimits() {
 	attrs = append(attrs, "addresses_refused", len(s.rl.hit),
 		"collectors", s.hub.collectors(), "parked", s.m.parked.Value(), "ws_sessions", s.m.wsSessions.Value())
 	s.rl.hit = map[string]struct{}{}
-	full := s.rl.refused.With(limWSSessions).Value()
-	attrs = append(attrs, limWSSessions+"_refused", full-s.rl.lastRef[limWSSessions])
-	s.rl.lastRef[limWSSessions] = full
+	for _, name := range []string{limWSSessions, limWSNetwork} { // appended last, in this order
+		total := s.rl.refused.With(name).Value()
+		attrs = append(attrs, name+"_refused", total-s.rl.lastRef[name])
+		s.rl.lastRef[name] = total
+	}
 	// At info level every minute: this line is what the limits are sized
 	// from (how close a vault host is to the flood guard, how many
 	// collectors a process carries). One line a minute per process.

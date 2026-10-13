@@ -133,6 +133,7 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_ANDROID_CERT_SHA256` | the official VettID app's signing keys | Comma-separated SHA-256 certificate fingerprints for `assetlinks.json`, colon-separated or plain hex, any case (served in uppercase colon form). The built-in default (`config.DefaultAndroidCertFingerprints`: the production upload key and the two staging signers) lets a self-hosted relay open links in the official app with no configuration. Set but empty turns `assetlinks.json` off (404). |
 | `RELAY_MAX_COLLECTORS_PER_MAILBOX` | `4` | Concurrent long-polls plus WebSockets per mailbox. |
 | `RELAY_MAX_WS_SESSIONS` | `4000` | Open WebSocket collect sessions per relay process, over all mailboxes. An upgrade beyond it is answered `429 rate_limited` with `retry_after` 5; long-poll isn't affected. At about 45 KiB a session the default is about 176 MiB. |
+| `RELAY_MAX_WS_SESSIONS_PER_NETWORK` | `1024` | Of those, the sessions of one client network (the IPv4 address or the IPv6 /64) per relay process. The first session of a mailbox is always admitted, so a full network keeps no mailbox behind it from collecting; beyond the maximum a network gets one session per mailbox. Other upgrades are answered `429 rate_limited` with `retry_after` 5. See [Rate limiting](#rate-limiting). |
 | `RELAY_REPLAY_CACHE_MAX` | `1000000` | Replay-cache capacity. When it's full, requests are shed with `rate_limited` and no live entries are evicted. |
 | `RELAY_SWEEP_INTERVAL` | `60s` | TTL sweeper period. The first pass is jittered. |
 | `RELAY_SHUTDOWN_TIMEOUT` | `20s` | Bound on the graceful drain after SIGTERM. |
@@ -153,6 +154,33 @@ version does not protect against. In short:
   (`RELAY_RATE_REGISTER_*`). Nothing else keyed on a network can refuse a
   request that is properly signed by a key with a mailbox. There is no
   penalty state.
+- A **WebSocket session** passes these limits once, at its upgrade. After
+  that:
+  - It has a window of 128 messages sent and not yet acked. The relay
+    leases the next batch of 32 only while it fits (so at least 97 are
+    outstanding before it pauses), and goes on when acks arrive or the
+    leases end. A session that doesn't ack costs at most 128 leases per
+    visibility timeout.
+  - An ack frame that names a message in the window is free, once. Every
+    other ack frame (a message received elsewhere, an id acked before or
+    after its lease ended, an id that names nothing) is charged like
+    `DELETE /v1/mailbox/{msg_id}`: a token of the flood guard and one of
+    the key's bucket. If either is empty the session is closed with
+    **1013** (try again later) and the reason `rate_limited`.
+  - A frame that isn't `{"ack":"<msg_id>"}` with a ULID in upper case
+    closes the session with **1008**.
+  - A process carries at most `RELAY_MAX_WS_SESSIONS` sessions, and at
+    most `RELAY_MAX_WS_SESSIONS_PER_NETWORK` of one network, not counting
+    the first session of a mailbox. The default of 1,024 per network is
+    the most vaults a vault host holds: each is a mailbox's first session
+    and admitted in any case, so the number is room for sessions that
+    overlap while clients reconnect. One address that registers mailboxes
+    as fast as the new-mailbox budget allows reaches 1,024 sessions on a
+    process in about 4 minutes and the process maximum in about 53.
+  - Refused upgrades are counted in `relay_ratelimit_refused_total` under
+    `ws_sessions` (the process is full) and `ws_network` (the network is),
+    and in the `rate limits` line as `ws_sessions_refused` and
+    `ws_network_refused`.
 - A deposit's body is read only after its token has verified (§5.3 steps
   1–6 need only headers). A request refused before its body was read is
   answered at once with `Connection: close`. Small bodies (register,
@@ -302,8 +330,10 @@ other process sees, refuses or is woken by.
   `relay_collect_store_queries_total`, `relay_collect_store_skips_total`,
   `relay_empty_hint_bump_failures_total`.
 - **Per-process limits.** `RELAY_MAX_COLLECTORS_PER_MAILBOX`,
-  `RELAY_MAX_WS_SESSIONS`, `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` and the replay-cache capacity bound
-  each process's own resources.
+  `RELAY_MAX_WS_SESSIONS`, `RELAY_MAX_WS_SESSIONS_PER_NETWORK`,
+  `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` and the replay-cache capacity
+  bound each process's own resources. A client that reconnects to another
+  process is counted there afresh.
 - **Mailbox quotas** are counters updated in the same transaction as the
   write. Acks, expiry and TTL deletions can leave them high; a failing quota
   check recomputes them from the items (at most once a minute per

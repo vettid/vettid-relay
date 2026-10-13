@@ -20,8 +20,9 @@ const (
 	wsReadLimit    = 1024 // client frames are tiny {"ack":"<ulid>"}
 
 	// wsFullRetryAfter is the retry_after of an upgrade refused because
-	// this process carries its maximum of sessions: longer than a busy
-	// mailbox's 1 s, since a slot frees only when some session ends.
+	// this process, or the caller's network on it, carries its maximum of
+	// sessions: longer than a busy mailbox's 1 s, since a slot frees only
+	// when some session ends.
 	wsFullRetryAfter = 5
 )
 
@@ -92,7 +93,9 @@ func (a *ackWindow) acked(id string) (owed, freed bool) {
 // The limits of §7.2 are applied to the upgrade request; what a session
 // does afterwards is bounded here:
 //
-//   - A process carries at most cfg.MaxWebSocketSessions sessions.
+//   - A process carries at most cfg.MaxWebSocketSessions sessions, and at
+//     most cfg.MaxWebSocketSessionsPerNetwork of one client network, not
+//     counting the first session of a mailbox (hub.acquireWS).
 //   - A session has at most wsWindow messages sent and not yet acked
 //     (ackWindow); the relay leases no more for it until it acks or their
 //     leases end. So a session that does not ack costs at most wsWindow
@@ -105,8 +108,10 @@ func (a *ackWindow) acked(id string) (owed, freed bool) {
 //     before, an id that names nothing) is charged like the DELETE /v1/mailbox/{msg_id}
 //     it stands for: one token of the flood guard of the session's network
 //     and one of the key's bucket. When either is empty the session is
-//     closed (the client reconnects under the ordinary limits).
-//   - A frame that is not an ack of a well-formed id closes the session.
+//     closed with 1013 "try again later" and the reason rate_limited (the
+//     client reconnects under the ordinary limits).
+//   - A frame that is not an ack of a well-formed id closes the session
+//     with 1008.
 //
 // So every client frame either answers a message in the window, is paid
 // for from the shared buckets, or is the session's last.
@@ -121,11 +126,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	if !s.hub.acquire(mb.ID, s.cfg.MaxCollectorsPerMailbox) {
-		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
-		return
-	}
-	defer s.hub.release(mb.ID)
+	network := rateKey(clientIP(r, s.cfg.TrustProxy))
 	if s.wsOpen.Add(1) > int64(s.cfg.MaxWebSocketSessions) { // this process is full
 		s.wsOpen.Add(-1)
 		s.rl.refused.With(limWSSessions).Inc()
@@ -133,12 +134,21 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.wsOpen.Add(-1)
+	switch s.hub.acquireWS(mb.ID, s.cfg.MaxCollectorsPerMailbox, network, s.cfg.MaxWebSocketSessionsPerNetwork) {
+	case wsMailboxFull:
+		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
+		return
+	case wsNetworkFull:
+		s.rl.refused.With(limWSNetwork).Inc()
+		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: wsFullRetryAfter})
+		return
+	}
+	defer s.hub.releaseWS(mb.ID, network)
 	gone := s.hub.goneCh(mb.ID)
 	if !s.stillRegistered(r.Context(), mb.ID) {
 		s.writeError(w, fail(CodeMailboxUnknown)) // deleted since authorization
 		return
 	}
-	network := rateKey(clientIP(r, s.cfg.TrustProxy))
 	if !s.beginStream() { // shutting down: tell the client to come back
 		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
 		return
@@ -205,7 +215,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				}
 				if e != nil {
 					s.m.errors.With(e.code).Inc()
-					conn.Close(websocket.StatusPolicyViolation, e.code)
+					conn.Close(websocket.StatusTryAgainLater, e.code)
 					return
 				}
 			}

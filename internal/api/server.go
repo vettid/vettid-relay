@@ -56,6 +56,7 @@ type Server struct {
 	hub       *hub
 	wsOpen    atomic.Int64  // WebSocket sessions holding a slot (cfg.MaxWebSocketSessions)
 	health    storeHealth   // /healthz: the last store ping
+	healthTO  time.Duration // how long that ping may take (healthPingTimeout; tests shorten it)
 	bus       WakeBus       // cross-process wake-on-deposit (nil: single process)
 	hints     EmptyHints    // known-empty mailboxes (nil: always query)
 	forceGen  atomic.Uint64 // bumped by WakeAll: collectors then query for real
@@ -148,6 +149,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		rl:       newLimiterMetrics(reg),
 
 		smallBodyTimeout: smallBodyTimeout,
+		healthTO:         healthPingTimeout,
 		subLimit:         ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
 		claimLimit:       ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
 		webLimit:         ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
@@ -257,7 +259,9 @@ func (s *Server) storeReachable() error {
 	if age := s.now().Sub(h.at); h.looked && age >= 0 && age < healthPingTTL {
 		return h.err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), healthPingTimeout)
+	// With its own deadline: a store that hangs must turn the answer to
+	// unhealthy, not hold every /healthz caller behind this one.
+	ctx, cancel := context.WithTimeout(context.Background(), s.healthTO)
 	defer cancel()
 	h.err = s.st.Ping(ctx)
 	h.at, h.looked = s.now(), true

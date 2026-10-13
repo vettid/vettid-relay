@@ -85,7 +85,10 @@ type Config struct {
 
 	MaxCollectorsPerMailbox int // RELAY_MAX_COLLECTORS_PER_MAILBOX
 	MaxWebSocketSessions    int // RELAY_MAX_WS_SESSIONS: open WebSocket collect sessions, per relay process
-	ReplayCacheMax          int // RELAY_REPLAY_CACHE_MAX
+	// RELAY_MAX_WS_SESSIONS_PER_NETWORK: of those, per client network (IPv4
+	// address / IPv6 /64); the first session of a mailbox is not refused by it.
+	MaxWebSocketSessionsPerNetwork int
+	ReplayCacheMax                 int // RELAY_REPLAY_CACHE_MAX
 
 	SweepInterval   time.Duration // RELAY_SWEEP_INTERVAL
 	ShutdownTimeout time.Duration // RELAY_SHUTDOWN_TIMEOUT
@@ -168,7 +171,9 @@ func Defaults() Config {
 
 		MaxCollectorsPerMailbox: 4,
 		MaxWebSocketSessions:    4000,
-		ReplayCacheMax:          1_000_000,
+
+		MaxWebSocketSessionsPerNetwork: 1024,
+		ReplayCacheMax:                 1_000_000,
 
 		SweepInterval:   60 * time.Second,
 		ShutdownTimeout: 20 * time.Second,
@@ -306,6 +311,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 
 	integer("RELAY_MAX_COLLECTORS_PER_MAILBOX", &c.MaxCollectorsPerMailbox)
 	integer("RELAY_MAX_WS_SESSIONS", &c.MaxWebSocketSessions)
+	integer("RELAY_MAX_WS_SESSIONS_PER_NETWORK", &c.MaxWebSocketSessionsPerNetwork)
 	integer("RELAY_REPLAY_CACHE_MAX", &c.ReplayCacheMax)
 
 	dur("RELAY_SWEEP_INTERVAL", &c.SweepInterval)
@@ -376,7 +382,7 @@ func (c Config) Validate() error {
 	if c.BlobsEnabled && c.MaxBlobBytes <= 0 {
 		errs = append(errs, errors.New("RELAY_MAX_BLOB_BYTES must be > 0 when blobs are enabled"))
 	}
-	if c.MaxConcurrentBlobTransfers <= 0 || c.MaxCollectorsPerMailbox <= 0 || c.MaxWebSocketSessions <= 0 || c.ReplayCacheMax <= 0 ||
+	if c.MaxConcurrentBlobTransfers <= 0 || c.MaxCollectorsPerMailbox <= 0 || c.MaxWebSocketSessions <= 0 || c.MaxWebSocketSessionsPerNetwork <= 0 || c.ReplayCacheMax <= 0 ||
 		c.RateIPBurst <= 0 || c.RateKeyBurst <= 0 || c.RateRegisterBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 || c.RateWebBurst <= 0 {
 		errs = append(errs, errors.New("concurrency, burst and cache limits must be > 0"))
 	}

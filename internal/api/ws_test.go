@@ -20,7 +20,16 @@ import (
 )
 
 func (f *fixture) dialWS(owner principal) (*websocket.Conn, *http.Response, error) {
+	return f.dialWSFrom(owner, "")
+}
+
+// dialWSFrom dials as the client address addr (the relay must trust the
+// proxy header); "" is the test's own address.
+func (f *fixture) dialWSFrom(owner principal, addr string) (*websocket.Conn, *http.Response, error) {
 	h := http.Header{}
+	if addr != "" {
+		h.Set("X-Forwarded-For", addr)
+	}
 	auth.SetHeaders(h, owner.priv, "GET", "/v1/mailbox/ws", f.sigTime(), auth.BodyHash(nil))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -174,12 +183,17 @@ type countingStore struct {
 	acks, blobOpens, blobDeletes atomic.Int64
 	pings                        atomic.Int64
 	down                         atomic.Bool   // Ping fails
+	hang                         atomic.Bool   // Ping does not answer until its context ends
 	slowPing                     time.Duration // Ping takes this long (set before use)
 }
 
 func (c *countingStore) Ping(ctx context.Context) error {
 	c.pings.Add(1)
 	time.Sleep(c.slowPing)
+	if c.hang.Load() {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	if c.down.Load() {
 		return errors.New("store down")
 	}
@@ -238,8 +252,9 @@ func expectWSClose(t *testing.T, c *websocket.Conn, code websocket.StatusCode, r
 
 // Ack frames the relay did not ask for (no message was sent on the session)
 // are charged like DELETE /v1/mailbox/{msg_id}: the key's bucket and the
-// network's flood guard. When one is empty the session ends, and nothing
-// more reaches the store.
+// network's flood guard. When one is empty the session ends with 1013 "try
+// again later" (1008 is for frames that are malformed), and nothing more
+// reaches the store.
 func TestWebSocketUnsolicitedAcksAreRateLimited(t *testing.T) {
 	for name, mut := range map[string]func(*config.Config){
 		"per key":     func(c *config.Config) { c.RateKeyPerSec, c.RateKeyBurst = 0.001, 5 },
@@ -261,7 +276,7 @@ func TestWebSocketUnsolicitedAcksAreRateLimited(t *testing.T) {
 					break // closed
 				}
 			}
-			expectWSClose(t, c, websocket.StatusPolicyViolation, CodeRateLimited)
+			expectWSClose(t, c, websocket.StatusTryAgainLater, CodeRateLimited)
 			if n := cs.acks.Load(); n != 3 {
 				t.Fatalf("%d acks reached the store, want 3", n)
 			}
@@ -306,7 +321,7 @@ func TestWebSocketAcksOfDeliveredMessagesAreNotLimited(t *testing.T) {
 	waitFor(t, func() bool { return f.s.m.acks.Value() == backlog+1 })
 	// One ack more than was delivered needs a token, and there is none.
 	sendAck(c, unknownID(0))
-	expectWSClose(t, c, websocket.StatusPolicyViolation, CodeRateLimited)
+	expectWSClose(t, c, websocket.StatusTryAgainLater, CodeRateLimited)
 	if n := cs.acks.Load(); n != backlog+1 {
 		t.Fatalf("%d acks reached the store, want %d", n, backlog+1)
 	}
@@ -495,7 +510,7 @@ func TestWebSocketRedeliveryGrantsNoExtraAcks(t *testing.T) {
 			break
 		}
 	}
-	expectWSClose(t, c, websocket.StatusPolicyViolation, CodeRateLimited)
+	expectWSClose(t, c, websocket.StatusTryAgainLater, CodeRateLimited)
 	if n := cs.acks.Load(); n != stored {
 		t.Fatalf("%d acks reached the store, want %d", n, stored)
 	}
@@ -524,7 +539,7 @@ func TestWebSocketCrossSessionAckIsCharged(t *testing.T) {
 	}
 	defer b.CloseNow()
 	sendAck(b, id)
-	expectWSClose(t, b, websocket.StatusPolicyViolation, CodeRateLimited)
+	expectWSClose(t, b, websocket.StatusTryAgainLater, CodeRateLimited)
 	if n := cs.acks.Load(); n != 0 {
 		t.Fatalf("%d acks reached the store from the other session", n)
 	}
@@ -588,7 +603,7 @@ func TestWebSocketAcksWhenLimiterRefuses(t *testing.T) {
 	sendAck(c, id)
 	waitFor(t, func() bool { return f.s.m.acks.Value() == 1 })
 	sendAck(c, unknownID(0))
-	expectWSClose(t, c, websocket.StatusPolicyViolation, CodeRateLimited)
+	expectWSClose(t, c, websocket.StatusTryAgainLater, CodeRateLimited)
 }
 
 func TestAckWindow(t *testing.T) {
@@ -624,4 +639,119 @@ func TestAckWindow(t *testing.T) {
 	if owed, _ := w.acked(unknownID(wsBatch)); owed {
 		t.Fatal("ack owed for a message whose lease ended")
 	}
+}
+
+// A network holds at most RELAY_MAX_WS_SESSIONS_PER_NETWORK sessions on a
+// process, except that the first session of a mailbox is always admitted:
+// whoever uses up a shared network's allowance keeps no other mailbox
+// behind it from collecting. Other networks are not affected, and the
+// process maximum holds for everyone.
+func TestWebSocketNetworkCap(t *testing.T) {
+	var logs syncBuf
+	f := newFixtureLog(t, func(c *config.Config) {
+		c.TrustProxy = true
+		c.MaxWebSocketSessionsPerNetwork = 2
+		c.MaxWebSocketSessions = 5
+	}, &logs)
+	const host, other = "203.0.113.7", "203.0.113.8"
+	a, b, c := newPrincipal(1), newPrincipal(2), newPrincipal(3)
+	for _, p := range []principal{a, b, c} {
+		f.register(p)
+	}
+	open := func(p principal, addr string) *websocket.Conn {
+		t.Helper()
+		conn, _, err := f.dialWSFrom(p, addr)
+		if err != nil {
+			t.Fatalf("upgrade from %s: %v", addr, err)
+		}
+		t.Cleanup(func() { conn.CloseNow() })
+		return conn
+	}
+	refused := func(p principal, addr, label string, want int64) {
+		t.Helper()
+		_, resp, err := f.dialWSFrom(p, addr)
+		if err == nil || resp == nil || resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("Retry-After") != "5" {
+			t.Fatalf("upgrade from %s: %v %v, want 429 with Retry-After 5", addr, resp, err)
+		}
+		if n := f.counter(`relay_ratelimit_refused_total{limiter="` + label + `"}`); n != want {
+			t.Fatalf("refused under %s: %d, want %d", label, n, want)
+		}
+	}
+	a1 := open(a, host)
+	open(a, host) // the network is at its maximum
+	refused(a, host, "ws_network", 1)
+	open(a, other)                    // another network is not: 3 sessions
+	open(b, host)                     // a mailbox's first session is admitted at the maximum: 4
+	refused(b, host, "ws_network", 2) // its second is not
+	// An IPv6 network is its /64.
+	open(c, "2001:db8:aa:bb::1") // 5: the process is full
+	refused(b, "2001:db8:aa:bb::2", "ws_sessions", 1)
+	if n := f.counter(`relay_ratelimit_refused_total{limiter="ws_network"}`); n != 2 {
+		t.Fatalf("a full process counted as a full network: %d", n)
+	}
+	// A session that ends gives its network the place back.
+	a1.CloseNow()
+	waitFor(t, func() bool { return f.s.wsOpen.Load() == 4 })
+	refused(a, host, "ws_network", 3) // host still holds 2: a's other session and b's
+	open(a, other)                    // 5 again
+	f.s.reportLimits()
+	if out := logs.String(); !strings.Contains(out, `"ws_sessions_refused":1,"ws_network_refused":3}`) {
+		t.Fatalf("rate limits line does not end with the session refusals:\n%s", out)
+	}
+	f.s.hub.mu.Lock()
+	nets := fmt.Sprint(f.s.hub.nets)
+	f.s.hub.mu.Unlock()
+	if nets != "map[2001:db8:aa:bb::/64:1 203.0.113.7:2 203.0.113.8:2]" {
+		t.Fatalf("sessions per network: %s", nets)
+	}
+}
+
+// The per-network count is given back however a session ends, and an
+// empty network is forgotten.
+func TestWebSocketNetworkCountReleased(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) { c.TrustProxy = true; c.MaxWebSocketSessionsPerNetwork = 1 })
+	owner := newPrincipal(1)
+	f.register(owner)
+	for i := 0; i < 3; i++ {
+		// Admitted (and counted), then the handshake fails.
+		hr := f.build(req{method: "GET", path: "/v1/mailbox/ws", signer: &owner, header: http.Header{"X-Forwarded-For": {"203.0.113.7"}}})
+		if code, _, _ := f.send(hr); code < 400 || code == http.StatusTooManyRequests {
+			t.Fatalf("plain GET: %d", code)
+		}
+		c, _, err := f.dialWSFrom(owner, "203.0.113.7")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.CloseNow()
+		waitFor(t, func() bool { return f.s.hub.collectors() == 0 })
+	}
+	f.s.hub.mu.Lock()
+	defer f.s.hub.mu.Unlock()
+	if len(f.s.hub.nets) != 0 || len(f.s.hub.boxes) != 0 {
+		t.Fatalf("left behind: %v, %d mailboxes", f.s.hub.nets, len(f.s.hub.boxes))
+	}
+}
+
+// A full window opens again when the leases of what was sent end, with no
+// ack, no deposit and no ping: the session is woken by the end of the
+// first lease it is waiting for.
+func TestWebSocketWindowResumesAtLeaseEnd(t *testing.T) {
+	const lease = 400 * time.Millisecond
+	f := newFixture(t, func(c *config.Config) { c.VisibilityTimeout = lease })
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	tok := f.mint(owner, sender, nil)
+	for i := 0; i < wsWindow+wsBatch; i++ {
+		f.mustDeposit(owner, sender, tok, []byte("x"))
+	}
+	c, _, err := f.dialWS(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.CloseNow()
+	waitFor(t, func() bool { return f.s.m.collected.Value() == wsWindow })
+	// The session now waits `lease` (of real time) for the first lease to
+	// end. Let the leases end on the relay's clock and do nothing else.
+	f.clk.add(lease + time.Millisecond)
+	waitFor(t, func() bool { return f.s.m.collected.Value() == 2*wsWindow })
 }

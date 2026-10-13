@@ -52,9 +52,18 @@ func TestWebSocketSessionCapConfig(t *testing.T) {
 	if err != nil || c.MaxWebSocketSessions != 150 {
 		t.Fatalf("%d %v", c.MaxWebSocketSessions, err)
 	}
-	for _, bad := range []string{"0", "-1", "many"} {
-		if _, err := Load(env(map[string]string{"RELAY_MAX_WS_SESSIONS": bad})); err == nil {
-			t.Errorf("RELAY_MAX_WS_SESSIONS=%s: expected an error", bad)
+	if d := Defaults(); d.MaxWebSocketSessionsPerNetwork != 1024 {
+		t.Fatalf("default per network %d", d.MaxWebSocketSessionsPerNetwork)
+	}
+	c, err = Load(env(map[string]string{"RELAY_MAX_WS_SESSIONS_PER_NETWORK": "40"}))
+	if err != nil || c.MaxWebSocketSessionsPerNetwork != 40 {
+		t.Fatalf("%d %v", c.MaxWebSocketSessionsPerNetwork, err)
+	}
+	for _, name := range []string{"RELAY_MAX_WS_SESSIONS", "RELAY_MAX_WS_SESSIONS_PER_NETWORK"} {
+		for _, bad := range []string{"0", "-1", "many"} {
+			if _, err := Load(env(map[string]string{name: bad})); err == nil {
+				t.Errorf("%s=%s: expected an error", name, bad)
+			}
 		}
 	}
 }

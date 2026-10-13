@@ -178,3 +178,33 @@ func TestHealthzFollowsStoreWithinInterval(t *testing.T) {
 	}
 	f.s.draining.Store(false)
 }
+
+// A store that does not answer the ping turns /healthz unhealthy after the
+// ping's own deadline; it does not hold the callers.
+func TestHealthzStorePingHasDeadline(t *testing.T) {
+	f := newFixture(t, nil)
+	cs := f.countStore()
+	f.s.healthTO = 100 * time.Millisecond
+	cs.hang.Store(true)
+	client := &http.Client{Timeout: 3 * time.Second}
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := client.Get(f.ts.URL + "/healthz")
+			if err != nil {
+				t.Errorf("healthz with a hung store: %v", err)
+				return
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Errorf("healthz with a hung store: %d", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := cs.pings.Load(); n != 1 {
+		t.Fatalf("%d pings, want 1 shared by the callers", n)
+	}
+}
