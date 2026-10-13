@@ -172,6 +172,18 @@ func TestWebSocketBadFrame(t *testing.T) {
 type countingStore struct {
 	store.Backend
 	acks, blobOpens, blobDeletes atomic.Int64
+	pings                        atomic.Int64
+	down                         atomic.Bool   // Ping fails
+	slowPing                     time.Duration // Ping takes this long (set before use)
+}
+
+func (c *countingStore) Ping(ctx context.Context) error {
+	c.pings.Add(1)
+	time.Sleep(c.slowPing)
+	if c.down.Load() {
+		return errors.New("store down")
+	}
+	return c.Backend.Ping(ctx)
 }
 
 func (c *countingStore) Ack(ctx context.Context, mailbox, msgID string) (bool, error) {

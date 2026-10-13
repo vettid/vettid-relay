@@ -349,7 +349,7 @@ other process sees, refuses or is woken by.
 | `PUT /v1/claim` | signed by a registered mailbox key | `201 {claim_id, expires_at}` |
 | `GET /v1/claim/{claim_id}` | none (rate-limited) | `200 application/octet-stream`. Single fetch: the claim is deleted. |
 | `DELETE /v1/claim/{claim_id}` | the creating key | `204` (idempotent) |
-| `GET /healthz` | none | `200` when the DB is reachable and not draining, else `503` |
+| `GET /healthz` | none | `200` when the DB is reachable and not draining, else `503`. The DB is asked at most once every 2 s per process; requests in between get the last answer |
 | `GET /connect` | none (web bucket) | `200 text/html`: the invitation landing page (§6.11). Invitation URLs are `<relay>/connect#<link>`; the fragment never reaches the relay. |
 | `GET /.well-known/assetlinks.json` | none (web bucket) | `200 application/json`: Android App Links statement for the VettID app |
 | `GET /robots.txt` | none (web bucket) | `200 text/plain` |
