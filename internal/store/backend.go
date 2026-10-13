@@ -57,6 +57,12 @@ type Backend interface {
 	// earliest time a currently leased message becomes collectable again
 	// (zero if none), so a parked collector can wake for redelivery.
 	Collect(ctx context.Context, mailbox string, max int, visibility time.Duration) (msgs []Message, nextVisible time.Time, err error)
+	// CollectRange is Collect restricted to the messages whose id is
+	// greater than after and, unless upTo is empty, not greater than
+	// upTo: the oldest of those first, and nextVisible for those only.
+	// With both empty it is Collect. Message ids order a mailbox's
+	// messages by arrival, and a later deposit never gets a smaller id.
+	CollectRange(ctx context.Context, mailbox, after, upTo string, max int, visibility time.Duration) (msgs []Message, nextVisible time.Time, err error)
 	// Ack deletes msgID if it belongs to mailbox.
 	Ack(ctx context.Context, mailbox, msgID string) (bool, error)
 
@@ -104,11 +110,16 @@ func (p TombstonePolicy) Times(now time.Time) (notBefore, keepUntil time.Time) {
 // Collect implements Backend for SQLite: Lease, and when nothing was leased,
 // the next lease expiry.
 func (s *Store) Collect(ctx context.Context, mailbox string, max int, visibility time.Duration) ([]Message, time.Time, error) {
-	msgs, err := s.Lease(ctx, mailbox, max, visibility)
+	return s.CollectRange(ctx, mailbox, "", "", max, visibility)
+}
+
+// CollectRange implements Backend for SQLite.
+func (s *Store) CollectRange(ctx context.Context, mailbox, after, upTo string, max int, visibility time.Duration) ([]Message, time.Time, error) {
+	msgs, err := s.leaseRange(ctx, mailbox, after, upTo, max, visibility)
 	if err != nil || len(msgs) > 0 {
 		return msgs, time.Time{}, err
 	}
-	next, ok, err := s.NextLeaseExpiry(ctx, mailbox)
+	next, ok, err := s.nextLeaseExpiry(ctx, mailbox, after, upTo)
 	if err != nil || !ok {
 		return nil, time.Time{}, err
 	}

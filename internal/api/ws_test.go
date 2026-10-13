@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -462,11 +463,12 @@ func TestWebSocketWindow(t *testing.T) {
 	for i := 0; i < wsBatch; i++ {
 		readFrame(t, c, 2*time.Second)
 	}
-	// The leases end: everything unacked is anyone's again, and the
-	// session is sent one window of it.
+	// The leases end: everything unacked is anyone's again. The session is
+	// sent one batch of it again, and the messages it has not been sent yet
+	// (the 40 that did not fit and the one deposited since).
 	f.clk.add(f.cfg.VisibilityTimeout + time.Second)
 	f.s.hub.notify(owner.mbx)
-	sentStays(2*wsWindow + wsBatch)
+	sentStays(wsWindow + wsBatch + wsBatch + (stored - wsWindow - wsBatch) + 1)
 }
 
 // Sending a message again after its lease ended does not add to what the
@@ -611,14 +613,14 @@ func TestAckWindow(t *testing.T) {
 	t0 := time.Unix(1_800_000_000, 0)
 	until := t0.Add(time.Minute)
 	for i := 0; i < wsWindow; i++ {
-		if fits, _ := w.room(t0); fits != (i <= wsWindow-wsBatch) {
+		if fits, _, _ := w.room(t0); fits != (i <= wsWindow-wsBatch) {
 			t.Fatalf("room with %d outstanding: %v", i, fits)
 		}
 		w.sent(unknownID(i), until.Add(time.Duration(i)*time.Second))
 		w.sent(unknownID(i), until.Add(time.Duration(i)*time.Second)) // again: nothing added
 	}
-	if fits, next := w.room(t0); fits || !next.Equal(until) || len(w.out) != wsWindow {
-		t.Fatalf("full window: fits=%v next=%v n=%d", fits, next, len(w.out))
+	if fits, next, lapsed := w.room(t0); fits || !next.Equal(until) || lapsed != 0 || len(w.out) != wsWindow {
+		t.Fatalf("full window: fits=%v next=%v lapsed=%d n=%d", fits, next, lapsed, len(w.out))
 	}
 	if owed, _ := w.acked(unknownID(wsWindow)); owed {
 		t.Fatal("ack owed for a message that was not sent")
@@ -633,8 +635,8 @@ func TestAckWindow(t *testing.T) {
 		t.Fatal("ack owed twice")
 	}
 	// Leases that ended are forgotten, with their acks.
-	if fits, _ := w.room(until.Add(time.Duration(wsBatch+9) * time.Second)); !fits || len(w.out) != wsWindow-wsBatch-10 {
-		t.Fatalf("after 10 more leases ended: fits=%v n=%d", fits, len(w.out))
+	if fits, _, lapsed := w.room(until.Add(time.Duration(wsBatch+9) * time.Second)); !fits || lapsed != 10 || len(w.out) != wsWindow-wsBatch-10 {
+		t.Fatalf("after 10 more leases ended: fits=%v lapsed=%d n=%d", fits, lapsed, len(w.out))
 	}
 	if owed, _ := w.acked(unknownID(wsBatch)); owed {
 		t.Fatal("ack owed for a message whose lease ended")
@@ -695,7 +697,7 @@ func TestWebSocketNetworkCap(t *testing.T) {
 	refused(a, host, "ws_network", 3) // host still holds 2: a's other session and b's
 	open(a, other)                    // 5 again
 	f.s.reportLimits()
-	if out := logs.String(); !strings.Contains(out, `"ws_sessions_refused":1,"ws_network_refused":3}`) {
+	if out := logs.String(); !strings.Contains(out, `"ws_sessions_refused":1,"ws_network_refused":3,"ws_network_hard_refused":0}`) {
 		t.Fatalf("rate limits line does not end with the session refusals:\n%s", out)
 	}
 	f.s.hub.mu.Lock()
@@ -752,6 +754,259 @@ func TestWebSocketWindowResumesAtLeaseEnd(t *testing.T) {
 	waitFor(t, func() bool { return f.s.m.collected.Value() == wsWindow })
 	// The session now waits `lease` (of real time) for the first lease to
 	// end. Let the leases end on the relay's clock and do nothing else.
+	// It is sent a batch again and the batch it had not been sent yet.
 	f.clk.add(lease + time.Millisecond)
-	waitFor(t, func() bool { return f.s.m.collected.Value() == 2*wsWindow })
+	waitFor(t, func() bool { return f.s.m.collected.Value() == wsWindow+2*wsBatch })
+}
+
+// No network holds more than RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD
+// sessions on a process, whatever mailboxes they are for: the first
+// session of a mailbox is admitted beyond the per-network maximum only up
+// to there. Other networks are not affected, and the process maximum holds.
+func TestWebSocketNetworkCeiling(t *testing.T) {
+	var logs syncBuf
+	f := newFixtureLog(t, func(c *config.Config) {
+		c.TrustProxy = true
+		c.MaxWebSocketSessionsPerNetwork = 1
+		c.MaxWebSocketSessionsPerNetworkHard = 3
+		c.MaxWebSocketSessions = 5
+	}, &logs)
+	const host, other = "203.0.113.7", "203.0.113.8"
+	var p []principal
+	for i := byte(1); i <= 6; i++ {
+		p = append(p, newPrincipal(i))
+		f.register(p[i-1])
+	}
+	open := func(who principal, addr string) {
+		t.Helper()
+		conn, _, err := f.dialWSFrom(who, addr)
+		if err != nil {
+			t.Fatalf("upgrade from %s: %v", addr, err)
+		}
+		t.Cleanup(func() { conn.CloseNow() })
+	}
+	refused := func(who principal, addr, label string, want int64) {
+		t.Helper()
+		_, resp, err := f.dialWSFrom(who, addr)
+		if err == nil || resp == nil || resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("Retry-After") != "5" {
+			t.Fatalf("upgrade from %s: %v %v, want 429 with Retry-After 5", addr, resp, err)
+		}
+		if n := f.counter(`relay_ratelimit_refused_total{limiter="` + label + `"}`); n != want {
+			t.Fatalf("refused under %s: %d, want %d", label, n, want)
+		}
+	}
+	open(p[0], host)
+	refused(p[0], host, "ws_network", 1)      // the per-network maximum: not a first session
+	open(p[1], host)                          // first sessions pass it
+	open(p[2], host)                          // ... up to the ceiling: 3
+	refused(p[3], host, "ws_network_hard", 1) // a first session, and still refused
+	refused(p[0], host, "ws_network_hard", 2)
+	open(p[3], other) // another network is not affected
+	open(p[4], other) // 5: the process is full
+	refused(p[5], other, "ws_sessions", 1)
+	f.s.reportLimits()
+	if out := logs.String(); !strings.Contains(out, `"ws_sessions_refused":1,"ws_network_refused":1,"ws_network_hard_refused":2}`) {
+		t.Fatalf("rate limits line does not end with the session refusals:\n%s", out)
+	}
+}
+
+// lapse lets every lease end on the relay's clock and wakes the session
+// (its timers run on real time).
+func (f *fixture) lapse(mailbox string) {
+	f.clk.add(f.cfg.VisibilityTimeout + time.Second)
+	f.s.hub.notify(mailbox)
+}
+
+// sent waits until the relay has sent want messages in all, and checks it
+// sends no more.
+func (f *fixture) sent(want int64) {
+	f.t.Helper()
+	waitFor(f.t, func() bool { return f.s.m.collected.Value() >= want })
+	time.Sleep(150 * time.Millisecond)
+	if n := f.s.m.collected.Value(); n != want {
+		f.t.Fatalf("%d messages sent, want %d", n, want)
+	}
+}
+
+func readFrames(t *testing.T, c *websocket.Conn, n int) []string {
+	t.Helper()
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = readFrame(t, c, 2*time.Second).MsgID
+	}
+	return ids
+}
+
+// A session that leaves a full window unacked is not sent the same
+// messages ahead of newer ones for ever: when the leases end, a message
+// that arrived meanwhile is sent at once, and what was left unacked is
+// sent again in turn, a batch per visibility timeout, so each of n such
+// messages again within ceil(n/32) timeouts.
+func TestWebSocketUnackedDoNotBlockNewer(t *testing.T) {
+	f := newFixture(t, nil)
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	tok := f.mint(owner, sender, nil)
+	var old []string
+	for i := 0; i < wsWindow; i++ {
+		old = append(old, f.mustDeposit(owner, sender, tok, []byte("x")))
+	}
+	c, _, err := f.dialWS(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.CloseNow()
+	if got := readFrames(t, c, wsWindow); !slices.Equal(got, old) {
+		t.Fatal("first delivery out of order")
+	}
+	late := f.mustDeposit(owner, sender, tok, []byte("late"))
+	f.sent(wsWindow) // the window is full: not yet
+
+	// The leases end: one batch of the oldest again, and the late one.
+	f.lapse(owner.mbx)
+	f.sent(wsWindow + wsBatch + 1)
+	if got := readFrames(t, c, wsBatch+1); !slices.Equal(got, append(slices.Clone(old[:wsBatch]), late)) {
+		t.Fatalf("after the first leases ended: %d frames, the late message among them: %v", len(got), slices.Contains(got, late))
+	}
+	// Then the rest in turn. 129 messages are unacked now: 5 batches.
+	again := map[string]int{}
+	for _, id := range old[:wsBatch] {
+		again[id]++
+	}
+	total := int64(wsWindow + wsBatch + 1)
+	for round, want := range []int{wsBatch, wsBatch, wsBatch, 1} {
+		f.lapse(owner.mbx)
+		total += int64(want)
+		f.sent(total)
+		for _, id := range readFrames(t, c, want) {
+			again[id]++
+		}
+		if round == 3 && again[late] != 1 {
+			t.Fatal("the late message was not sent again at the end of the pass")
+		}
+	}
+	for _, id := range append(old, late) {
+		if again[id] != 1 {
+			t.Fatalf("after one pass (5 visibility timeouts) a message was sent again %d times", again[id])
+		}
+	}
+	// The pass starts over, and acks still work by id.
+	f.lapse(owner.mbx)
+	f.sent(total + wsBatch)
+	for _, id := range readFrames(t, c, wsBatch) {
+		if !slices.Contains(old[:wsBatch], id) {
+			t.Fatal("second pass did not start with the oldest")
+		}
+		sendAck(c, id)
+	}
+	waitFor(t, func() bool { return f.s.m.acks.Value() == wsBatch })
+}
+
+// With messages left unacked and new ones arriving all the time, neither
+// kind waits for the other: new messages are sent as they arrive, and the
+// unacked ones are still sent again a batch per visibility timeout.
+func TestWebSocketUnackedAndSteadyTraffic(t *testing.T) {
+	// Two tokens: the registration and the upgrade. Every ack below must
+	// be one the session is owed.
+	f := newFixture(t, func(c *config.Config) { c.RateKeyPerSec, c.RateKeyBurst = 0.001, 2 })
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	tok := f.mint(owner, sender, nil)
+	var stuck []string
+	for i := 0; i < wsWindow; i++ {
+		stuck = append(stuck, f.mustDeposit(owner, sender, tok, []byte("x")))
+	}
+	c, _, err := f.dialWS(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.CloseNow()
+	readFrames(t, c, wsWindow)
+	var acked int64
+	for round := 0; round < wsWindow/wsBatch; round++ {
+		f.lapse(owner.mbx)
+		if got := readFrames(t, c, wsBatch); !slices.Equal(got, stuck[round*wsBatch:(round+1)*wsBatch]) {
+			t.Fatalf("round %d: not the next batch of unacked messages", round)
+		}
+		// New messages arrive and are acked while those are outstanding.
+		for i := 0; i < 5; i++ {
+			id := f.mustDeposit(owner, sender, tok, []byte("new"))
+			if m := readFrame(t, c, 2*time.Second); m.MsgID != id {
+				t.Fatalf("round %d: new message held up (got %s)", round, m.MsgID)
+			}
+			sendAck(c, id)
+			acked++
+			waitFor(t, func() bool { return f.s.m.acks.Value() == acked })
+		}
+	}
+}
+
+// What one session lets expire, another session on the same mailbox
+// collects as before; the first is then back to plain oldest-first.
+func TestWebSocketUnackedGoToAnotherSession(t *testing.T) {
+	f := newFixture(t, nil)
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	tok := f.mint(owner, sender, nil)
+	var old []string
+	for i := 0; i < wsWindow; i++ {
+		old = append(old, f.mustDeposit(owner, sender, tok, []byte("x")))
+	}
+	a, _, err := f.dialWS(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.CloseNow()
+	readFrames(t, a, wsWindow)
+	f.clk.add(f.cfg.VisibilityTimeout + time.Second) // a is not woken
+	b, _, err := f.dialWS(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.CloseNow()
+	if got := readFrames(t, b, wsWindow); !slices.Equal(got, old) {
+		t.Fatal("the second session was not sent what the first let expire, oldest first")
+	}
+	for _, id := range old {
+		sendAck(b, id)
+	}
+	waitFor(t, func() bool { return f.s.m.acks.Value() == wsWindow })
+	// a finds nothing to send again and goes on with new messages.
+	f.s.hub.notify(owner.mbx)
+	b.CloseNow()
+	waitFor(t, func() bool { return f.s.hub.collectors() == 1 })
+	id := f.mustDeposit(owner, sender, tok, []byte("new"))
+	if m := readFrame(t, a, 2*time.Second); m.MsgID != id {
+		t.Fatalf("first session after the other took over: %+v", m)
+	}
+}
+
+// A message deposited after the relay's clock was set back still gets an
+// id above the earlier ones, so a session that is rationing re-sends
+// takes it for the new message it is and sends it at once.
+func TestWebSocketNewMessageAfterClockSetBack(t *testing.T) {
+	f := newFixture(t, nil)
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	tok := f.mint(owner, sender, nil)
+	var old []string
+	for i := 0; i < wsWindow; i++ {
+		old = append(old, f.mustDeposit(owner, sender, tok, []byte("x")))
+	}
+	c, _, err := f.dialWS(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.CloseNow()
+	readFrames(t, c, wsWindow)
+	f.lapse(owner.mbx)
+	readFrames(t, c, wsBatch)
+	f.clk.add(-10 * time.Minute)
+	id := f.mustDeposit(owner, sender, f.mint(owner, sender, nil), []byte("late"))
+	if id <= old[wsWindow-1] {
+		t.Fatalf("id %s issued after %s is not above it", id, old[wsWindow-1])
+	}
+	if m := readFrame(t, c, 2*time.Second); m.MsgID != id {
+		t.Fatalf("got %s, want the new message", m.MsgID)
+	}
 }

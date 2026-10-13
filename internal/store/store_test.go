@@ -548,3 +548,32 @@ func TestTakeClaimConcurrent(t *testing.T) {
 		t.Fatalf("claim fetched %d times", hits)
 	}
 }
+
+// Ids go on above the stored messages when the relay restarts with a
+// clock that is behind them.
+func TestIDsOnlyGrowAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.db")
+	c := &clock{t: time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)}
+	s, err := Open(ctx, path, WithClock(c.now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "a", 1)
+	first, err := s.Deposit(ctx, "a", "s", []byte("x"), 48*time.Hour, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	c.add(-time.Hour)
+	if s, err = Open(ctx, path, WithClock(c.now)); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	second, err := s.Deposit(ctx, "a", "s", []byte("y"), 48*time.Hour, Limits{})
+	if err != nil || second.ID <= first.ID {
+		t.Fatalf("id %s after restart is not above %s (%v)", second.ID, first.ID, err)
+	}
+	if got, _, err := s.CollectRange(ctx, "a", first.ID, "", 10, time.Minute); err != nil || len(got) != 1 || got[0].ID != second.ID {
+		t.Fatalf("collect after the first id: %v %v", got, err)
+	}
+}

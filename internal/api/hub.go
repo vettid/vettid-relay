@@ -25,9 +25,10 @@ func newHub() *hub { return &hub{boxes: map[string]*hubEntry{}, nets: map[string
 type wsAdmission int
 
 const (
-	wsAdmitted    wsAdmission = iota
-	wsMailboxFull             // the mailbox has its maximum of collectors
-	wsNetworkFull             // the network has its maximum of sessions, and the mailbox already has one
+	wsAdmitted       wsAdmission = iota
+	wsMailboxFull                // the mailbox has its maximum of collectors
+	wsNetworkFull                // the network has its maximum of sessions, and the mailbox already has one
+	wsNetworkCeiling             // the network has as many sessions as any network may have
 )
 
 // acquireWS registers a WebSocket session for mailbox, opened from
@@ -37,14 +38,18 @@ const (
 // no WebSocket session here is always admitted. So whoever fills a
 // network's allowance (a network is shared: a vault host, a carrier NAT)
 // keeps nobody else behind that network from its first session, and what
-// a network can hold beyond netMax is one session per mailbox.
-func (h *hub) acquireWS(mailbox string, max int, network string, netMax int) wsAdmission {
+// a network can hold beyond netMax is one session per mailbox. That
+// exception ends at netCeiling, which no network passes: one network
+// cannot take every session the process has.
+func (h *hub) acquireWS(mailbox string, max int, network string, netMax, netCeiling int) wsAdmission {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	e, ok := h.boxes[mailbox]
 	switch {
 	case ok && e.collectors >= max:
 		return wsMailboxFull
+	case h.nets[network] >= netCeiling:
+		return wsNetworkCeiling
 	case ok && e.sessions > 0 && h.nets[network] >= netMax:
 		return wsNetworkFull
 	case !ok:

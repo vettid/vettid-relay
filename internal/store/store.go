@@ -47,6 +47,7 @@ type Store struct {
 	now func() time.Time
 
 	idMu    sync.Mutex
+	lastID  ulid.ULID // the last id issued (or stored, at open): ids only grow
 	entropy io.Reader
 
 	tomb TombstonePolicy
@@ -112,6 +113,10 @@ func Open(ctx context.Context, path string, opts ...Option) (*Store, error) {
 	for _, o := range opts {
 		o(s)
 	}
+	if err := s.loadLastID(ctx); err != nil {
+		s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -131,10 +136,42 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // newID returns a fresh ULID. Called while holding the writer connection so
 // IDs are issued in commit order (per-mailbox ULID order == arrival order).
+// A ULID begins with the time, so a clock that is set back would issue ids
+// below earlier ones: then the id is the last one issued plus one instead.
+// Collectors rely on it (CollectRange): a message deposited later never
+// sorts before one deposited earlier.
 func (s *Store) newID(t time.Time) string {
 	s.idMu.Lock()
 	defer s.idMu.Unlock()
-	return ulid.MustNew(ulid.Timestamp(t), s.entropy).String()
+	id := ulid.MustNew(ulid.Timestamp(t), s.entropy)
+	if s.lastID.Compare(id) >= 0 {
+		id = incrementID(s.lastID)
+	}
+	s.lastID = id
+	return id.String()
+}
+
+// incrementID returns the ULID one greater than u (128-bit big-endian add).
+func incrementID(u ulid.ULID) ulid.ULID {
+	for i := len(u) - 1; i >= 0; i-- {
+		u[i]++
+		if u[i] != 0 {
+			break
+		}
+	}
+	return u
+}
+
+// loadLastID makes ids continue above the stored messages after a restart.
+func (s *Store) loadLastID(ctx context.Context) error {
+	var last sql.NullString
+	if err := s.w.QueryRowContext(ctx, `SELECT MAX(msg_id) FROM messages`).Scan(&last); err != nil {
+		return err
+	}
+	if id, err := ulid.ParseStrict(last.String); last.Valid && err == nil {
+		s.lastID = id
+	}
+	return nil
 }
 
 func ms(t time.Time) int64 { return t.UnixMilli() }
@@ -470,6 +507,20 @@ func chargeToken(ctx context.Context, tx *sql.Tx, mailbox string, lim Limits, ms
 // Lease returns up to max of the oldest unexpired, unleased messages and
 // leases them until now+visibility.
 func (s *Store) Lease(ctx context.Context, mailbox string, max int, visibility time.Duration) ([]Message, error) {
+	return s.leaseRange(ctx, mailbox, "", "", max, visibility)
+}
+
+// maxID is greater than every message id (ULIDs begin with 0 to 7): the
+// upper bound of a range that has none.
+const maxID = "~"
+
+// leaseRange is Lease for the messages with after < msg_id <= upTo (an
+// empty upTo: no upper bound). msg_id is the primary key, so the range
+// narrows the same index walk.
+func (s *Store) leaseRange(ctx context.Context, mailbox, after, upTo string, max int, visibility time.Duration) ([]Message, error) {
+	if upTo == "" {
+		upTo = maxID
+	}
 	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -478,8 +529,8 @@ func (s *Store) Lease(ctx context.Context, mailbox string, max int, visibility t
 	now := ms(s.now())
 	rows, err := tx.QueryContext(ctx,
 		`SELECT msg_id, deposited_at, sender_sub, token_jti, payload FROM messages
-		 WHERE mailbox_id=? AND expires_at>? AND (leased_until IS NULL OR leased_until<=?)
-		 ORDER BY msg_id LIMIT ?`, mailbox, now, now, max)
+		 WHERE mailbox_id=? AND msg_id>? AND msg_id<=? AND expires_at>? AND (leased_until IS NULL OR leased_until<=?)
+		 ORDER BY msg_id LIMIT ?`, mailbox, after, upTo, now, now, max)
 	if err != nil {
 		return nil, err
 	}
@@ -516,11 +567,18 @@ func (s *Store) Lease(ctx context.Context, mailbox string, max int, visibility t
 // NextLeaseExpiry returns the earliest time a currently leased, unexpired
 // message of the mailbox becomes collectable again.
 func (s *Store) NextLeaseExpiry(ctx context.Context, mailbox string) (time.Time, bool, error) {
+	return s.nextLeaseExpiry(ctx, mailbox, "", "")
+}
+
+func (s *Store) nextLeaseExpiry(ctx context.Context, mailbox, after, upTo string) (time.Time, bool, error) {
+	if upTo == "" {
+		upTo = maxID
+	}
 	var v sql.NullInt64
 	now := ms(s.now())
 	err := s.r.QueryRowContext(ctx,
-		`SELECT MIN(leased_until) FROM messages WHERE mailbox_id=? AND expires_at>? AND leased_until>?`,
-		mailbox, now, now).Scan(&v)
+		`SELECT MIN(leased_until) FROM messages WHERE mailbox_id=? AND msg_id>? AND msg_id<=? AND expires_at>? AND leased_until>?`,
+		mailbox, after, upTo, now, now).Scan(&v)
 	if err != nil || !v.Valid {
 		return time.Time{}, false, err
 	}

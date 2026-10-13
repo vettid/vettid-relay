@@ -166,3 +166,16 @@ func (s *Server) collectOnce(ctx context.Context, mailbox string, max int, force
 	}
 	return msgs, next, nil
 }
+
+// collectRange is a collect attempt for the messages of mailbox with
+// after < id <= upTo (an empty upTo: no upper bound). It always asks the
+// store: the empty hints speak of a whole mailbox, and finding part of
+// one empty says nothing about the rest, so it marks nothing either.
+func (s *Server) collectRange(ctx context.Context, mailbox, after, upTo string, max int) ([]store.Message, time.Time, error) {
+	s.m.storeQueries.Inc()
+	msgs, next, err := s.st.CollectRange(ctx, mailbox, after, upTo, max, s.cfg.VisibilityTimeout)
+	if err == nil && len(msgs) > 0 && s.hints != nil {
+		s.hints.Clear(ctx, mailbox)
+	}
+	return msgs, next, err
+}

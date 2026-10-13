@@ -88,7 +88,11 @@ type Config struct {
 	// RELAY_MAX_WS_SESSIONS_PER_NETWORK: of those, per client network (IPv4
 	// address / IPv6 /64); the first session of a mailbox is not refused by it.
 	MaxWebSocketSessionsPerNetwork int
-	ReplayCacheMax                 int // RELAY_REPLAY_CACHE_MAX
+	// RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD: the most sessions of one
+	// network per process, first sessions of mailboxes included. Between
+	// the per-network maximum and the process maximum.
+	MaxWebSocketSessionsPerNetworkHard int
+	ReplayCacheMax                     int // RELAY_REPLAY_CACHE_MAX
 
 	SweepInterval   time.Duration // RELAY_SWEEP_INTERVAL
 	ShutdownTimeout time.Duration // RELAY_SHUTDOWN_TIMEOUT
@@ -172,8 +176,9 @@ func Defaults() Config {
 		MaxCollectorsPerMailbox: 4,
 		MaxWebSocketSessions:    4000,
 
-		MaxWebSocketSessionsPerNetwork: 1024,
-		ReplayCacheMax:                 1_000_000,
+		MaxWebSocketSessionsPerNetwork:     1024,
+		MaxWebSocketSessionsPerNetworkHard: 2000,
+		ReplayCacheMax:                     1_000_000,
 
 		SweepInterval:   60 * time.Second,
 		ShutdownTimeout: 20 * time.Second,
@@ -312,6 +317,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	integer("RELAY_MAX_COLLECTORS_PER_MAILBOX", &c.MaxCollectorsPerMailbox)
 	integer("RELAY_MAX_WS_SESSIONS", &c.MaxWebSocketSessions)
 	integer("RELAY_MAX_WS_SESSIONS_PER_NETWORK", &c.MaxWebSocketSessionsPerNetwork)
+	integer("RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD", &c.MaxWebSocketSessionsPerNetworkHard)
 	integer("RELAY_REPLAY_CACHE_MAX", &c.ReplayCacheMax)
 
 	dur("RELAY_SWEEP_INTERVAL", &c.SweepInterval)
@@ -385,6 +391,9 @@ func (c Config) Validate() error {
 	if c.MaxConcurrentBlobTransfers <= 0 || c.MaxCollectorsPerMailbox <= 0 || c.MaxWebSocketSessions <= 0 || c.MaxWebSocketSessionsPerNetwork <= 0 || c.ReplayCacheMax <= 0 ||
 		c.RateIPBurst <= 0 || c.RateKeyBurst <= 0 || c.RateRegisterBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 || c.RateWebBurst <= 0 {
 		errs = append(errs, errors.New("concurrency, burst and cache limits must be > 0"))
+	}
+	if c.MaxWebSocketSessionsPerNetworkHard < c.MaxWebSocketSessionsPerNetwork || c.MaxWebSocketSessionsPerNetworkHard > c.MaxWebSocketSessions {
+		errs = append(errs, errors.New("RELAY_MAX_WS_SESSIONS_PER_NETWORK <= RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD <= RELAY_MAX_WS_SESSIONS must hold (set all three when lowering one)"))
 	}
 	// A zero rate would silently turn a limit into "never refills".
 	for _, r := range []float64{c.RateIPPerSec, c.RateKeyPerSec, c.RateRegisterPerSec, c.RateSenderPerSec, c.RateClaimPerSec, c.RateWebPerSec} {

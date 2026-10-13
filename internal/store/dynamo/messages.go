@@ -217,40 +217,60 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 // ULID order; each candidate is leased with a conditional write, so two
 // collectors — on any processes — never hold the same message at once.
 func (s *Store) Collect(ctx context.Context, mailbox string, max int, visibility time.Duration) ([]store.Message, time.Time, error) {
+	return s.CollectRange(ctx, mailbox, "", "", max, visibility)
+}
+
+// CollectRange implements store.Backend. Without bounds it is the one
+// query described at Collect. With bounds the same walk is two queries,
+// each a key condition: the lease items of the range, then its messages
+// (the sort keys L#<id> and M#<id> order like the ids). Deposits give
+// every message an id above the mailbox's last (see newID), so a range
+// that starts after an id holds exactly the messages deposited after it.
+func (s *Store) CollectRange(ctx context.Context, mailbox, after, upTo string, max int, visibility time.Duration) ([]store.Message, time.Time, error) {
+	// Sort-key ranges to walk, in order; BETWEEN is inclusive, so the
+	// lower bound itself (the id `after`) is skipped below.
+	ranges := [][2]string{{"L#", "M$"}}
+	if after != "" || upTo != "" {
+		lhi, mhi := "L$", "M$"
+		if upTo != "" {
+			lhi, mhi = leaseSK(upTo), msgSK(upTo)
+		}
+		ranges = [][2]string{{"L#" + after, lhi}, {"M#" + after, mhi}}
+		if "L#"+after > lhi { // an empty range (after >= upTo): BETWEEN would be rejected
+			return nil, time.Time{}, nil
+		}
+	}
 	now := s.now()
 	nowMS := ms(now)
 	leases := map[string]int64{}
 	var candidates []store.Message
 	var expired []string
 	var next int64
-	in := &dynamodb.QueryInput{
-		TableName:                 &s.cfg.Table,
-		ConsistentRead:            aws.Bool(true),
-		KeyConditionExpression:    aws.String("pk = :pk AND sk BETWEEN :lo AND :hi"),
-		ExpressionAttributeValues: item{":pk": avS(mbPK(mailbox)), ":lo": avS("L#"), ":hi": avS("M$")},
-		Limit:                     aws.Int32(int32(max + 16)),
-	}
-	for len(candidates) < max {
-		out, err := s.cfg.DB.Query(ctx, in)
-		if err != nil {
-			return nil, time.Time{}, err
+	for _, r := range ranges {
+		in := &dynamodb.QueryInput{
+			TableName:                 &s.cfg.Table,
+			ConsistentRead:            aws.Bool(true),
+			KeyConditionExpression:    aws.String("pk = :pk AND sk BETWEEN :lo AND :hi"),
+			ExpressionAttributeValues: item{":pk": avS(mbPK(mailbox)), ":lo": avS(r[0]), ":hi": avS(r[1])},
+			Limit:                     aws.Int32(int32(max + 16)),
 		}
-		for _, it := range out.Items {
+		if err := s.walk(ctx, in, func(it item) bool {
 			sk := getS(it, "sk")
 			switch {
+			case after != "" && sk[2:] == after: // the bound itself
 			case strings.HasPrefix(sk, "L#"):
 				leases[sk[2:]] = getN0(it, "lease_until")
 			case strings.HasPrefix(sk, "M#"):
 				id := sk[2:]
 				if getN0(it, "exp") <= nowMS {
 					expired = append(expired, sk)
-					continue
+					return true
 				}
 				if until := leases[id]; until > nowMS {
 					if next == 0 || until < next {
 						next = until
 					}
-					continue
+					return true
 				}
 				if len(candidates) < max {
 					candidates = append(candidates, store.Message{
@@ -259,11 +279,10 @@ func (s *Store) Collect(ctx context.Context, mailbox string, max int, visibility
 					})
 				}
 			}
+			return true
+		}, func() bool { return len(candidates) < max }); err != nil {
+			return nil, time.Time{}, err
 		}
-		if len(out.LastEvaluatedKey) == 0 {
-			break
-		}
-		in.ExclusiveStartKey = out.LastEvaluatedKey
 	}
 	s.dropExpiredMessages(ctx, mailbox, expired, now)
 
@@ -326,6 +345,25 @@ func (s *Store) Collect(ctx context.Context, mailbox string, max int, visibility
 		return nil, time.Time{}, nil
 	}
 	return nil, fromMS(next), nil
+}
+
+// walk runs the query page by page, handing each item to visit, for as
+// long as more reports that more are wanted (checked before each page).
+func (s *Store) walk(ctx context.Context, in *dynamodb.QueryInput, visit func(item) bool, more func() bool) error {
+	for more() {
+		out, err := s.cfg.DB.Query(ctx, in)
+		if err != nil {
+			return err
+		}
+		for _, it := range out.Items {
+			visit(it)
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			return nil
+		}
+		in.ExclusiveStartKey = out.LastEvaluatedKey
+	}
+	return nil
 }
 
 // dropExpiredMessages deletes expired messages met during a collect and

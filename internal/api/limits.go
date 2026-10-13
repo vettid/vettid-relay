@@ -53,6 +53,11 @@ const limWSSessions = "ws_sessions"
 // (cfg.MaxWebSocketSessionsPerNetwork). Likewise a count.
 const limWSNetwork = "ws_network"
 
+// limWSNetworkHard labels the upgrades refused because the caller's
+// network holds as many sessions as any network may on this process
+// (cfg.MaxWebSocketSessionsPerNetworkHard), a mailbox's first included.
+const limWSNetworkHard = "ws_network_hard"
+
 var allLimiters = []string{limAddress, limKey, limSender, limRegister, limClaim, limWeb}
 
 // maxCounted bounds the per-minute tally of requests per network and per
@@ -90,6 +95,7 @@ func newLimiterMetrics(reg *metrics.Registry) *limiterMetrics {
 	m.busiest.With(limKey)
 	m.refused.With(limWSSessions)
 	m.refused.With(limWSNetwork)
+	m.refused.With(limWSNetworkHard)
 	return m
 }
 
@@ -186,7 +192,7 @@ func (s *Server) reportLimits() {
 	attrs = append(attrs, "addresses_refused", len(s.rl.hit),
 		"collectors", s.hub.collectors(), "parked", s.m.parked.Value(), "ws_sessions", s.m.wsSessions.Value())
 	s.rl.hit = map[string]struct{}{}
-	for _, name := range []string{limWSSessions, limWSNetwork} { // appended last, in this order
+	for _, name := range []string{limWSSessions, limWSNetwork, limWSNetworkHard} { // appended last, in this order
 		total := s.rl.refused.With(name).Value()
 		attrs = append(attrs, name+"_refused", total-s.rl.lastRef[name])
 		s.rl.lastRef[name] = total
