@@ -132,6 +132,7 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
 | `RELAY_ANDROID_CERT_SHA256` | the official VettID app's signing keys | Comma-separated SHA-256 certificate fingerprints for `assetlinks.json`, colon-separated or plain hex, any case (served in uppercase colon form). The built-in default (`config.DefaultAndroidCertFingerprints`: the production upload key and the two staging signers) lets a self-hosted relay open links in the official app with no configuration. Set but empty turns `assetlinks.json` off (404). |
 | `RELAY_MAX_COLLECTORS_PER_MAILBOX` | `4` | Concurrent long-polls plus WebSockets per mailbox. |
+| `RELAY_MAX_WS_SESSIONS` | `4000` | Open WebSocket collect sessions per relay process, over all mailboxes. An upgrade beyond it is answered `429 rate_limited` with `retry_after` 5; long-poll isn't affected. At about 45 KiB a session the default is about 176 MiB. |
 | `RELAY_REPLAY_CACHE_MAX` | `1000000` | Replay-cache capacity. When it's full, requests are shed with `rate_limited` and no live entries are evicted. |
 | `RELAY_SWEEP_INTERVAL` | `60s` | TTL sweeper period. The first pass is jittered. |
 | `RELAY_SHUTDOWN_TIMEOUT` | `20s` | Bound on the graceful drain after SIGTERM. |
@@ -301,7 +302,7 @@ other process sees, refuses or is woken by.
   `relay_collect_store_queries_total`, `relay_collect_store_skips_total`,
   `relay_empty_hint_bump_failures_total`.
 - **Per-process limits.** `RELAY_MAX_COLLECTORS_PER_MAILBOX`,
-  `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` and the replay-cache capacity bound
+  `RELAY_MAX_WS_SESSIONS`, `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` and the replay-cache capacity bound
   each process's own resources.
 - **Mailbox quotas** are counters updated in the same transaction as the
   write. Acks, expiry and TTL deletions can leave them high; a failing quota

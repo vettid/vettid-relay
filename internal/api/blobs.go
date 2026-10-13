@@ -131,7 +131,7 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("blob_id")
-	if len(id) != 26 {
+	if !validID(id) {
 		s.writeError(w, fail(CodeBlobUnknown))
 		return
 	}
@@ -175,7 +175,7 @@ func (s *Server) handleBlobDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("blob_id")
-	if len(id) == 26 {
+	if validID(id) {
 		if err := s.blobs.DeleteBlob(r.Context(), mb.ID, id); err != nil {
 			s.log.Error("blob delete failed", "err", err)
 			s.writeError(w, fail(CodeInternal))
@@ -183,6 +183,6 @@ func (s *Server) handleBlobDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.m.blobDeletes.Inc()
-	setLog(w, "blob_id", id)
+	setLog(w, "blob_id", logID(id))
 	w.WriteHeader(http.StatusNoContent)
 }

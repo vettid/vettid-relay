@@ -44,6 +44,21 @@ func TestLoadOverrides(t *testing.T) {
 	}
 }
 
+func TestWebSocketSessionCapConfig(t *testing.T) {
+	if d := Defaults(); d.MaxWebSocketSessions != 4000 {
+		t.Fatalf("default %d", d.MaxWebSocketSessions)
+	}
+	c, err := Load(env(map[string]string{"RELAY_MAX_WS_SESSIONS": "150"}))
+	if err != nil || c.MaxWebSocketSessions != 150 {
+		t.Fatalf("%d %v", c.MaxWebSocketSessions, err)
+	}
+	for _, bad := range []string{"0", "-1", "many"} {
+		if _, err := Load(env(map[string]string{"RELAY_MAX_WS_SESSIONS": bad})); err == nil {
+			t.Errorf("RELAY_MAX_WS_SESSIONS=%s: expected an error", bad)
+		}
+	}
+}
+
 func TestLoadRejects(t *testing.T) {
 	for name, m := range map[string]map[string]string{
 		"trailing slash": {"RELAY_BASE_URL": "https://relay.vettid.org/"},

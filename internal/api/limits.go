@@ -26,6 +26,10 @@ import (
 //	claim     unauthenticated claim fetches per network. Shared.
 //	web       everything outside /v1/, per network. Per process.
 //
+// A WebSocket session passes address and key once, at its upgrade. Its ack
+// frames are requests too: those the relay did not ask for by sending a
+// message on that session draw on address and key again (ws.go).
+//
 // Nothing else is keyed on a network. A request properly signed by a key
 // with a mailbox can be refused on account of its network only by the
 // flood guard and, if it would create a mailbox, by the registration

@@ -54,6 +54,7 @@ type Server struct {
 	hsts bool     // public base URL is https: send Strict-Transport-Security
 
 	hub       *hub
+	wsOpen    atomic.Int64  // WebSocket sessions holding a slot (cfg.MaxWebSocketSessions)
 	bus       WakeBus       // cross-process wake-on-deposit (nil: single process)
 	hints     EmptyHints    // known-empty mailboxes (nil: always query)
 	forceGen  atomic.Uint64 // bumped by WakeAll: collectors then query for real
