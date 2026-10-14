@@ -202,10 +202,10 @@ func TestQuotas(t *testing.T) {
 	if _, err := s.Deposit(ctx, "a", "s", make([]byte, 6), time.Hour, tb); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", SenderSub: "s", Size: 5, TTL: time.Hour, Limits: tb}, bytes.NewReader(make([]byte, 5))); !errors.Is(err, ErrQuota) {
+	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", Size: 5, TTL: time.Hour, Limits: tb}, bytes.NewReader(make([]byte, 5))); !errors.Is(err, ErrQuota) {
 		t.Fatalf("token bytes quota on blob: %v", err)
 	}
-	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", SenderSub: "s", Size: 4, TTL: time.Hour, Limits: tb}, bytes.NewReader(make([]byte, 4))); err != nil {
+	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", Size: 4, TTL: time.Hour, Limits: tb}, bytes.NewReader(make([]byte, 4))); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -283,14 +283,14 @@ func TestBlobs(t *testing.T) {
 	mustRegister(t, s, "a", 1)
 	mustRegister(t, s, "b", 2)
 	data := bytes.Repeat([]byte("z"), 1000)
-	info, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", SenderSub: "s", Size: 1000, TTL: time.Hour, Limits: Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data))
+	info, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", Size: 1000, TTL: time.Hour, Limits: Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", SenderSub: "s", Size: 1000, TTL: time.Hour, Limits: Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data)); !errors.Is(err, ErrQuota) {
+	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", Size: 1000, TTL: time.Hour, Limits: Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data)); !errors.Is(err, ErrQuota) {
 		t.Fatalf("mailbox blob cap: %v", err)
 	}
-	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", SenderSub: "s", Size: 10, TTL: time.Hour}, bytes.NewReader(data)); err == nil {
+	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", Size: 10, TTL: time.Hour}, bytes.NewReader(data)); err == nil {
 		t.Fatal("size mismatch must fail")
 	}
 	got, rc, err := s.OpenBlob(ctx, "a", info.ID)
@@ -514,7 +514,7 @@ func TestClaims(t *testing.T) {
 	if _, _, err := s.PutClaim(ctx, "a", make([]byte, 600), time.Hour, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", SenderSub: "s", Size: 500, TTL: time.Hour, Limits: Limits{MailboxMaxBytes: 1000}}, bytes.NewReader(make([]byte, 500))); !errors.Is(err, ErrQuota) {
+	if _, err := s.PutBlob(ctx, BlobPut{Mailbox: "a", Size: 500, TTL: time.Hour, Limits: Limits{MailboxMaxBytes: 1000}}, bytes.NewReader(make([]byte, 500))); !errors.Is(err, ErrQuota) {
 		t.Fatalf("blob over shared cap: %v", err)
 	}
 	if _, _, err := s.PutClaim(ctx, "a", make([]byte, 401), time.Hour, 1000); !errors.Is(err, ErrQuota) {

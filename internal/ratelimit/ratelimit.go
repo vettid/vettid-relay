@@ -39,6 +39,15 @@ func New(rate float64, burst int, maxKeys int) *Limiter {
 // Allow consumes one token for key. When refused it returns the wait until
 // a token is available (at least one second).
 func (l *Limiter) Allow(key string, now time.Time) (bool, time.Duration) {
+	return l.AllowN(key, 1, now)
+}
+
+// AllowN consumes n tokens for key (a byte budget charges a request's
+// bytes), or none: when refused it returns the wait until n tokens are
+// available (at least one second). A request of more than the burst is
+// never allowed; callers keep their largest request within it.
+func (l *Limiter) AllowN(key string, n int64, now time.Time) (bool, time.Duration) {
+	need := float64(max(n, 0))
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b, ok := l.buckets[key]
@@ -57,15 +66,15 @@ func (l *Limiter) Allow(key string, now time.Time) (bool, time.Duration) {
 		b.tokens = math.Min(l.burst, b.tokens+el*l.rate)
 		b.last = now
 	}
-	if b.tokens >= 1 {
-		b.tokens--
+	if b.tokens >= need && need <= l.burst {
+		b.tokens -= need
 		if used := 1 - b.tokens/l.burst; used > l.peak {
 			l.peak = used
 		}
 		return true, 0
 	}
 	l.peak = 1
-	wait := time.Duration((1 - b.tokens) / l.rate * float64(time.Second))
+	wait := time.Duration((math.Min(need, l.burst) - b.tokens) / l.rate * float64(time.Second))
 	if wait < time.Second {
 		wait = time.Second
 	}

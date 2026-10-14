@@ -1,9 +1,12 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"sync"
+	"time"
 
+	"github.com/vettid/vettid-relay/internal/logbudget"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/ratelimit"
 	auth "github.com/vettid/vettid-relay/relayauth"
@@ -26,14 +29,26 @@ import (
 //	claim     unauthenticated claim fetches per network. Shared.
 //	web       everything outside /v1/, per network. Per process.
 //
+// Two byte budgets per network bound what one network can make the relay
+// store and move, whatever number of keys and mailboxes it holds. They are
+// charged with a request's declared length (Content-Length) before its
+// body is read, and kept per process:
+//
+//	bytes       deposits (after §5.3 steps 1–6) and claims (after the
+//	            claim's signature verified).
+//	blob_bytes  blob uploads (after the per-sender limit) and downloads
+//	            (after the owner's signature verified, with the blob's
+//	            size).
+//
 // A WebSocket session passes address and key once, at its upgrade. Its ack
 // frames are requests too: those that do not answer a message the relay
 // sent on that session draw on address and key again (ws.go).
 //
 // Nothing else is keyed on a network. A request properly signed by a key
 // with a mailbox can be refused on account of its network only by the
-// flood guard and, if it would create a mailbox, by the registration
-// budget.
+// flood guard, the byte budgets and, if it would create a mailbox, by the
+// registration budget. The byte budgets, like the flood guard, never look
+// at a request's target.
 const (
 	limAddress  = "address"
 	limKey      = "key"
@@ -60,6 +75,29 @@ const limWSNetworkHard = "ws_network_hard"
 
 var allLimiters = []string{limAddress, limKey, limSender, limRegister, limClaim, limWeb}
 
+// The byte budgets per network (per process). They are reported after
+// every other field of the "rate limits" line.
+const (
+	limBytes     = "bytes"
+	limBlobBytes = "blob_bytes"
+)
+
+var byteLimiters = []string{limBytes, limBlobBytes}
+
+// limBlobSlots and limBlobMailboxSlots label blob transfers refused
+// because the process (cfg.MaxConcurrentBlobTransfers) or the mailbox
+// (cfg.MaxBlobTransfersPerMailbox) has no transfer slot free. Counts.
+const (
+	limBlobSlots        = "blob_slots"
+	limBlobMailboxSlots = "blob_mailbox_slots"
+)
+
+// ByteLimiter is a keyed byte budget: AllowN consumes n tokens (bytes), or
+// none and reports how long until n are available.
+type ByteLimiter interface {
+	AllowN(key string, n int64, now time.Time) (bool, time.Duration)
+}
+
 // maxCounted bounds the per-minute tally of requests per network and per
 // key (limiterMetrics.busiest); beyond it new ones go uncounted.
 const maxCounted = 50_000
@@ -69,10 +107,12 @@ type limiterMetrics struct {
 	refused metrics.CounterVec
 	peak    metrics.GaugeVec
 	busiest metrics.GaugeVec
+	bytes   metrics.GaugeVec // busiest network's bytes per minute, by byte budget
 
 	mu      sync.Mutex
 	lastRef map[string]int64          // refused counts at the previous report
-	count   map[string]map[string]int // this minute's requests, by limiter and key
+	lastLog [2]int64                  // log lines dropped, suppressed at the previous report
+	count   map[string]map[string]int // this minute's requests (bytes for the byte budgets), by limiter and key
 	hit     map[string]struct{}       // networks the flood guard refused this minute
 }
 
@@ -82,8 +122,9 @@ func newLimiterMetrics(reg *metrics.Registry) *limiterMetrics {
 		refused: reg.CounterVec("relay_ratelimit_refused_total", "Requests a rate limiter refused (429 rate_limited), by limiter.", "limiter"),
 		peak:    reg.GaugeVec("relay_ratelimit_peak_permille", "How full the busiest bucket of each limiter got during the last full minute, in thousandths of its burst (1000: something was refused).", "limiter"),
 		busiest: reg.GaugeVec("relay_ratelimit_busiest_per_minute", "Requests of the busiest single client network (limiter address) and of the busiest single key (limiter key) during the last full minute.", "limiter"),
+		bytes:   reg.GaugeVec("relay_ratelimit_busiest_bytes_per_minute", "Bytes charged to the busiest single client network during the last full minute, by byte budget (bytes: deposits and claims; blob_bytes: blob uploads and downloads).", "limiter"),
 		lastRef: map[string]int64{},
-		count:   map[string]map[string]int{limAddress: {}, limKey: {}},
+		count:   map[string]map[string]int{limAddress: {}, limKey: {}, limBytes: {}, limBlobBytes: {}},
 		hit:     map[string]struct{}{},
 	}
 	for _, l := range allLimiters {
@@ -96,17 +137,26 @@ func newLimiterMetrics(reg *metrics.Registry) *limiterMetrics {
 	m.refused.With(limWSSessions)
 	m.refused.With(limWSNetwork)
 	m.refused.With(limWSNetworkHard)
+	for _, l := range byteLimiters {
+		m.allowed.With(l)
+		m.refused.With(l)
+		m.peak.With(l)
+		m.bytes.With(l)
+	}
+	m.refused.With(limBlobSlots)
+	m.refused.With(limBlobMailboxSlots)
 	return m
 }
 
-// tally counts one request for key under limiter (address or key), for
-// the busiest-per-minute figures. Nothing of key is ever reported.
-func (m *limiterMetrics) tally(limiter, key string, refused bool) {
+// tally counts n for key under limiter (one request under address or
+// key, the bytes charged under a byte budget), for the busiest-per-minute
+// figures. Nothing of key is ever reported.
+func (m *limiterMetrics) tally(limiter, key string, n int, refused bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c := m.count[limiter]
 	if _, ok := c[key]; ok || len(c) < maxCounted {
-		c[key]++
+		c[key] += n
 	}
 	if refused && limiter == limAddress && len(m.hit) < maxCounted {
 		m.hit[key] = struct{}{}
@@ -117,7 +167,7 @@ func (m *limiterMetrics) tally(limiter, key string, refused bool) {
 func (s *Server) take(name string, l RateLimiter, key string) *apiError {
 	ok, wait := l.Allow(key, s.now())
 	if name == limAddress || name == limKey {
-		s.rl.tally(name, key, !ok)
+		s.rl.tally(name, key, 1, !ok)
 	}
 	if ok {
 		s.rl.allowed.With(name).Inc()
@@ -125,6 +175,30 @@ func (s *Server) take(name string, l RateLimiter, key string) *apiError {
 	}
 	s.rl.refused.With(name).Inc()
 	return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
+}
+
+// takeBytes charges n bytes to the byte budget l (name: limBytes or
+// limBlobBytes) of network, or returns the 429. Refused, it charges
+// nothing.
+func (s *Server) takeBytes(name string, l ByteLimiter, network string, n int64) *apiError {
+	ok, wait := l.AllowN(network, n, s.now())
+	if !ok {
+		s.rl.refused.With(name).Inc()
+		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
+	}
+	s.rl.allowed.With(name).Inc()
+	s.rl.tally(name, network, int(n), false)
+	return nil
+}
+
+// declaredLength is what a byte budget charges for a body before it is
+// read: its Content-Length, or limit (the most it may be) when the length
+// is not declared.
+func declaredLength(r *http.Request, limit int64) int64 {
+	if r.ContentLength >= 0 {
+		return min(r.ContentLength, limit)
+	}
+	return limit
 }
 
 // allowKey applies the per-key bucket to a caller that has proved it holds
@@ -162,15 +236,16 @@ func (s *Server) reportLimits() {
 	s.rl.mu.Lock()
 	defer s.rl.mu.Unlock()
 	peaks := map[string]float64{}
-	for name, l := range map[string]RateLimiter{
+	for name, l := range map[string]any{
 		limAddress: s.ipLimit, limKey: s.keyLimit, limSender: s.subLimit,
 		limRegister: s.regLimit, limClaim: s.claimLimit, limWeb: s.webLimit,
+		limBytes: s.byteLimit, limBlobBytes: s.blobByteLimit,
 	} {
 		if p, ok := l.(interface{ Peak() float64 }); ok {
 			peaks[name] = p.Peak()
 		}
 	}
-	attrs := make([]any, 0, 24)
+	attrs := make([]any, 0, 48)
 	for _, name := range allLimiters {
 		pm := int64(peaks[name] * 1000)
 		s.rl.peak.With(name).Set(pm)
@@ -197,8 +272,41 @@ func (s *Server) reportLimits() {
 		attrs = append(attrs, name+"_refused", total-s.rl.lastRef[name])
 		s.rl.lastRef[name] = total
 	}
+	// The byte budgets, the blob transfer slots and the log budget come
+	// after everything above (which is unchanged), in this order.
+	for _, name := range byteLimiters {
+		pm := int64(peaks[name] * 1000)
+		s.rl.peak.With(name).Set(pm)
+		total := s.rl.refused.With(name).Value()
+		most := 0
+		for _, n := range s.rl.count[name] {
+			most = max(most, n)
+		}
+		s.rl.bytes.With(name).Set(int64(most))
+		s.rl.count[name] = map[string]int{}
+		attrs = append(attrs, name+"_peak", pm, name+"_refused", total-s.rl.lastRef[name], name+"_busiest_per_min", most)
+		s.rl.lastRef[name] = total
+	}
+	for _, name := range []string{limBlobSlots, limBlobMailboxSlots} {
+		total := s.rl.refused.With(name).Value()
+		attrs = append(attrs, name+"_refused", total-s.rl.lastRef[name])
+		s.rl.lastRef[name] = total
+	}
+	if lb, ok := s.log.Handler().(logCounts); ok {
+		d, sup := lb.Dropped(), lb.Suppressed()
+		attrs = append(attrs, "log_dropped", d-s.rl.lastLog[0], "log_suppressed", sup-s.rl.lastLog[1])
+		s.rl.lastLog = [2]int64{d, sup}
+	}
 	// At info level every minute: this line is what the limits are sized
 	// from (how close a vault host is to the flood guard, how many
 	// collectors a process carries). One line a minute per process.
-	s.log.Info("rate limits", attrs...)
+	// It is exempt from the log budget: it reports what the budget dropped.
+	s.log.InfoContext(logbudget.Exempt(context.Background()), "rate limits", attrs...)
+}
+
+// logCounts is implemented by a log handler with a line budget
+// (logbudget.Handler).
+type logCounts interface {
+	Dropped() int64
+	Suppressed() int64
 }

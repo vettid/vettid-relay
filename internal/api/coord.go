@@ -103,6 +103,12 @@ func WithSmallBodyTimeout(d time.Duration) Option {
 	return func(s *Server) { s.smallBodyTimeout = d }
 }
 
+// WithBlobPaceWindow replaces the period in which a blob body must move
+// cfg.BlobPaceBytes (tests).
+func WithBlobPaceWindow(d time.Duration) Option {
+	return func(s *Server) { s.blobPaceWindow = d }
+}
+
 // WithWakeBus publishes every deposit's mailbox to other relay processes.
 // Signals they publish are delivered here through Server.Wake.
 func WithWakeBus(b WakeBus) Option { return func(s *Server) { s.bus = b } }

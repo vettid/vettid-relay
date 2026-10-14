@@ -54,6 +54,13 @@ func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeBadRequest))
 		return
 	}
+	// A claim is stored: it draws on the network's byte budget, like a
+	// deposit. (Its small body is read before the signature can be
+	// checked, so it is charged once the claim is authenticated.)
+	if e := s.takeBytes(limBytes, s.byteLimit, s.network(r), int64(len(body))); e != nil {
+		s.writeError(w, e)
+		return
+	}
 	id, exp, err := s.st.PutClaim(r.Context(), mb.ID, body, ttl, s.cfg.MailboxMaxBlobBytes)
 	switch {
 	case errors.Is(err, store.ErrQuota):

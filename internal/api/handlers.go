@@ -65,9 +65,10 @@ func (s *Server) readBody(w http.ResponseWriter, r *http.Request, limit int64) (
 
 // depositBodyLimit is the JSON envelope cap: base64 of the max payload plus
 // headroom for {"payload":""} and whitespace.
-func (s *Server) depositBodyLimit() int64 {
-	return 4*((s.cfg.MaxPayloadBytes+2)/3) + 1024
-}
+func (s *Server) depositBodyLimit() int64 { return s.cfg.DepositBodyLimit() }
+
+// network is the rate-limit key of the request's client network.
+func (s *Server) network(r *http.Request) string { return rateKey(clientIP(r, s.cfg.TrustProxy)) }
 
 func decodeJSON(b []byte, v any) bool {
 	dec := json.NewDecoder(bytes.NewReader(b))
@@ -194,6 +195,13 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	// before its body is read (as a blob upload is).
 	da, e := s.authorizeDepositToken(r.Context(), r, mailboxID)
 	if e != nil {
+		s.refuseUnread(w, r, e)
+		return
+	}
+	// The network's byte budget, on the declared length: a deposit it
+	// refuses is not read. (After steps 1–6, so an unauthorized deposit
+	// costs the network nothing.)
+	if e := s.takeBytes(limBytes, s.byteLimit, s.network(r), declaredLength(r, s.depositBodyLimit())); e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}

@@ -212,3 +212,62 @@ func TestRateLimitConfig(t *testing.T) {
 		}
 	}
 }
+
+// The resource limits: byte budgets per network, blob transfer slots and
+// pace, the mailbox's stored-bytes cap and the log budget. Their defaults,
+// their variables, and the start-up checks between related limits.
+func TestResourceLimitConfig(t *testing.T) {
+	d := Defaults()
+	if d.RateIPBytesPerSec != 256<<10 || d.RateIPBytesBurst != 8<<20 ||
+		d.RateBlobBytesPerSec != 1<<20 || d.RateBlobBytesBurst != 64<<20 ||
+		d.MaxBlobTransfersPerMailbox != 2 || d.MaxConcurrentBlobTransfers != 8 || d.BlobPaceBytes != 16<<10 ||
+		d.MailboxMaxBytes != 32<<20 || d.LogInfoPerSec != 100 || d.LogInfoBurst != 1000 {
+		t.Fatalf("defaults differ from README.md: %+v", d)
+	}
+	c, err := Load(env(map[string]string{
+		"RELAY_RATE_IP_BYTES_PER_SEC":          "524288",
+		"RELAY_RATE_IP_BYTES_BURST":            "16777216",
+		"RELAY_RATE_BLOB_BYTES_PER_SEC":        "2097152",
+		"RELAY_RATE_BLOB_BYTES_BURST":          "134217728",
+		"RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "3",
+		"RELAY_BLOB_PACE_BYTES":                "65536",
+		"RELAY_LOG_INFO_RPS":                   "50",
+		"RELAY_LOG_INFO_BURST":                 "200",
+		"RELAY_MAILBOX_MAX_BYTES":              "0",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RateIPBytesPerSec != 524288 || c.RateIPBytesBurst != 16<<20 || c.RateBlobBytesPerSec != 2<<20 || c.RateBlobBytesBurst != 128<<20 ||
+		c.MaxBlobTransfersPerMailbox != 3 || c.BlobPaceBytes != 65536 || c.LogInfoPerSec != 50 || c.LogInfoBurst != 200 || c.MailboxMaxBytes != 0 {
+		t.Fatalf("%+v", c)
+	}
+	for _, bad := range []map[string]string{
+		{"RELAY_RATE_IP_BYTES_PER_SEC": "0"},
+		{"RELAY_RATE_BLOB_BYTES_PER_SEC": "0"},
+		{"RELAY_LOG_INFO_RPS": "0"},
+		{"RELAY_LOG_INFO_BURST": "0"},
+		// The burst must hold the largest deposit body (about 350 KiB at the default payload size).
+		{"RELAY_RATE_IP_BYTES_BURST": "300000"},
+		{"RELAY_RATE_IP_BYTES_BURST": "0"},
+		// ... and the largest blob.
+		{"RELAY_RATE_BLOB_BYTES_BURST": "8388607"},
+		// Per-mailbox slots: at least 1, at most the process's.
+		{"RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "0"},
+		{"RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "9"},
+		{"RELAY_BLOB_PACE_BYTES": "0"},
+		// A mailbox cap below one message.
+		{"RELAY_MAILBOX_MAX_BYTES": "1000"},
+	} {
+		if _, err := Load(env(bad)); err == nil {
+			t.Errorf("%v: expected an error", bad)
+		}
+	}
+	// With blobs off, the blob limits are not checked.
+	if _, err := Load(env(map[string]string{"RELAY_BLOBS_ENABLED": "false", "RELAY_RATE_BLOB_BYTES_BURST": "1", "RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "0"})); err != nil {
+		t.Fatalf("blobs off: %v", err)
+	}
+	if got := Defaults().DepositBodyLimit(); got != 4*((262144+2)/3)+1024 {
+		t.Fatalf("deposit body limit %d", got)
+	}
+}

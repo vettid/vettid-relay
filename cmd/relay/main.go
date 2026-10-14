@@ -26,6 +26,7 @@ import (
 	"github.com/vettid/vettid-relay/internal/api"
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/coord"
+	"github.com/vettid/vettid-relay/internal/logbudget"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/sweep"
 )
@@ -47,7 +48,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "relay: invalid configuration:", err)
 		os.Exit(2)
 	}
-	log := newLogger(cfg.LogLevel)
+	log := newLogger(cfg)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	if err := run(ctx, cfg, log, nil); err != nil {
@@ -104,9 +105,11 @@ func runHealthcheck(cfg config.Config) int {
 	return 0
 }
 
-func newLogger(level string) *slog.Logger {
+// newLogger writes JSON lines to stdout at RELAY_LOG_LEVEL, within the log
+// budget (internal/logbudget).
+func newLogger(cfg config.Config) *slog.Logger {
 	var l slog.Level
-	switch strings.ToLower(level) {
+	switch strings.ToLower(cfg.LogLevel) {
 	case "debug":
 		l = slog.LevelDebug
 	case "warn":
@@ -116,7 +119,7 @@ func newLogger(level string) *slog.Logger {
 	default:
 		l = slog.LevelInfo
 	}
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}))
+	return slog.New(logbudget.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}), cfg.LogInfoPerSec, cfg.LogInfoBurst))
 }
 
 // run serves until ctx is cancelled (SIGTERM/SIGINT in production), then

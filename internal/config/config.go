@@ -40,6 +40,12 @@ type Config struct {
 	TrustProxy       bool   // RELAY_TRUST_PROXY
 	LogLevel         string // RELAY_LOG_LEVEL
 
+	// Log volume, per relay process: info lines beyond this budget are
+	// dropped and counted (the per-minute "rate limits" line always gets
+	// through and reports the count).
+	LogInfoPerSec float64 // RELAY_LOG_INFO_RPS
+	LogInfoBurst  int     // RELAY_LOG_INFO_BURST
+
 	MaxPayloadBytes   int64         // RELAY_MAX_PAYLOAD_BYTES
 	MessageTTL        time.Duration // RELAY_MESSAGE_TTL
 	VisibilityTimeout time.Duration // RELAY_VISIBILITY_TIMEOUT
@@ -47,7 +53,11 @@ type Config struct {
 	BlobsEnabled               bool          // RELAY_BLOBS_ENABLED
 	MaxBlobBytes               int64         // RELAY_MAX_BLOB_BYTES
 	BlobTTL                    time.Duration // RELAY_BLOB_TTL
-	MaxConcurrentBlobTransfers int           // RELAY_MAX_CONCURRENT_BLOB_TRANSFERS
+	MaxConcurrentBlobTransfers int           // RELAY_MAX_CONCURRENT_BLOB_TRANSFERS (per process)
+	MaxBlobTransfersPerMailbox int           // RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX: of those, per mailbox
+	// RELAY_BLOB_PACE_BYTES: a blob body (up or down) must move at least
+	// this many bytes in every BlobPaceWindow, or the transfer is dropped.
+	BlobPaceBytes int64
 
 	MailboxMaxMessages  int64 // RELAY_MAILBOX_MAX_MESSAGES
 	MailboxMaxBytes     int64 // RELAY_MAILBOX_MAX_BYTES
@@ -75,6 +85,13 @@ type Config struct {
 	RateClaimBurst     int     // RELAY_RATE_CLAIM_GET_BURST
 	RateWebPerSec      float64 // RELAY_RATE_WEB_RPS (everything outside /v1/ and /healthz)
 	RateWebBurst       int     // RELAY_RATE_WEB_BURST
+
+	// Byte budgets per network, per relay process. Charged with a
+	// request's declared length before its body is read.
+	RateIPBytesPerSec   float64 // RELAY_RATE_IP_BYTES_PER_SEC: deposits and claims
+	RateIPBytesBurst    int     // RELAY_RATE_IP_BYTES_BURST
+	RateBlobBytesPerSec float64 // RELAY_RATE_BLOB_BYTES_PER_SEC: blob uploads and downloads
+	RateBlobBytesBurst  int     // RELAY_RATE_BLOB_BYTES_BURST
 
 	// Web endpoints (spec §6.11): /.well-known/assetlinks.json names the
 	// Android app allowed to open this relay's /connect links. An empty
@@ -109,6 +126,15 @@ type Config struct {
 // its keys and attributes. The protocol default (262,144) fits easily.
 const MaxDynamoPayloadBytes = 380_000
 
+// BlobPaceWindow is the period of RELAY_BLOB_PACE_BYTES.
+const BlobPaceWindow = 5 * time.Second
+
+// DepositBodyLimit is the most a deposit's JSON body may be: base64 of
+// the maximum payload plus headroom for {"payload":""} and whitespace.
+func (c Config) DepositBodyLimit() int64 {
+	return 4*((c.MaxPayloadBytes+2)/3) + 1024
+}
+
 // DefaultAndroidPackage is the VettID Android app.
 const DefaultAndroidPackage = "com.vettid.app"
 
@@ -135,6 +161,8 @@ func Defaults() Config {
 		ValkeyServerless: true,
 		ValkeyPrefix:     "relay",
 		LogLevel:         "info",
+		LogInfoPerSec:    100,
+		LogInfoBurst:     1000,
 
 		MaxPayloadBytes:   262144,
 		MessageTTL:        14 * 24 * time.Hour,
@@ -144,9 +172,11 @@ func Defaults() Config {
 		MaxBlobBytes:               8388608,
 		BlobTTL:                    7 * 24 * time.Hour,
 		MaxConcurrentBlobTransfers: 8,
+		MaxBlobTransfersPerMailbox: 2,
+		BlobPaceBytes:              16 << 10,
 
 		MailboxMaxMessages:  10000,
-		MailboxMaxBytes:     128 << 20,
+		MailboxMaxBytes:     32 << 20,
 		MailboxMaxBlobBytes: 64 << 20,
 		MailboxMaxDenylist:  10000,
 
@@ -169,6 +199,11 @@ func Defaults() Config {
 		RateClaimBurst:     10,
 		RateWebPerSec:      2,
 		RateWebBurst:       20,
+
+		RateIPBytesPerSec:   256 << 10,
+		RateIPBytesBurst:    8 << 20,
+		RateBlobBytesPerSec: 1 << 20,
+		RateBlobBytesBurst:  64 << 20,
 
 		AndroidPackage:          DefaultAndroidPackage,
 		AndroidCertFingerprints: append([]string(nil), DefaultAndroidCertFingerprints...),
@@ -270,6 +305,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	str("RELAY_VALKEY_PREFIX", &c.ValkeyPrefix)
 	boolean("RELAY_TRUST_PROXY", &c.TrustProxy)
 	str("RELAY_LOG_LEVEL", &c.LogLevel)
+	f64("RELAY_LOG_INFO_RPS", &c.LogInfoPerSec)
+	integer("RELAY_LOG_INFO_BURST", &c.LogInfoBurst)
 
 	i64("RELAY_MAX_PAYLOAD_BYTES", &c.MaxPayloadBytes)
 	dur("RELAY_MESSAGE_TTL", &c.MessageTTL)
@@ -279,6 +316,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	i64("RELAY_MAX_BLOB_BYTES", &c.MaxBlobBytes)
 	dur("RELAY_BLOB_TTL", &c.BlobTTL)
 	integer("RELAY_MAX_CONCURRENT_BLOB_TRANSFERS", &c.MaxConcurrentBlobTransfers)
+	integer("RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX", &c.MaxBlobTransfersPerMailbox)
+	i64("RELAY_BLOB_PACE_BYTES", &c.BlobPaceBytes)
 
 	i64("RELAY_MAILBOX_MAX_MESSAGES", &c.MailboxMaxMessages)
 	i64("RELAY_MAILBOX_MAX_BYTES", &c.MailboxMaxBytes)
@@ -303,6 +342,10 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	integer("RELAY_RATE_CLAIM_GET_BURST", &c.RateClaimBurst)
 	f64("RELAY_RATE_WEB_RPS", &c.RateWebPerSec)
 	integer("RELAY_RATE_WEB_BURST", &c.RateWebBurst)
+	f64("RELAY_RATE_IP_BYTES_PER_SEC", &c.RateIPBytesPerSec)
+	integer("RELAY_RATE_IP_BYTES_BURST", &c.RateIPBytesBurst)
+	f64("RELAY_RATE_BLOB_BYTES_PER_SEC", &c.RateBlobBytesPerSec)
+	integer("RELAY_RATE_BLOB_BYTES_BURST", &c.RateBlobBytesBurst)
 
 	str("RELAY_ANDROID_PACKAGE", &c.AndroidPackage)
 	if v, ok := lookup("RELAY_ANDROID_CERT_SHA256"); ok {
@@ -392,13 +435,41 @@ func (c Config) Validate() error {
 		c.RateIPBurst <= 0 || c.RateKeyBurst <= 0 || c.RateRegisterBurst <= 0 || c.RateSenderBurst <= 0 || c.RateClaimBurst <= 0 || c.RateWebBurst <= 0 {
 		errs = append(errs, errors.New("concurrency, burst and cache limits must be > 0"))
 	}
+	// Byte budgets: the largest single request must fit in the burst, or
+	// it could never be served.
+	if c.RateIPBytesBurst <= 0 || c.LogInfoBurst <= 0 {
+		errs = append(errs, errors.New("RELAY_RATE_IP_BYTES_BURST and RELAY_LOG_INFO_BURST must be > 0"))
+	} else if int64(c.RateIPBytesBurst) < max(c.DepositBodyLimit(), c.MaxClaimBytes) {
+		errs = append(errs, fmt.Errorf("RELAY_RATE_IP_BYTES_BURST must be at least the largest deposit body (%d bytes for RELAY_MAX_PAYLOAD_BYTES) and RELAY_MAX_CLAIM_BYTES", c.DepositBodyLimit()))
+	}
+	if c.BlobsEnabled {
+		if c.RateBlobBytesBurst <= 0 || int64(c.RateBlobBytesBurst) < c.MaxBlobBytes {
+			errs = append(errs, errors.New("RELAY_RATE_BLOB_BYTES_BURST must be at least RELAY_MAX_BLOB_BYTES when blobs are enabled"))
+		}
+		if c.MaxBlobTransfersPerMailbox <= 0 || c.MaxBlobTransfersPerMailbox > c.MaxConcurrentBlobTransfers {
+			errs = append(errs, errors.New("0 < RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX <= RELAY_MAX_CONCURRENT_BLOB_TRANSFERS must hold"))
+		}
+		if c.BlobPaceBytes <= 0 {
+			errs = append(errs, errors.New("RELAY_BLOB_PACE_BYTES must be > 0 when blobs are enabled"))
+		}
+	}
+	// 0 is "no cap"; a cap below one message would refuse every deposit.
+	if c.MailboxMaxBytes > 0 && c.MailboxMaxBytes < c.MaxPayloadBytes {
+		errs = append(errs, errors.New("RELAY_MAILBOX_MAX_BYTES must be 0 (no cap) or at least RELAY_MAX_PAYLOAD_BYTES"))
+	}
 	if c.MaxWebSocketSessionsPerNetworkHard < c.MaxWebSocketSessionsPerNetwork || c.MaxWebSocketSessionsPerNetworkHard > c.MaxWebSocketSessions {
 		errs = append(errs, errors.New("RELAY_MAX_WS_SESSIONS_PER_NETWORK <= RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD <= RELAY_MAX_WS_SESSIONS must hold (set all three when lowering one)"))
 	}
 	// A zero rate would silently turn a limit into "never refills".
-	for _, r := range []float64{c.RateIPPerSec, c.RateKeyPerSec, c.RateRegisterPerSec, c.RateSenderPerSec, c.RateClaimPerSec, c.RateWebPerSec} {
+	for _, r := range []float64{c.RateIPPerSec, c.RateKeyPerSec, c.RateRegisterPerSec, c.RateSenderPerSec, c.RateClaimPerSec, c.RateWebPerSec, c.LogInfoPerSec} {
 		if !(r > 0) || r > 1e9 {
-			errs = append(errs, errors.New("every RELAY_RATE_*_RPS must be > 0"))
+			errs = append(errs, errors.New("every RELAY_RATE_*_RPS and RELAY_LOG_INFO_RPS must be > 0"))
+			break
+		}
+	}
+	for _, r := range []float64{c.RateIPBytesPerSec, c.RateBlobBytesPerSec} {
+		if !(r > 0) || r > 1e12 {
+			errs = append(errs, errors.New("every RELAY_RATE_*_BYTES_PER_SEC must be > 0"))
 			break
 		}
 	}

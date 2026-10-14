@@ -104,6 +104,13 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 				// collectors re-polling every 25 s.
 				level = slog.LevelDebug
 			}
+			if status == http.StatusTooManyRequests {
+				// Refusals (rate limits, quotas) are counted per minute
+				// (relay_ratelimit_refused_total, relay_errors_total and
+				// the "rate limits" line). A flood of them would otherwise
+				// be a flood of log lines, paid for by the relay.
+				level = slog.LevelDebug
+			}
 			s.log.LogAttrs(r.Context(), level, "request", attrs...)
 		}()
 		next.ServeHTTP(rec, r)
