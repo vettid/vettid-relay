@@ -19,8 +19,15 @@ import (
 // newUpload is an upload record for the slot accounting tests: started
 // now on the fixture's clock, with a cut that counts.
 func (f *fixture) newUpload(mailbox, sender string) *upload {
-	return &upload{mailbox: mailbox, sender: sender, network: "n", start: f.clk.now(), now: f.clk.now, cut: func() {}}
+	return f.newUploadFrom("n", mailbox, sender)
 }
+
+func (f *fixture) newUploadFrom(network, mailbox, sender string) *upload {
+	return &upload{mailbox: mailbox, sender: sender, network: network, start: f.clk.now(), now: f.clk.now, cut: func() {}}
+}
+
+// trickler is a client address of the tests (relayed in X-Forwarded-For).
+const trickler = "198.51.100.66"
 
 // rawBlobPutVia is rawBlobPut from the client address xff (the relay
 // trusts X-Forwarded-For in these tests).
@@ -71,6 +78,7 @@ func readAnswer(t *testing.T, c net.Conn) (*http.Response, errorBody) {
 func evictFixture(t *testing.T, mut func(*config.Config)) *fixture {
 	return newFixtureWith(t, func(c *config.Config) {
 		c.MaxConcurrentBlobTransfers, c.MaxBlobTransfersPerMailbox = 2, 1
+		c.TrustProxy = true // rawBlobPutVia gives each client its network
 		if mut != nil {
 			mut(c)
 		}
@@ -87,10 +95,10 @@ func TestTrickleEvictedByARealUpload(t *testing.T) {
 	f.register(a)
 	f.register(b)
 	c := dial(t, f)
-	rawBlobPut(t, f, c, a, s1, f.mint(a, s1, nil), make([]byte, 64<<10), 1000)
+	rawBlobPutVia(t, f, c, trickler, a, s1, make([]byte, 64<<10), 1000)
 	waitFor(t, func() bool { return f.s.xfers.inFlight() == 1 })
 	f.clk.add(31 * time.Second)
-	f.mustPutBlob(b, s2, f.mint(b, s2, nil), []byte("a real attachment"))
+	f.mustPutBlob(b, s2, f.mint(b, s2, nil), []byte("a real attachment")) // from another network
 	resp, e := readAnswer(t, c)
 	if resp.StatusCode != 429 || e.Code != CodeRateLimited || e.RetryAfter != 2 || !resp.Close {
 		t.Fatalf("evicted upload: %d %+v close=%v", resp.StatusCode, e, resp.Close)
@@ -99,15 +107,15 @@ func TestTrickleEvictedByARealUpload(t *testing.T) {
 		t.Fatalf("evictions counted: %d", n)
 	}
 	waitFor(t, f.s.xfers.empty)
-	// Charged: the 1,000 bytes the trickle sent and the 17 stored; the
-	// rest of its declared 64 KiB was given back (once its handler ends).
-	key := rateKey(netip.MustParseAddr("127.0.0.1"))
+	// Charged to its network: the 1,000 bytes the trickle sent; the rest
+	// of its declared 64 KiB was given back (once its handler ends).
+	key := rateKey(netip.MustParseAddr(trickler))
 	waitFor(t, func() bool {
 		f.s.rl.mu.Lock()
 		defer f.s.rl.mu.Unlock()
-		return f.s.rl.count[limBlobBytes][key] == 1017
+		return f.s.rl.count[limBlobBytes][key] == 1000
 	})
-	if ok, _ := f.s.blobByteLimit.AllowN(key, 1<<20-1017, f.clk.now()); !ok {
+	if ok, _ := f.s.blobByteLimit.AllowN(key, 1<<20-1000, f.clk.now()); !ok {
 		t.Fatal("the unsent part of the evicted upload was not given back")
 	}
 	if ok, _ := f.s.blobByteLimit.AllowN(key, 1, f.clk.now()); ok {
@@ -124,7 +132,7 @@ func TestNoEvictionUnderMinAge(t *testing.T) {
 	f.register(a)
 	f.register(b)
 	c := dial(t, f)
-	rawBlobPut(t, f, c, a, s1, f.mint(a, s1, nil), make([]byte, 64<<10), 1000)
+	rawBlobPutVia(t, f, c, trickler, a, s1, make([]byte, 64<<10), 1000)
 	waitFor(t, func() bool { return f.s.xfers.inFlight() == 1 })
 	f.clk.add(29 * time.Second)
 	f.expectCode(req{method: "PUT", path: "/v1/blob/" + b.mbx, body: []byte("x"), signer: &s2, token: f.mint(b, s2, nil)}, 429, CodeRateLimited)
@@ -143,16 +151,18 @@ func TestNoEvictionUnderMinAge(t *testing.T) {
 // is not cut off ahead of a slower one, and a full mailbox gives up only
 // its own uploads.
 func TestSlowestUploadEvictedFirst(t *testing.T) {
-	f := newFixtureWith(t, func(c *config.Config) { c.MaxConcurrentBlobTransfers, c.MaxBlobTransfersPerMailbox = 3, 1 }, // 2 uploads
-		func(*fixture) []Option { return []Option{WithBlobPaceWindow(5 * time.Second)} })
+	f := newFixtureWith(t, func(c *config.Config) {
+		c.MaxConcurrentBlobTransfers, c.MaxBlobTransfersPerMailbox = 3, 1 // 2 uploads
+		c.TrustProxy = true
+	}, func(*fixture) []Option { return []Option{WithBlobPaceWindow(5 * time.Second)} })
 	a, b, c3 := newPrincipal(1), newPrincipal(2), newPrincipal(3)
 	s1, s2, s3 := newPrincipal(11), newPrincipal(12), newPrincipal(13)
 	for _, p := range []principal{a, b, c3} {
 		f.register(p)
 	}
 	fast, slow := dial(t, f), dial(t, f)
-	rawBlobPut(t, f, fast, a, s1, f.mint(a, s1, nil), make([]byte, 64<<10), 30_000)
-	rawBlobPut(t, f, slow, b, s2, f.mint(b, s2, nil), make([]byte, 64<<10), 1000)
+	rawBlobPutVia(t, f, fast, "198.51.100.7", a, s1, make([]byte, 64<<10), 30_000)
+	rawBlobPutVia(t, f, slow, "198.51.100.8", b, s2, make([]byte, 64<<10), 1000)
 	waitFor(t, func() bool { return f.s.xfers.inFlight() == 2 })
 	f.clk.add(31 * time.Second)
 	// Within the measuring window, the fast one keeps sending.
@@ -184,7 +194,7 @@ func TestEvictionAccountingConcurrent(t *testing.T) {
 	var cuts atomic.Int64
 	rels := make([]func(), 4)
 	for i := range rels {
-		u := f.newUpload(string(rune('a'+i)), "x")
+		u := f.newUploadFrom("old", string(rune('a'+i)), "x")
 		u.cut = func() { cuts.Add(1) }
 		u.add(i)
 		r, e := s.acquireUpload(u)
@@ -200,7 +210,7 @@ func TestEvictionAccountingConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			u := f.newUpload("n", string(rune('A'+i)))
+			u := f.newUploadFrom("new", "n", string(rune('A'+i)))
 			u.cut = func() { cuts.Add(1) }
 			if r, e := s.acquireUpload(u); e == nil {
 				admitted.Add(1)
@@ -243,7 +253,7 @@ func TestEvictionRacesCompletion(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); finished.Store(old.state.CompareAndSwap(upReading, upDone)) }()
-		go func() { defer wg.Done(); relNew, _ = s.acquireUpload(f.newUpload("b", "y")) }()
+		go func() { defer wg.Done(); relNew, _ = s.acquireUpload(f.newUploadFrom("m", "b", "y")) }()
 		wg.Wait()
 		switch {
 		case finished.Load() && relNew != nil:
@@ -317,7 +327,7 @@ func TestBurstThenTrickleEvictedBeforeSteady(t *testing.T) {
 	rawBlobPutVia(t, f, burst, "198.51.100.7", a, newPrincipal(21), data, 60_000)
 	rawBlobPutVia(t, f, steady, "203.0.113.50", b, newPrincipal(22), data, 1000)
 	waitFor(t, func() bool { return f.s.xfers.inFlight() == 2 })
-	waitFor(t, func() bool { u := f.uploadOf(a.mbx); return u != nil && u.rate(f.clk.now()) >= 60_000 })
+	waitFor(t, func() bool { u := f.uploadOf(a.mbx); return u != nil && u.rate(f.clk.now()) >= 60_000/5 }) // measured over at least 5 s
 	f.clk.add(31 * time.Second)
 	if _, err := steady.Write(make([]byte, 5000)); err != nil { // steady keeps sending; burst has stopped
 		t.Fatal(err)
@@ -329,5 +339,101 @@ func TestBurstThenTrickleEvictedBeforeSteady(t *testing.T) {
 	}
 	if f.uploadOf(b.mbx) == nil {
 		t.Fatal("the steady upload was cut off")
+	}
+}
+
+// Every upload is protected for its first seconds, whatever its network:
+// newcomers from two busy networks (vault hosts) do not cut each other
+// off before they get going, and a network never cuts off its own.
+func TestBusyNetworksNewcomersComplete(t *testing.T) {
+	f := newFixtureWith(t, func(c *config.Config) {
+		c.MaxConcurrentBlobTransfers, c.MaxBlobTransfersPerMailbox = 3, 1 // 2 uploads
+		c.TrustProxy = true
+	}, func(*fixture) []Option { return []Option{WithBlobPaceWindow(5 * time.Second)} })
+	const hostX, hostY = "198.51.100.10", "198.51.100.20"
+	var mb []principal
+	for i := 0; i < 6; i++ {
+		mb = append(mb, newPrincipal(byte(1+i)))
+		f.register(mb[i])
+	}
+	big := make([]byte, 64<<10)
+	ox, oy := dial(t, f), dial(t, f) // both networks busy for 40 s
+	rawBlobPutVia(t, f, ox, hostX, mb[0], newPrincipal(31), big, 1000)
+	rawBlobPutVia(t, f, oy, hostY, mb[1], newPrincipal(32), big, 1000)
+	waitFor(t, func() bool { return f.s.xfers.inFlight() == 2 })
+	f.clk.add(40 * time.Second)
+	body := bytes.Repeat([]byte("n"), 40_000)
+	// A newcomer from X cuts off Y's old upload (a network never cuts off
+	// its own); one from Y then cuts off X's old one.
+	n1, n2 := dial(t, f), dial(t, f)
+	rawBlobPutVia(t, f, n1, hostX, mb[2], newPrincipal(33), body, 20_000)
+	if resp, _ := readAnswer(t, oy); resp.StatusCode != 429 {
+		t.Fatalf("Y's old upload: %d", resp.StatusCode)
+	}
+	rawBlobPutVia(t, f, n2, hostY, mb[3], newPrincipal(34), body, 20_000)
+	if resp, _ := readAnswer(t, ox); resp.StatusCode != 429 {
+		t.Fatalf("X's old upload: %d", resp.StatusCode)
+	}
+	// Further newcomers from either find only uploads under 5 s old: they
+	// are refused, and cut off nobody.
+	f.clk.add(2 * time.Second)
+	for i, host := range []string{hostX, hostY} {
+		c := dial(t, f)
+		rawBlobPutVia(t, f, c, host, mb[4+i], newPrincipal(byte(35+i)), body, 20_000)
+		if resp, _ := readAnswer(t, c); resp.StatusCode != 429 {
+			t.Fatalf("a newcomer while both are young: %d", resp.StatusCode)
+		}
+	}
+	// The protected newcomers complete.
+	for _, c := range []net.Conn{n1, n2} {
+		if _, err := c.Write(body[20_000:]); err != nil {
+			t.Fatal(err)
+		}
+		if resp, _ := readAnswer(t, c); resp.StatusCode != 201 {
+			t.Fatalf("a protected newcomer: %d", resp.StatusCode)
+		}
+	}
+	if n := f.counter(`relay_ratelimit_refused_total{limiter="blob_evicted"}`); n != 2 {
+		t.Fatalf("evictions: %d", n)
+	}
+}
+
+// A network keeps its clock when it gives up its last slot and comes back
+// within RELAY_BLOB_EVICT_MIN_AGE: aborting at 29 s and reconnecting does
+// not make its uploads young again.
+func TestReconnectKeepsTheNetworkClock(t *testing.T) {
+	f := evictFixture(t, nil)
+	a, b, c := newPrincipal(1), newPrincipal(2), newPrincipal(3)
+	for _, p := range []principal{a, b, c} {
+		f.register(p)
+	}
+	big := make([]byte, 64<<10)
+	u1 := dial(t, f)
+	rawBlobPutVia(t, f, u1, trickler, a, newPrincipal(21), big, 1000)
+	waitFor(t, func() bool { return f.s.xfers.inFlight() == 1 })
+	f.clk.add(29 * time.Second)
+	u1.Close()
+	waitFor(t, f.s.xfers.empty)
+	u2 := dial(t, f)
+	rawBlobPutVia(t, f, u2, trickler, b, newPrincipal(22), big, 1000)
+	waitFor(t, func() bool { return f.s.xfers.inFlight() == 1 })
+	f.clk.add(6 * time.Second) // u2 is 6 s old; its network's clock says 35 s
+	f.mustPutBlob(c, newPrincipal(23), f.mint(c, newPrincipal(23), nil), []byte("honest"))
+	if resp, _ := readAnswer(t, u2); resp.StatusCode != 429 {
+		t.Fatalf("the reconnected upload: %d", resp.StatusCode)
+	}
+}
+
+// The eviction clock is kept per IPv4 address or IPv6 /48.
+func TestEvictionNetwork(t *testing.T) {
+	x, y := evictionNetwork(netip.MustParseAddr("2001:db8:1:1::1")), evictionNetwork(netip.MustParseAddr("2001:db8:1:ffff::2"))
+	if x != y || x != "2001:db8:1::/48" {
+		t.Fatalf("%s %s", x, y)
+	}
+	if evictionNetwork(netip.MustParseAddr("2001:db8:2::1")) == x {
+		t.Fatal("another /48")
+	}
+	if n := evictionNetwork(netip.MustParseAddr("203.0.113.9")); n != "203.0.113.9" {
+		t.Fatal(n)
 	}
 }

@@ -775,7 +775,7 @@ a network: the per-process and per-key limits.)
 | 10 | WebSocket window | session | 128 messages | to messages sent on a session and not yet acked there: the relay leases a further batch (32) only while it fits, so it pauses at 97 or more outstanding, until acks arrive or leases end |
 | 11 | stored bytes | authenticated key, and network as a ceiling; per relay process | per key 64 KiB/s, burst 2 MiB; per network 1 MiB/s, burst 32 MiB | charged in bytes. Deposits: the key is the sender's, the token's `sub` (an open token's signer), which the request signature proves only after the body (§5.3 step 7); so after step 6 and **before the body is read**, the network's ceiling is charged with the declared body length (without a `Content-Length`, the largest deposit body) and the key's budget is only checked (an empty one is refused, and the deposit is not read); once the signature has verified, the key's budget is charged with the body's length, unconditionally (it may go into debt). Claim creation (§6.9): the key is the claim's creator, the mailbox owner whose signature verified; key and network are charged together with the claim's length (refused by either, charged to neither). A deposit or claim that is then not stored (quota, signature, malformed body, store failure) is refunded. `429` with `retry_after` |
 | 12 | blob bytes | authenticated key, and network as a ceiling; per relay process | per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst 256 MiB | charged in bytes. Blob uploads: the key is the token's `sub`, which the mailbox owner wrote and the request signature proves only after the body (§5.3 step 7); so after §5.3 steps 1–6 and before the body is read, the network's ceiling is charged with the declared length (without one, the largest blob) and the key's budget is only checked (an empty one is refused unread); once the signature has verified the key's budget is charged with the bytes received, unconditionally (it may go into debt). Blob downloads: after the owner's signature verified, the owner's key and the network's ceiling are charged together with the blob's size, at most a key's burst (refused by either, charged to neither). An upload that stores nothing is refunded only the part of its network charge it never sent: the bytes that reached the relay stay charged whatever refused it (body failure, signature, quota, store failure); an upload refused a transfer slot (13), which held none, is refunded entirely. A download by an owner whose budget, or whose network's, is empty is refused before the store is read. `429` with `retry_after` |
-| 13 | blob transfers | relay process; mailbox; sender and mailbox | 8 per process; per mailbox 2 uploads and, apart, 2 downloads; 1 upload per sender key and mailbox; uploads at most 8 − 2 = 6 per process | to blob uploads once their body has begun to arrive (an upload that has sent nothing holds no slot), and to blob downloads; the mailbox is the recipient's for an upload and the owner's for a download. Uploads never take a mailbox's download slots nor the 2 process slots kept for downloads. `429` with `retry_after` 2. A transfer's body must move at least 16 KiB in every 5 s and finish within 5 minutes, or the transfer is dropped (an upload is answered `400` with `Connection: close`): an upload that trickles at the minimum pace holds its slot up to 5 minutes unless it is cut off for a new upload (0.9.1). When a new upload finds no upload slot free (in the process, or in its mailbox), one in-progress upload is cut off and the new upload takes its slot. It is chosen among the uploads still reading their body (to that mailbox, if the mailbox is full) that are *evictable*: that have run at least 30 s, or whose client network has held at least one upload slot on the process without a break for at least 30 s. Of those, the one that received the fewest bytes per second over the last 10 s (over its life, at least 1 s, if younger) goes. A sender's own upload to a mailbox is never cut off for its next upload to that mailbox. The cut-off upload is answered `429` with `retry_after` 2 and `Connection: close`, and the bytes it sent stay charged (12). If none is evictable, the new upload is refused as above |
+| 13 | blob transfers | relay process; mailbox; sender and mailbox | 8 per process; per mailbox 2 uploads and, apart, 2 downloads; 1 upload per sender key and mailbox; uploads at most 8 − 2 = 6 per process | to blob uploads once their body has begun to arrive (an upload that has sent nothing holds no slot), and to blob downloads; the mailbox is the recipient's for an upload and the owner's for a download. Uploads never take a mailbox's download slots nor the 2 process slots kept for downloads. `429` with `retry_after` 2. A transfer's body must move at least 16 KiB in every 5 s and finish within 5 minutes, or the transfer is dropped (an upload is answered `400` with `Connection: close`): an upload that trickles at the minimum pace holds its slot up to 5 minutes unless it is cut off for a new upload (0.9.1). When a new upload finds no upload slot free (in the process, or in its mailbox), one in-progress upload is cut off and the new upload takes its slot. It is chosen among the uploads still reading their body (to that mailbox, if the mailbox is full) that are *evictable*: that have run at least 5 s (one pace window), come from another network than the new upload's, and have run at least 30 s or come from a network that has held upload slots on the process for at least 30 s. "Network" here is the IPv4 address or the IPv6 /48, and its 30 s run on across gaps shorter than 30 s with no slot. Of those, the one that received the fewest bytes per second over the last 10 s (over its age, at least 5 s, if younger) goes; of nearly equal speeds (within 10% or 1 KiB/s), the one whose network holds the most upload slots. A sender's own upload to a mailbox is never cut off for its next upload to that mailbox. The cut-off upload is answered `429` with `retry_after` 2 and `Connection: close`, and the bytes it sent stay charged (12). If none is evictable, the new upload is refused as above |
 
 Nothing else is keyed on a network. A request that is properly signed by a
 key with a mailbox can be refused on account of its network only by the
@@ -906,12 +906,17 @@ does the same on its own mailbox.
   no slot, and one that stalls part-way holds it for 5 s; one that keeps
   the minimum pace holds it up to the 5-minute maximum, or (0.9.1) until a
   new upload finds no slot free and it is the slowest evictable upload.
-  30 s gives an upload from a network that is not already uploading time
-  to show its speed. The clock is also kept per network (how long it has
-  held a slot without a break), so an address cannot reset it by
-  replacing old uploads with new ones. Speed is measured over the last
-  10 s, so a burst followed by a trickle is judged on the trickle. There
-  is no limit on uploads per address: a vault host's vaults upload for
+  Every upload is protected for its first 5 s, one pace window, by the
+  end of which it has had to send 16 KiB or be dropped: newcomers from
+  busy networks (vault hosts) then cannot cut each other off before they
+  get going. A network never cuts off its own uploads, so an address
+  cannot renew its uploads without first giving a slot up. 30 s gives an
+  upload from a network that is not already uploading time to show its
+  speed. The 30 s clock is kept per network, across gaps under 30 s, and
+  per IPv6 /48 rather than /64, so replacing uploads, reconnecting or
+  switching /64s does not reset it. Speed is measured over the last 10 s,
+  so a burst followed by a trickle is judged on the trickle. There is no
+  limit on uploads per address: a vault host's vaults upload for
   hundreds of members.
 - *Refunds.* The byte budgets bound what is stored, so a deposit or
   claim that stores nothing is given its charge back: a vault host's
@@ -999,32 +1004,40 @@ sender's budget, and an unauthorized deposit's body is not read.
 - **Mailboxes never expire.** One address can create 86,400 a day (3);
   each is small, but their number only grows (see "Later").
 - **Upload slots are shared by all networks on a process.** What holds
-  (13):
-  - One network keeps newcomers out for at most 30 s. From the moment it
-    has held an upload slot without a break for 30 s, every upload of
-    it is evictable, however young: replacing its uploads does not reset
-    that clock, and only giving up all its slots does.
+  (13; "network" is the IPv4 address or the IPv6 /48):
+  - A network holding upload slots keeps newcomers from other networks
+    out until it has held slots for 30 s. Gaps under 30 s with no slot
+    do not reset that clock, so aborting and reconnecting does not help.
+    Once the clock has run, every upload of the network older than 5 s is
+    evictable.
   - After that, to keep a slot it must keep that upload faster, over the
     last 10 s, than an evictable upload of someone else. It pays for every
-    byte from its network's ceiling (12; sender keys are free, so the
-    key budgets do not bind it): 8 MiB/s per process, about 1.3 MiB/s
-    for each of the 6 upload slots, faster than most uploads from phones.
+    byte from its network's ceiling (12; sender keys are free, so the key
+    budgets do not bind it): 8 MiB/s per process, about 1.3 MiB/s for
+    each of the 6 upload slots, faster than most uploads from phones.
     Holding them that way spends its whole ceiling (about 0.7 TB a day
     per process), shows in `blob_bytes_busiest_per_min`, and throttles
     anything honest behind the same address.
+  - It cannot renew a slow upload in place: a network never cuts off its
+    own, so a replacement needs a free slot, and a newcomer from another
+    network that arrives as the slot is given up takes it.
 
   What does not hold:
-  - Several networks can take turns. A network that gives up its last
-    slot starts afresh, so an attacker holding many networks (a larger
-    IPv6 prefix holds thousands) can pass the slots from one to the next
-    before any reaches 30 s. Newcomers are then refused as before 0.9.1,
-    except when they arrive just as a slot is handed over.
+  - Networks can take turns. A network's clock resets after 30 s with no
+    slot, so each slot can be kept by two networks alternating, each
+    holding it for up to 30 s and then resting 30 s: about 12 IPv4
+    addresses or IPv6 /48s for the 6 upload slots of a process. Newcomers
+    are then refused as before 0.9.1, except when they arrive just as a
+    slot is handed over.
+  - An upload is protected for its first 5 s. An address that replaces
+    its uploads more often than that keeps them protected, but must give
+    each slot up to replace it (see above).
   - Several fast addresses together can keep slower honest uploads out
     or cut them off.
-  - An honest upload that has run 30 s, or that comes from a network
-    that keeps uploading (a vault host), can be cut off for a newcomer
-    when it is the slowest. Its sender loses the work and retries,
-    perhaps cutting off the next slowest.
+  - An honest upload older than 5 s whose network has been uploading for
+    30 s (a vault host), or any upload older than 30 s, can be cut off for
+    a newcomer from another network when it is the slowest. Its sender
+    loses the work and retries.
 
   No limit is placed on uploads per address: vault hosts upload for
   hundreds of members. Uploads alone cannot keep owners from their
@@ -1361,9 +1374,11 @@ The push gateway API is specified separately.
 
 - **0.9.1 (proposed)** — an upload that finds no transfer slot free cuts
   off the slowest evictable upload and takes its slot (§7.2, limit 13).
-  Evictable means it has run at least 30 s, or its network has held an
-  upload slot without a break for 30 s. Slowest means the fewest bytes
-  received over the last 10 s. The cut-off upload is
+  Evictable means: older than 5 s, from another network (IPv4 address or
+  IPv6 /48), and older than 30 s or from a network that has held upload
+  slots for 30 s (gaps under 30 s not counting). Slowest means the fewest
+  bytes received over the last 10 s; of nearly equal speeds, from the
+  network holding the most slots. The cut-off upload is
   answered `429` with `retry_after` 2 and `Connection: close`; its sent
   bytes stay charged. No per-address upload limit. New counter
   `blob_evicted` and configuration variable `RELAY_BLOB_EVICT_MIN_AGE`.

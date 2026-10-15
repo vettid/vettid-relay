@@ -7,11 +7,13 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/ratelimit"
 	"github.com/vettid/vettid-relay/internal/store"
 	auth "github.com/vettid/vettid-relay/relayauth"
@@ -51,13 +53,14 @@ type blobTransfers struct {
 	downMbx  map[string]int // downloads, by owner mailbox
 	upSender map[string]int // uploads, by recipient mailbox and sender key
 	uploads  map[*upload]struct{}
-	netUp    map[string]int       // uploads, by client network
-	netSince map[string]time.Time // since when each network has held an upload slot without a break
+	netUp    map[string]int       // uploads, by eviction network (evictionNetwork)
+	netSince map[string]time.Time // since when each has held an upload slot (gaps under the minimum age not counted)
+	netLeft  map[string]time.Time // when each last gave up its last upload slot
 }
 
 func newBlobTransfers() *blobTransfers {
 	return &blobTransfers{upMbx: map[string]int{}, downMbx: map[string]int{}, upSender: map[string]int{}, uploads: map[*upload]struct{}{},
-		netUp: map[string]int{}, netSince: map[string]time.Time{}}
+		netUp: map[string]int{}, netSince: map[string]time.Time{}, netLeft: map[string]time.Time{}}
 }
 
 func (b *blobTransfers) inFlight() int {
@@ -69,7 +72,7 @@ func (b *blobTransfers) inFlight() int {
 func (b *blobTransfers) empty() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.up+b.down == 0 && len(b.upMbx)+len(b.downMbx)+len(b.upSender)+len(b.uploads)+len(b.netUp)+len(b.netSince) == 0
+	return b.up+b.down == 0 && len(b.upMbx)+len(b.downMbx)+len(b.upSender)+len(b.uploads)+len(b.netUp) == 0
 }
 
 func decr(m map[string]int, k string) {
@@ -101,6 +104,29 @@ const (
 // received in the last rateWindow seconds (an upload that bursts and then
 // trickles is judged on the trickle).
 const rateWindow = 10
+
+// evictGrace protects every upload, whatever its network, for its first
+// seconds: one pace window (config.BlobPaceWindow), by the end of which it
+// has had to send cfg.BlobPaceBytes or be dropped, so it has a speed to
+// be judged on. Without it, newcomers from busy networks (vault hosts)
+// would cut each other off before any got going.
+const evictGrace = config.BlobPaceWindow
+
+// evictionNetwork is what the eviction clock is kept for: the IPv4
+// address, or the IPv6 /48 (wider than the /64 of the per-network limits,
+// so that whoever holds a larger prefix cannot take turns with its /64s).
+func evictionNetwork(a netip.Addr) string {
+	if a.Is6() && !a.Is4In6() {
+		p, _ := a.Prefix(48)
+		return p.String()
+	}
+	return rateKey(a)
+}
+
+// nearlyEqual is how close two speeds are to count as the same when the
+// victim is chosen: then the upload of the network holding the most
+// upload slots goes.
+func nearlyEqual(a, b float64) bool { return math.Abs(a-b) <= max(0.1*min(a, b), 1024) }
 
 // upload is one blob upload, from the moment its body begins to be read.
 type upload struct {
@@ -135,7 +161,7 @@ func (u *upload) add(n int) {
 }
 
 // rate is u's bytes received per second over the last rateWindow seconds
-// (over its whole life, at least one second, if it is younger).
+// (over its actual age, at least evictGrace, if it is younger).
 func (u *upload) rate(now time.Time) float64 {
 	sec := now.Unix()
 	var n int64
@@ -146,7 +172,7 @@ func (u *upload) rate(now time.Time) float64 {
 		}
 	}
 	u.mu.Unlock()
-	span := min(max(now.Sub(u.start).Seconds(), 1), rateWindow)
+	span := min(max(now.Sub(u.start).Seconds(), evictGrace.Seconds()), rateWindow)
 	return float64(n) / span
 }
 
@@ -162,34 +188,77 @@ func (b *blobTransfers) removeLocked(u *upload) {
 	delete(b.uploads, u)
 	if b.netUp[u.network]--; b.netUp[u.network] <= 0 {
 		delete(b.netUp, u.network)
-		delete(b.netSince, u.network)
+		b.netLeft[u.network] = u.now() // its clock is kept: see takeNetLocked
 	}
 }
 
-// evictableLocked reports whether u may be cut off now: it has run
-// cfg.BlobEvictMinAge, or its network has held at least one upload slot
-// without a break for that long. Tying it to the network's occupancy means
-// an address cannot keep slots by replacing old uploads with new ones.
-func (s *Server) evictableLocked(u *upload, now time.Time) bool {
-	age := s.cfg.BlobEvictMinAge
-	return now.Sub(u.start) >= age || now.Sub(s.xfers.netSince[u.network]) >= age
+// takeNetLocked records that u's network takes an upload slot. A network
+// that comes back within cfg.BlobEvictMinAge of giving up its last slot
+// keeps its clock: aborting and reconnecting does not reset it. Clocks of
+// networks gone longer are dropped.
+func (s *Server) takeNetLocked(u *upload, now time.Time) {
+	b := s.xfers
+	if b.netUp[u.network]++; b.netUp[u.network] > 1 {
+		return
+	}
+	if left, ok := b.netLeft[u.network]; !ok || now.Sub(left) >= s.cfg.BlobEvictMinAge {
+		b.netSince[u.network] = now
+	}
+	delete(b.netLeft, u.network)
+	if len(b.netLeft) > 256 {
+		for n, left := range b.netLeft {
+			if now.Sub(left) >= s.cfg.BlobEvictMinAge {
+				delete(b.netLeft, n)
+				delete(b.netSince, n)
+			}
+		}
+	}
 }
 
-// victimLocked is the upload to cut off for a newcomer to mailbox when the
-// mailbox (inMailbox) or the process has no upload slot free: the slowest,
-// by bytes received in the last rateWindow seconds, of the evictable
-// uploads still reading their body (uploads to mailbox, if the mailbox is
-// full). Nil if none qualifies.
-func (s *Server) victimLocked(mailbox string, inMailbox bool) *upload {
+// evictableLocked reports whether u may be cut off now for a newcomer
+// from network: u has run evictGrace, comes from another network, and has
+// run cfg.BlobEvictMinAge or its network has held upload slots that long
+// (gaps shorter than that not counting). Tying it to the network means an
+// address cannot keep slots by replacing old uploads with new ones; not
+// letting a network cut off its own means it cannot replace them without
+// first giving a slot up.
+func (s *Server) evictableLocked(u *upload, network string, now time.Time) bool {
+	age, minAge := now.Sub(u.start), s.cfg.BlobEvictMinAge
+	return age >= evictGrace && u.network != network &&
+		(age >= minAge || now.Sub(s.xfers.netSince[u.network]) >= minAge)
+}
+
+// victimLocked is the upload to cut off for newcomer when its mailbox
+// (inMailbox) or the process has no upload slot free: the slowest, by
+// bytes received in the last rateWindow seconds, of the evictable uploads
+// still reading their body (uploads to that mailbox, if it is full); of
+// nearly equal speeds, the one whose network holds the most upload slots.
+// Nil if none qualifies.
+func (s *Server) victimLocked(newcomer *upload, inMailbox bool) *upload {
 	now := s.now()
-	var victim *upload
+	type cand struct {
+		u    *upload
+		rate float64
+	}
+	var cands []cand
 	slowest := math.Inf(1)
 	for u := range s.xfers.uploads {
-		if (inMailbox && u.mailbox != mailbox) || u.state.Load() != upReading || !s.evictableLocked(u, now) {
+		if (inMailbox && u.mailbox != newcomer.mailbox) || u.state.Load() != upReading || !s.evictableLocked(u, newcomer.network, now) {
 			continue
 		}
-		if r := u.rate(now); victim == nil || r < slowest {
-			victim, slowest = u, r
+		r := u.rate(now)
+		cands = append(cands, cand{u, r})
+		slowest = min(slowest, r)
+	}
+	var victim *upload
+	var vr float64
+	for _, c := range cands {
+		if !nearlyEqual(c.rate, slowest) {
+			continue
+		}
+		if victim == nil || s.xfers.netUp[c.u.network] > s.xfers.netUp[victim.network] ||
+			(s.xfers.netUp[c.u.network] == s.xfers.netUp[victim.network] && c.rate < vr) {
+			victim, vr = c.u, c.rate
 		}
 	}
 	return victim
@@ -212,7 +281,7 @@ func (s *Server) acquireUpload(u *upload) (release func(), e *apiError) {
 	mailboxFull := b.upMbx[u.mailbox] >= per
 	if mailboxFull || b.up >= all-per || b.up+b.down >= all {
 		for {
-			v := s.victimLocked(u.mailbox, mailboxFull)
+			v := s.victimLocked(u, mailboxFull)
 			if v == nil {
 				if mailboxFull {
 					return nil, s.slotBusy(limBlobMailboxSlots)
@@ -232,9 +301,7 @@ func (s *Server) acquireUpload(u *upload) (release func(), e *apiError) {
 	b.upMbx[u.mailbox]++
 	b.upSender[ks]++
 	b.uploads[u] = struct{}{}
-	if b.netUp[u.network]++; b.netUp[u.network] == 1 {
-		b.netSince[u.network] = s.now()
-	}
+	s.takeNetLocked(u, s.now())
 	return func() {
 		b.mu.Lock()
 		defer b.mu.Unlock()
@@ -423,7 +490,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// limit+1 bytes, so at most limit bytes are ever buffered. The body
 	// must keep its pace from the start.
 	rc := http.NewResponseController(w)
-	up := &upload{mailbox: mailboxID, sender: da.claims.Sub, network: network, start: s.now(), now: s.now,
+	up := &upload{mailbox: mailboxID, sender: da.claims.Sub, network: evictionNetwork(clientIP(r, s.cfg.TrustProxy)), start: s.now(), now: s.now,
 		cut: func() { rc.SetReadDeadline(time.Unix(1, 0)) }}
 	body := newPacedBody(http.MaxBytesReader(w, r.Body, limit), rc, s.cfg.BlobPaceBytes, s.blobPaceWindow)
 	body.u = up
