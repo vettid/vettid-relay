@@ -419,7 +419,7 @@ func TestResourceLimitsReport(t *testing.T) {
 	f.s.reportLimits()
 	line := lastLine(t, logs.String(), `"msg":"rate limits"`)
 	dep := len(depositBody([]byte("hello")))
-	want := fmt.Sprintf(`"ws_sessions_refused":0,"ws_network_refused":0,"ws_network_hard_refused":0,"bytes_peak":0,"bytes_refused":0,"bytes_busiest_per_min":%d,"blob_bytes_peak":0,"blob_bytes_refused":0,"blob_bytes_busiest_per_min":700,"blob_key_bytes_peak":0,"blob_key_bytes_refused":0,"blob_key_bytes_busiest_per_min":700,"blob_slots_refused":0,"blob_mailbox_slots_refused":0,"blob_sender_slots_refused":0}`, dep)
+	want := fmt.Sprintf(`"ws_sessions_refused":0,"ws_network_refused":0,"ws_network_hard_refused":0,"bytes_peak":0,"bytes_refused":0,"bytes_busiest_per_min":%d,"blob_bytes_peak":0,"blob_bytes_refused":0,"blob_bytes_busiest_per_min":700,"blob_key_bytes_peak":0,"blob_key_bytes_refused":0,"blob_key_bytes_busiest_per_min":700,"key_bytes_peak":0,"key_bytes_refused":0,"key_bytes_busiest_per_min":%d,"blob_slots_refused":0,"blob_mailbox_slots_refused":0,"blob_sender_slots_refused":0}`, dep, dep)
 	if !strings.Contains(line, want) {
 		t.Fatalf("rate limits line:\n%s\nwant it to end with\n%s", line, want)
 	}
@@ -719,4 +719,54 @@ func TestBlobKeyDebtRetryAfter(t *testing.T) {
 	if e := f.expectFrom(hostA, up, 429, CodeRateLimited); e.RetryAfter != 6 {
 		t.Fatalf("retry_after %d, want 6 (501 bytes at 100 a second)", e.RetryAfter)
 	}
+}
+
+// The deposit and claim byte budget is per key (the depositor's, once its
+// signature verified; a claim's creator), with a ceiling per network:
+// vaults behind one address each have their own budget, the address as a
+// whole the ceiling. A key is charged after the fact (it may go into
+// debt), and looked at before the body: an empty one is refused unread.
+func TestDepositKeyBudget(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		c.RateKeyBytesPerSec, c.RateKeyBytesBurst = 0.001, 3000
+		c.RateIPBytesPerSec, c.RateIPBytesBurst = 0.001, 6000
+	})
+	owner, s1, s2, s3 := newPrincipal(1), newPrincipal(11), newPrincipal(12), newPrincipal(13)
+	f.register(owner)
+	dep := func(sender principal) req {
+		return depositReq(owner, sender, f.mint(owner, sender, nil), strings.Repeat("x", 1000)) // a body of 1,349 bytes
+	}
+	f.expectFrom(hostA, dep(s1), 201, "")
+	f.expectFrom(hostA, dep(s1), 201, "")
+	f.expectFrom(hostA, dep(s1), 201, "")              // 302 left: let through, charged into debt
+	f.expectFrom(hostA, dep(s1), 429, CodeRateLimited) // s1's key is in debt: refused unread
+	f.expectFrom(hostA, dep(s2), 201, "")              // another vault behind the same address: 5,396 of the network's 6,000
+	f.expectFrom(hostA, dep(s2), 429, CodeRateLimited) // the network's ceiling
+	f.expectFrom(hostB, dep(s3), 201, "")              // another network
+	if k, n := f.counter(`relay_ratelimit_refused_total{limiter="key_bytes"}`), f.counter(`relay_ratelimit_refused_total{limiter="bytes"}`); k != 1 || n != 1 {
+		t.Fatalf("refused: %d by the key budget, %d by the network ceiling", k, n)
+	}
+	// Claims are charged to their creator's key.
+	f.expectFrom(hostB, req{method: "PUT", path: "/v1/claim", body: make([]byte, 2000), signer: &owner}, 201, "")
+	f.expectFrom(hostB, req{method: "PUT", path: "/v1/claim", body: make([]byte, 2000), signer: &owner}, 429, CodeRateLimited)
+}
+
+// The token's sub is written by the mailbox owner: a deposit is charged
+// to its sender's key only once the signature has proved it, so tokens
+// naming another's key cannot drain that key's deposit budget.
+func TestForgedSubCannotDrainADepositBudget(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) { c.RateKeyBytesPerSec, c.RateKeyBytesBurst = 0.001, 3000 })
+	mallory, victim, friend := newPrincipal(1), newPrincipal(2), newPrincipal(3)
+	f.register(mallory)
+	f.register(friend)
+	forged := f.mint(mallory, victim, nil)
+	for i := 0; i < 10; i++ {
+		f.expectFrom(hostA, depositReq(mallory, mallory, forged, strings.Repeat("x", 1000)), 401, CodeSignatureInvalid)
+	}
+	tok := f.mint(friend, victim, nil)
+	f.expectFrom(hostB, depositReq(friend, victim, tok, strings.Repeat("x", 1000)), 201, "")
+	f.expectFrom(hostB, depositReq(friend, victim, tok, strings.Repeat("x", 1000)), 201, "")
+	// A deposit that is then not stored gives its key charge back.
+	f.expectFrom(hostB, req{method: "POST", path: "/v1/mailbox/" + friend.mbx, body: []byte("not json"), signer: &victim, token: tok}, 400, CodeBadRequest)
+	f.expectFrom(hostB, depositReq(friend, victim, tok, strings.Repeat("x", 100)), 201, "")
 }

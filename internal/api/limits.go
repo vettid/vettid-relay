@@ -82,9 +82,10 @@ const (
 	limBytes        = "bytes"
 	limBlobBytes    = "blob_bytes"
 	limBlobKeyBytes = "blob_key_bytes"
+	limKeyBytes     = "key_bytes"
 )
 
-var byteLimiters = []string{limBytes, limBlobBytes, limBlobKeyBytes}
+var byteLimiters = []string{limBytes, limBlobBytes, limBlobKeyBytes, limKeyBytes}
 
 // limBlobSlots and limBlobMailboxSlots label blob transfers refused
 // because the process (cfg.MaxConcurrentBlobTransfers) or the mailbox
@@ -134,9 +135,9 @@ func newLimiterMetrics(reg *metrics.Registry) *limiterMetrics {
 		refused: reg.CounterVec("relay_ratelimit_refused_total", "Requests a rate limiter refused (429 rate_limited), by limiter.", "limiter"),
 		peak:    reg.GaugeVec("relay_ratelimit_peak_permille", "How full the busiest bucket of each limiter got during the last full minute, in thousandths of its burst (1000: something was refused).", "limiter"),
 		busiest: reg.GaugeVec("relay_ratelimit_busiest_per_minute", "Requests of the busiest single client network (limiter address) and of the busiest single key (limiter key) during the last full minute.", "limiter"),
-		bytes:   reg.GaugeVec("relay_ratelimit_busiest_bytes_per_minute", "Bytes charged to the busiest single client network (bytes, blob_bytes) or key (blob_key_bytes) during the last full minute, by byte budget (bytes: deposits and claims; blob_bytes and blob_key_bytes: blob uploads and downloads).", "limiter"),
+		bytes:   reg.GaugeVec("relay_ratelimit_busiest_bytes_per_minute", "Bytes charged to the busiest single client network (bytes, blob_bytes) or key (key_bytes, blob_key_bytes) during the last full minute, by byte budget (bytes and key_bytes: deposits and claims; blob_bytes and blob_key_bytes: blob uploads and downloads).", "limiter"),
 		lastRef: map[string]int64{},
-		count:   map[string]map[string]int{limAddress: {}, limKey: {}, limBytes: {}, limBlobBytes: {}, limBlobKeyBytes: {}},
+		count:   map[string]map[string]int{limAddress: {}, limKey: {}, limBytes: {}, limBlobBytes: {}, limBlobKeyBytes: {}, limKeyBytes: {}},
 		hit:     map[string]struct{}{},
 	}
 	for _, l := range allLimiters {
@@ -213,19 +214,25 @@ func (s *Server) refundBytes(name string, l ByteLimiter, network string, n int64
 
 // takeBlobBytes charges n blob bytes to key's budget and to network's
 // ceiling, or neither (the 429 of the one that refused).
-// (Used for downloads, whose key, the owner's, is verified first.)
+// (Used for blob downloads, whose key, the owner's, is verified first.)
 func (s *Server) takeBlobBytes(key, network string, n int64) *apiError {
+	return s.takeKeyAndNetwork(limBlobKeyBytes, s.blobKeyLimit, key, limBlobBytes, s.blobByteLimit, network, n)
+}
+
+// takeKeyAndNetwork charges n bytes to a verified key's budget (keyName,
+// keyL) and to its network's ceiling (netName, netL), or to neither.
+func (s *Server) takeKeyAndNetwork(keyName string, keyL ByteLimiter, key, netName string, netL ByteLimiter, network string, n int64) *apiError {
 	now := s.now()
-	if ok, wait := s.blobKeyLimit.AllowN(key, n, now); !ok {
-		s.rl.refused.With(limBlobKeyBytes).Inc()
+	if ok, wait := keyL.AllowN(key, n, now); !ok {
+		s.rl.refused.With(keyName).Inc()
 		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
 	}
-	if ok, wait := s.blobByteLimit.AllowN(network, n, now); !ok {
-		s.blobKeyLimit.Refund(key, n)
-		s.rl.refused.With(limBlobBytes).Inc()
+	if ok, wait := netL.AllowN(network, n, now); !ok {
+		keyL.Refund(key, n)
+		s.rl.refused.With(netName).Inc()
 		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
 	}
-	for _, x := range [][2]string{{limBlobKeyBytes, key}, {limBlobBytes, network}} {
+	for _, x := range [][2]string{{keyName, key}, {netName, network}} {
 		s.rl.allowed.With(x[0]).Inc()
 		s.rl.tally(x[0], x[1], int(n), false)
 	}
@@ -236,9 +243,26 @@ func (s *Server) takeBlobBytes(key, network string, n int64) *apiError {
 // even into debt (the bytes have arrived; the sender's key is proved only
 // now). Never refuses.
 func (s *Server) chargeBlobKey(key string, n int64) {
-	s.blobKeyLimit.Charge(key, n, s.now())
-	s.rl.allowed.With(limBlobKeyBytes).Inc()
-	s.rl.tally(limBlobKeyBytes, key, int(n), false)
+	s.forceBytes(limBlobKeyBytes, s.blobKeyLimit, key, n)
+}
+
+// forceBytes charges n bytes to key's budget l after the fact, even into
+// debt. Never refuses.
+func (s *Server) forceBytes(name string, l ByteLimiter, key string, n int64) {
+	l.Charge(key, n, s.now())
+	s.rl.allowed.With(name).Inc()
+	s.rl.tally(name, key, int(n), false)
+}
+
+// keyReady is the read-only look at key's budget l made before a body is
+// read, when the key is not yet proved: an empty budget is refused (the
+// 429), nothing is charged.
+func (s *Server) keyReady(name string, l ByteLimiter, key string) *apiError {
+	if ok, wait := l.Ready(key, s.now()); !ok {
+		s.rl.refused.With(name).Inc()
+		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
+	}
+	return nil
 }
 
 // declaredLength is what a byte budget charges for a body before it is
@@ -289,7 +313,7 @@ func (s *Server) reportLimits() {
 	for name, l := range map[string]any{
 		limAddress: s.ipLimit, limKey: s.keyLimit, limSender: s.subLimit,
 		limRegister: s.regLimit, limClaim: s.claimLimit, limWeb: s.webLimit,
-		limBytes: s.byteLimit, limBlobBytes: s.blobByteLimit, limBlobKeyBytes: s.blobKeyLimit,
+		limBytes: s.byteLimit, limBlobBytes: s.blobByteLimit, limBlobKeyBytes: s.blobKeyLimit, limKeyBytes: s.keyByteLimit,
 	} {
 		if p, ok := l.(interface{ Peak() float64 }); ok {
 			peaks[name] = p.Peak()

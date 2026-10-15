@@ -198,20 +198,35 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		s.refuseUnread(w, r, e)
 		return
 	}
-	// The network's byte budget, on the declared length: a deposit it
-	// refuses is not read. (After steps 1–6, so an unauthorized deposit
-	// costs the network nothing.)
+	// The byte budgets. The token's sub names the sender's key, but the
+	// mailbox owner wrote the token; the sender proves the key only with
+	// the request signature (step 7), after the body. So before the body
+	// the network's ceiling is charged with the declared length (after
+	// steps 1–6, so an unauthorized deposit costs the network nothing)
+	// and the key's budget is only looked at (an empty one is refused,
+	// unread); the key is charged once the signature verified. Nobody can
+	// spend another key's budget by naming it in a token. (An open
+	// token's sender is known only from its signature: no look before.)
 	network, charged := s.network(r), declaredLength(r, s.depositBodyLimit())
+	if !da.claims.Open() {
+		if e := s.keyReady(limKeyBytes, s.keyByteLimit, da.claims.Sub); e != nil {
+			s.refuseUnread(w, r, e)
+			return
+		}
+	}
 	if e := s.takeBytes(limBytes, s.byteLimit, network, charged); e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}
 	// Whatever refuses the deposit from here on, nothing is stored: the
-	// charge is given back.
-	stored := false
+	// charges are given back.
+	stored, keyCharged, sender := false, int64(0), ""
 	defer func() {
 		if !stored {
 			s.refundBytes(limBytes, s.byteLimit, network, charged)
+			if keyCharged > 0 {
+				s.refundBytes(limKeyBytes, s.keyByteLimit, sender, keyCharged)
+			}
 		}
 	}()
 	body, e := s.readBody(w, r, s.depositBodyLimit())
@@ -219,11 +234,15 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, e)
 		return
 	}
-	sender, e := s.verifySender(r, da, auth.BodyHash(body)) // step 7
+	sender, e = s.verifySender(r, da, auth.BodyHash(body)) // step 7
 	if e != nil {
 		s.writeError(w, e)
 		return
 	}
+	// The sender is proved: its key's budget pays for the body, even into
+	// debt (it has arrived).
+	keyCharged = int64(len(body))
+	s.forceBytes(limKeyBytes, s.keyByteLimit, sender, keyCharged)
 	// The per-sender limit comes after step 7: a token without its
 	// sender's key (a leaked one) cannot use up the sender's budget.
 	if e := s.allowSender(senderRateKey(da)); e != nil {

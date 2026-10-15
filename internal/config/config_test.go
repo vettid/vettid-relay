@@ -218,7 +218,7 @@ func TestRateLimitConfig(t *testing.T) {
 // their variables, and the start-up checks between related limits.
 func TestResourceLimitConfig(t *testing.T) {
 	d := Defaults()
-	if d.RateIPBytesPerSec != 256<<10 || d.RateIPBytesBurst != 8<<20 ||
+	if d.RateKeyBytesPerSec != 64<<10 || d.RateKeyBytesBurst != 2<<20 || d.RateIPBytesPerSec != 1<<20 || d.RateIPBytesBurst != 32<<20 ||
 		d.RateBlobKeyBytesPerSec != 1<<20 || d.RateBlobKeyBytesBurst != 32<<20 ||
 		d.RateBlobBytesPerSec != 8<<20 || d.RateBlobBytesBurst != 256<<20 ||
 		d.MaxBlobTransfersPerMailbox != 2 || d.MaxConcurrentBlobTransfers != 8 || d.BlobPaceBytes != 16<<10 ||
@@ -226,6 +226,8 @@ func TestResourceLimitConfig(t *testing.T) {
 		t.Fatalf("defaults differ from README.md: %+v", d)
 	}
 	c, err := Load(env(map[string]string{
+		"RELAY_RATE_KEY_BYTES_PER_SEC":         "131072",
+		"RELAY_RATE_KEY_BYTES_BURST":           "4194304",
 		"RELAY_RATE_IP_BYTES_PER_SEC":          "524288",
 		"RELAY_RATE_IP_BYTES_BURST":            "16777216",
 		"RELAY_RATE_BLOB_KEY_BYTES_PER_SEC":    "2097152",
@@ -241,7 +243,7 @@ func TestResourceLimitConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.RateIPBytesPerSec != 524288 || c.RateIPBytesBurst != 16<<20 || c.RateBlobKeyBytesPerSec != 2<<20 || c.RateBlobKeyBytesBurst != 16<<20 || c.RateBlobBytesPerSec != 16<<20 || c.RateBlobBytesBurst != 128<<20 ||
+	if c.RateKeyBytesPerSec != 131072 || c.RateKeyBytesBurst != 4<<20 || c.RateIPBytesPerSec != 524288 || c.RateIPBytesBurst != 16<<20 || c.RateBlobKeyBytesPerSec != 2<<20 || c.RateBlobKeyBytesBurst != 16<<20 || c.RateBlobBytesPerSec != 16<<20 || c.RateBlobBytesBurst != 128<<20 ||
 		c.MaxBlobTransfersPerMailbox != 3 || c.BlobPaceBytes != 65536 || c.LogInfoPerSec != 50 || c.LogInfoBurst != 200 || c.MailboxMaxBytes != 0 {
 		t.Fatalf("%+v", c)
 	}
@@ -251,7 +253,12 @@ func TestResourceLimitConfig(t *testing.T) {
 		{"RELAY_LOG_INFO_RPS": "0"},
 		{"RELAY_LOG_INFO_BURST": "0"},
 		// The burst must hold the largest deposit body (about 350 KiB at the default payload size).
-		{"RELAY_RATE_IP_BYTES_BURST": "300000"},
+		{"RELAY_RATE_KEY_BYTES_BURST": "300000"},
+		{"RELAY_RATE_KEY_BYTES_BURST": "0"},
+		{"RELAY_RATE_KEY_BYTES_PER_SEC": "0"},
+		// The network's ceiling at least a key's burst and rate.
+		{"RELAY_RATE_IP_BYTES_BURST": "2097151"},
+		{"RELAY_RATE_IP_BYTES_PER_SEC": "65535"},
 		{"RELAY_RATE_IP_BYTES_BURST": "0"},
 		// A key's blob burst must hold the largest blob, and the network's
 		// ceiling at least a key's burst and rate.

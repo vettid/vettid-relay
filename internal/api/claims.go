@@ -57,14 +57,17 @@ func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 	// A claim is stored: it draws on the network's byte budget, like a
 	// deposit. (Its small body is read before the signature can be
 	// checked, so it is charged once the claim is authenticated.)
-	network := s.network(r)
-	if e := s.takeBytes(limBytes, s.byteLimit, network, int64(len(body))); e != nil {
+	// The key is the claim's creator, the mailbox owner whose signature
+	// authorizeOwner verified; and its network's ceiling.
+	network, owner, n := s.network(r), auth.EncodeKey(mb.PubKey), int64(len(body))
+	if e := s.takeKeyAndNetwork(limKeyBytes, s.keyByteLimit, owner, limBytes, s.byteLimit, network, n); e != nil {
 		s.writeError(w, e)
 		return
 	}
 	id, exp, err := s.st.PutClaim(r.Context(), mb.ID, body, ttl, s.cfg.MailboxMaxBlobBytes)
-	if err != nil { // not stored: the charge is given back
-		s.refundBytes(limBytes, s.byteLimit, network, int64(len(body)))
+	if err != nil { // not stored: the charges are given back
+		s.refundBytes(limKeyBytes, s.keyByteLimit, owner, n)
+		s.refundBytes(limBytes, s.byteLimit, network, n)
 	}
 	switch {
 	case errors.Is(err, store.ErrQuota):
