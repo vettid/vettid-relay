@@ -99,8 +99,9 @@ const (
 )
 
 // limBlobEvicted counts uploads cut off to give their slot to a newer one
-// (the slowest that had run cfg.BlobEvictMinAge). Reported after every
-// other field of the "rate limits" line, as blob_evicted.
+// (the slowest evictable upload: see evictableLocked and victimLocked in
+// blobs.go). It is a count in relay_ratelimit_refused_total, and the last
+// field of the "rate limits" line, blob_evicted.
 const limBlobEvicted = "blob_evicted"
 
 // ByteLimiter is a keyed byte budget: AllowN consumes n tokens (bytes), or

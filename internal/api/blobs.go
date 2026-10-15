@@ -195,7 +195,7 @@ func (b *blobTransfers) removeLocked(u *upload) {
 // takeNetLocked records that u's network takes an upload slot. A network
 // that comes back within cfg.BlobEvictMinAge of giving up its last slot
 // keeps its clock: aborting and reconnecting does not reset it. Clocks of
-// networks gone longer are dropped.
+// networks gone longer are dropped by pruneNetClocks.
 func (s *Server) takeNetLocked(u *upload, now time.Time) {
 	b := s.xfers
 	if b.netUp[u.network]++; b.netUp[u.network] > 1 {
@@ -205,12 +205,19 @@ func (s *Server) takeNetLocked(u *upload, now time.Time) {
 		b.netSince[u.network] = now
 	}
 	delete(b.netLeft, u.network)
-	if len(b.netLeft) > 256 {
-		for n, left := range b.netLeft {
-			if now.Sub(left) >= s.cfg.BlobEvictMinAge {
-				delete(b.netLeft, n)
-				delete(b.netSince, n)
-			}
+}
+
+// pruneNetClocks drops the clocks of networks that have held no upload
+// slot for cfg.BlobEvictMinAge (they would start afresh anyway). Run by
+// the server's periodic janitor, not on every upload.
+func (s *Server) pruneNetClocks(now time.Time) {
+	b := s.xfers
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for n, left := range b.netLeft {
+		if now.Sub(left) >= s.cfg.BlobEvictMinAge {
+			delete(b.netLeft, n)
+			delete(b.netSince, n)
 		}
 	}
 }

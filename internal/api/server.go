@@ -202,6 +202,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 				p.Prune(now)
 			}
 		}
+		s.pruneNetClocks(now)
 	})
 	s.every(time.Minute, func(time.Time) { s.reportLimits() })
 	return s

@@ -1032,6 +1032,11 @@ sender's budget, and an unauthorized deposit's body is not read.
   - An upload is protected for its first 5 s. An address that replaces
     its uploads more often than that keeps them protected, but must give
     each slot up to replace it (see above).
+  - Uploads that share an IPv4 address or an IPv6 /48 (behind a
+    carrier-grade NAT, or within a provider's prefix) share one clock and
+    cannot cut each other off. A neighbour in the same /48 can keep that
+    clock running, so that an honest host's uploads there are evictable
+    once they are 5 s old.
   - Several fast addresses together can keep slower honest uploads out
     or cut them off.
   - An honest upload older than 5 s whose network has been uploading for

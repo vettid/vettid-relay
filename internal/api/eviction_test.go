@@ -437,3 +437,34 @@ func TestEvictionNetwork(t *testing.T) {
 		t.Fatal(n)
 	}
 }
+
+// Clocks of networks that have held no upload slot for the minimum age
+// are dropped by the periodic janitor; a network still holding one, or
+// gone for less, keeps its clock.
+func TestNetClocksPruned(t *testing.T) {
+	f := newFixture(t, nil)
+	s := f.s
+	gone, back, busy := f.newUploadFrom("gone", "a", "x"), f.newUploadFrom("back", "b", "x"), f.newUploadFrom("busy", "c", "x")
+	var rels []func()
+	for _, u := range []*upload{gone, back, busy} {
+		r, e := s.acquireUpload(u)
+		if e != nil {
+			t.Fatal(e.code)
+		}
+		rels = append(rels, r)
+	}
+	rels[0]()
+	f.clk.add(20 * time.Second)
+	rels[1]()
+	f.clk.add(15 * time.Second) // "gone" left 35 s ago, "back" 15 s ago
+	s.pruneNetClocks(f.clk.now())
+	s.xfers.mu.Lock()
+	_, g := s.xfers.netSince["gone"]
+	_, bk := s.xfers.netSince["back"]
+	_, bs := s.xfers.netSince["busy"]
+	s.xfers.mu.Unlock()
+	if g || !bk || !bs {
+		t.Fatalf("clocks kept: gone %v, back %v, busy %v", g, bk, bs)
+	}
+	rels[2]()
+}
