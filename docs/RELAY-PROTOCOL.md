@@ -1,6 +1,6 @@
 # VettID Relay Protocol
 
-**Version:** 0.9.2 (draft)
+**Version:** 0.9.3 (draft)
 **Status:** Pre-implementation draft for review
 
 ## 1. Purpose & design principles
@@ -437,11 +437,20 @@ Content-Type: application/octet-stream
   the mailbox created (§6.9). So that one sender cannot fill it for all
   the others:
   - an upload MUST carry `Content-Length` (else `bad_request`), and the
-    relay MUST check the token's `quota.bytes`, the mailbox's cap and
-    the sender's share against that declared length **before reading
-    the body** (in §5.3 step 8, after the signature), refusing with
-    `quota_exceeded` and `Connection: close`; it checks again what it
-    actually stored;
+    relay MUST check the token's `quota.bytes`, the mailbox's cap and the
+    sender's share against that declared length **before reading the
+    body** (after §5.3 steps 1–6, for the token's `sub`: the signature
+    covers the body), refusing with `quota_exceeded` and `Connection:
+    close` when what is stored leaves no room; it MAY also count its
+    uploads in progress that hold a transfer slot (§7.2, limit 13), each
+    with its declared length reserved from when it takes its slot until it
+    ends or is cut off, but not those the new upload could cut off for its
+    slot: when it takes its slot, it cuts off the fewest of those, slowest
+    first, that make room (or none, if they cannot), and refuses an upload
+    that the remaining reservations leave no room for with `rate_limited`
+    and `retry_after` (they may yet fail), before its body or when it
+    takes its slot; it checks again, after the signature and for the key
+    that signed, what it actually stored;
   - one sender key's blobs in one mailbox MUST NOT exceed
     `max_sender_blob_bytes`, at most 2 × `max_blob_bytes` (the
     reference relay: 16 MiB, so a quarter of the 64 MiB cap), **nor
@@ -453,13 +462,15 @@ Content-Type: application/octet-stream
     a token with `owner_device: true` (§5.2). An upload under any other
     token is refused (`quota_exceeded`, `quota: "mailbox_blobs"`) when
     it would leave less than `max_blob_bytes` free; an upload under a
-    device token, and a claim the owner creates (§6.9), may use the
-    whole cap. So peers filling a mailbox can never stop its
+    device token, and a claim the owner creates (§6.9), may use the whole
+    cap (a device-token upload still counts against its sender's share and
+    its token's quota). So peers filling a mailbox can never stop its
     owner's phone from uploading one photo;
   - to enforce the share, the relay MUST keep each blob's sender key
     with the blob, for as long as the blob exists (vettid-relay #10
-    dropped that column as unread; the relay pull request that builds
-    0.9.2 restores it);
+    dropped that column as unread; vettid-relay #12 restores it: a blob
+    stored before it has no sender, counts against the mailbox's cap and
+    against no sender's share, and is listed without `sender`);
   - a `quota_exceeded` error body carries `quota` (§7.1): `token`,
     `mailbox` (the message quota), `mailbox_blobs` (the blob storage
     cap) or `sender_blobs` (the sender's share), so that a client can
@@ -470,9 +481,14 @@ Content-Type: application/octet-stream
   stop reading and refuse a body that grows beyond it while it is read,
   so that it never holds more than `max_blob_bytes` (plus its read
   buffer) of one upload. A relay MAY hold the whole body in memory before
-  storing it: the request signature's digest (§4.1) covers the whole
-  body, and the reference relay buffers each upload, at most
-  `max_blob_bytes`, verifies the digest and only then stores it.
+  storing it, or stream it to storage as it arrives, provided that nothing
+  it stores can be read or counts against any quota until the request
+  signature's digest (§4.1), which covers the whole body, has verified,
+  and that a body which is then refused, or fails, is deleted. The
+  reference relay streams each upload to a staging place (S3 under the
+  blob's key, which no metadata points at yet, or a temporary file),
+  hashing it on the way, verifies the digest and only then commits the
+  blob.
   A relay MAY also load a blob whole to serve it (the reference relay's
   SQLite store does). (0.9.2: before, this item said
   "relays MUST enforce this limit during streaming, not after
@@ -483,8 +499,11 @@ Content-Type: application/octet-stream
   authenticated key under a network ceiling, and transfer slots).
 - For the signed-request digest (§4.1), `hex(SHA-256(body))` is computed over
   the raw ciphertext bytes.
-- Blobs SHOULD be stored outside the message database (e.g., as files on disk)
-  and MUST NOT be parsed or logged.
+- Blobs SHOULD be stored apart from messages (e.g., as files on disk, in
+  an object store, or in a table of their own that message queries never
+  read) and MUST NOT be parsed or logged. (The reference relay's SQLite
+  store keeps them in a table of the one database file, so that the file
+  is its whole state; its shared store keeps them in S3.)
 
 ```
 GET /v1/blob/{blob_id}               (owner-signed; recipient mailbox only)
@@ -517,7 +536,12 @@ POST /v1/blobs                       (owner-signed; 0.9.2)
 - The owner's list of the blobs in its own mailbox, oldest first, in
   pages of at most `max` (1–500, default 100), continued with `after` =
   `next` (exclusive) until a page has no `next`; and the bytes used
-  against `max_mailbox_blob_bytes` (claims included). It lets an owner
+  against `max_mailbox_blob_bytes` (claims included; a relay with a shared
+  store MAY report a counter that is recomputed after expiries at most
+  every minute); `max_bytes` is `max_mailbox_blob_bytes`, the whole cap,
+  of which `max_blob_bytes` is kept for the owner's devices. An empty body
+  is `{}`; a `max` that is not an integer in 1–500, or an `after` that is
+  not a blob id, is `bad_request` (never clamped). It lets an owner
   delete blobs nobody will fetch (an abandoned upload, a peer's upload
   whose message never came) instead of waiting `blob_ttl_seconds` with
   its storage full: the owner deletes every id it does not expect, and
@@ -795,8 +819,11 @@ any proxy or load balancer in front of the relay.
 ```
 
 (0.9.2) A `quota_exceeded` body also carries `"quota"`:
-`token`, `mailbox`, `mailbox_blobs` or `sender_blobs` (§6.8). Clients
-ignore members they do not know.
+`token`, `mailbox`, `mailbox_blobs` or `sender_blobs` (§6.8). When several
+are exceeded it names the first of `mailbox_blobs`, `sender_blobs`,
+`token` (a deposit: `mailbox`, `token`), so that a client renews a token
+only when nothing else stands in the way. A full denylist (§5.5) is
+answered without it. Clients ignore members they do not know.
 
 Canonical codes and their HTTP statuses:
 
@@ -815,7 +842,7 @@ Canonical codes and their HTTP statuses:
 | `not_found` | 404 | no such route |
 | `token_used` | 409 | one-shot open token already consumed (§5.6) |
 | `payload_too_large` | 413 | body over the advertised limit |
-| `quota_exceeded` | 429 | token or mailbox quota exhausted |
+| `quota_exceeded` | 429 | token or mailbox quota, or the mailbox's blob storage or the sender's share of it, exhausted (`quota`, above). Not transient: a client MUST NOT retry the request unchanged; only a fresh token (`token`) or storage the owner frees cures it |
 | `rate_limited` | 429 | slow down; see `retry_after` |
 | `internal` | 500 | relay fault |
 
@@ -823,8 +850,10 @@ Canonical codes and their HTTP statuses:
 
 Limits are relay policy, not protocol constants. The protocol contract: a
 relay signalling overload MUST use `429` + `rate_limited` and SHOULD include
-`retry_after`. Clients MUST honor `retry_after` and MUST implement exponential
-backoff with jitter on `429` and `5xx`. The web endpoints (§6.11) are limited
+`retry_after`. Clients MUST honor `retry_after` and MUST implement
+exponential backoff with jitter on `429 rate_limited` and `5xx`; a `429
+quota_exceeded` is not retried unchanged (§7.1). The web endpoints (§6.11)
+are limited
 with a separate budget.
 
 The rest of this section (0.7.0) says how a relay SHOULD limit, and gives
@@ -860,7 +889,7 @@ a network: the per-process and per-key limits.)
 | 9 | WebSocket sessions per network, ceiling | network, per relay process | 2,000 | to every upgrade, a mailbox's first session included: no network holds more on a process. `429` with `retry_after` 5. At least 8 and at most 7 |
 | 10 | WebSocket window | session | 128 messages | to messages sent on a session and not yet acked there: the relay leases a further batch (32) only while it fits, so it pauses at 97 or more outstanding, until acks arrive or leases end |
 | 11 | stored bytes | authenticated key, and network as a ceiling; per relay process | per key 64 KiB/s, burst 2 MiB; per network 1 MiB/s, burst 32 MiB | charged in bytes. Deposits: the key is the sender's, the token's `sub` (an open token's signer), which the request signature proves only after the body (§5.3 step 7); so after step 6 and **before the body is read**, the network's ceiling is charged with the declared body length (without a `Content-Length`, the largest deposit body) and the key's budget is only checked (an empty one is refused, and the deposit is not read); once the signature has verified, the key's budget is charged with the body's length, unconditionally (it may go into debt). Claim creation (§6.9): the key is the claim's creator, the mailbox owner whose signature verified; key and network are charged together with the claim's length (refused by either, charged to neither). A deposit or claim that is then not stored (quota, signature, malformed body, store failure) is refunded. `429` with `retry_after` |
-| 12 | blob bytes | authenticated key, and network as a ceiling; per relay process | per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst 256 MiB | charged in bytes. Blob uploads: the key is the token's `sub`, which the mailbox owner wrote and the request signature proves only after the body (§5.3 step 7); so after §5.3 steps 1–6 and before the body is read, the network's ceiling is charged with the declared length (without one, the largest blob) and the key's budget is only checked (an empty one is refused unread); once the signature has verified the key's budget is charged with the bytes received, unconditionally (it may go into debt). Blob downloads: after the owner's signature verified, the owner's key and the network's ceiling are charged together with the blob's size, at most a key's burst (refused by either, charged to neither). An upload that stores nothing is refunded only the part of its network charge it never sent: the bytes that reached the relay stay charged whatever refused it (body failure, signature, quota, store failure); an upload refused a transfer slot (13), which held none, is refunded entirely. A download by an owner whose budget, or whose network's, is empty is refused before the store is read. `429` with `retry_after` |
+| 12 | blob bytes | authenticated key, and network as a ceiling; per relay process | per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst 256 MiB | charged in bytes. Blob uploads: the key is the token's `sub`, which the mailbox owner wrote and the request signature proves only after the body (§5.3 step 7); so after §5.3 steps 1–6 and the checks of §6.8 (an upload they refuse, with `quota_exceeded` or, for reservations only, `rate_limited`, holds no slot and is charged nothing), and before the body is read, the network's ceiling is charged with the declared length (an upload without one is refused `bad_request` before this, §6.8) and the key's budget is only checked (an empty one is refused unread); once the signature has verified the key's budget is charged with the bytes received, unconditionally (it may go into debt). Blob downloads: after the owner's signature verified, the owner's key and the network's ceiling are charged together with the blob's size, at most a key's burst (refused by either, charged to neither). An upload that stores nothing is refunded only the part of its network charge it never sent: the bytes that reached the relay stay charged whatever refused it (body failure, signature, quota, store failure); an upload refused a transfer slot (13), or refused at it for its reservation (§6.8), holds none and is refunded entirely. A download by an owner whose budget, or whose network's, is empty is refused before the store is read. `429` with `retry_after` |
 | 13 | blob transfers | relay process; mailbox; sender and mailbox | 8 per process; per mailbox 2 uploads and, apart, 2 downloads; 1 upload per sender key and mailbox; uploads at most 8 − 2 = 6 per process | to blob uploads once their body has begun to arrive (an upload that has sent nothing holds no slot), and to blob downloads; the mailbox is the recipient's for an upload and the owner's for a download. Uploads never take a mailbox's download slots nor the 2 process slots kept for downloads. `429` with `retry_after` 2. A transfer's body must move at least 16 KiB in every 5 s and finish within 5 minutes, or the transfer is dropped (an upload is answered `400` with `Connection: close`): an upload that trickles at the minimum pace holds its slot up to 5 minutes unless it is cut off for a new upload (0.9.1). When a new upload finds no upload slot free (in the process, or in its mailbox), one in-progress upload is cut off and the new upload takes its slot. It is chosen among the uploads still reading their body (to that mailbox, if the mailbox is full) that are *evictable*: that have run at least 5 s (one pace window), come from another network than the new upload's, and have run at least 30 s or come from a network that has held upload slots on the process for at least 30 s. "Network" here is the IPv4 address or the IPv6 /48, and its 30 s run on across gaps shorter than 30 s with no slot. Of those, the one that received the fewest bytes per second over the last 10 s (over its age, at least 5 s, if younger) goes; of nearly equal speeds (within 10% or 1 KiB/s), the one whose network holds the most upload slots. A sender's own upload to a mailbox is never cut off for its next upload to that mailbox. The cut-off upload is answered `429` with `retry_after` 2 and `Connection: close`, and the bytes it sent stay charged (12). If none is evictable, the new upload is refused as above |
 
 Nothing else is keyed on a network. A request that is properly signed by a
@@ -888,7 +917,12 @@ budgets (11: the creator's key and its network), for blob downloads an empty blo
 the store is read, then the transfer slot (13), the store read and the
 charge with the blob's size; for blob uploads the transfer slot (13) once
 the body begins to arrive, cutting off the slowest evictable upload if no
-slot is free (13). A charge for a request that ends up storing
+slot is free (13), and with it the reservation of the upload's declared
+length (§6.8), re-checked then: evictable uploads to its mailbox whose
+reservations stand in its way are cut off too, the fewest, slowest first,
+and their reservations dropped at once (none, and the upload refused
+`rate_limited`, if that cannot make room). A reservation is dropped when
+its upload ends or is cut off. A charge for a request that ends up storing
 nothing is refunded as limits 11 and 12 say. A request that
 is refused before its body has been read SHOULD be answered at once with
 `Connection: close`, not after waiting for the body. A small body that
@@ -978,13 +1012,16 @@ does the same on its own mailbox.
   times, moves about 0.2 MB/s on average; a peak hour at ten times that
   is a quarter of the 8 MiB/s ceiling, and the 256 MiB burst holds 32
   maximum-size attachments crossing at once. Memory is bounded by the
-  transfer slots (13), not by the budget: 8 transfers of 8 MiB, 64 MiB a
-  process. 8 MiB/s (67 Mbit/s) is about what one small relay task can
+  transfer slots (13), not by the budget: an upload streamed to storage
+  holds a buffer (about 100 KiB measured), as does a download from S3; a
+  blob served whole from the SQLite store holds up to 8 MiB. 8 MiB/s (67
+  Mbit/s) is about what one small relay task can
   move, and bounds a network's blob egress at about 0.7 TB a day per
   process (an estimate: about $65 a day at $0.09/GB).
 - *Blob transfers, 8 per process; per mailbox 2 uploads and 2 downloads;
-  one upload per sender and mailbox; 16 KiB per 5 s.* A blob is held in
-  memory while it moves, so transfers are bounded. Uploads and downloads
+  one upload per sender and mailbox; 16 KiB per 5 s.* Transfers share a
+  process's bandwidth and compete for slots (and, from the SQLite store, a
+  download holds its blob), so they are bounded. Uploads and downloads
   are counted apart so that senders cannot keep an owner from its blobs,
   and one sender cannot take both of a mailbox's upload slots. The slot
   is taken only once an upload's body arrives and is dropped when the
@@ -1463,10 +1500,31 @@ The push gateway API is specified separately.
 
 ## 10. Changelog
 
+- **0.9.3** — errata approved by the owner 2026-10-15 (vettid-relay
+  #12), to match 0.9.2 as built. §6.8: the quota checks before an
+  upload's body are made for the token's `sub` (the signature covers the
+  body) and again at the commit for the key that signed; uploads in
+  progress count only while they hold a transfer slot, reservations of
+  uploads a new upload could cut off do not refuse it, and a refusal due
+  only to reservations is `rate_limited`; device-token uploads still
+  count against their sender's share; a body may be streamed to storage
+  if nothing is readable or counted before the signature verifies;
+  blobs stored before #12 have no sender; blobs may be kept in a table
+  of their own; the list's `used_bytes`, `max_bytes` and malformed
+  paging. §7.1: quota precedence (`mailbox_blobs`, `sender_blobs`,
+  `token`), no `quota` for a full denylist, `quota_exceeded` is not
+  retried unchanged. §7.2: backoff on `429 rate_limited` only; limit 12
+  and the order of checks for reservations, refusals before the body and
+  at the slot (charged nothing), chunked uploads (`bad_request`); the
+  memory notes for streamed transfers. §10: 0.9.2 built in vettid-relay
+  #12, with its compatibility note
 - **0.9.2** — blob transfer for VettID's photo attachments
   (VAULT-MESSAGING 0.32.0); **approved by the owner 2026-10-15**
-  (vettid.org #288), on top of 0.9.1. Not built: the relay code
-  follows in a relay pull request. Also a **device-token claim**
+  (vettid.org #288), on top of 0.9.1. Built in vettid-relay #12 (with the
+  errata above). **Compatibility:** a blob upload without a
+  `Content-Length` (a chunked body), which 0.9.1 accepted, is now refused
+  with `bad_request` before its body is read; such a client must send the
+  length. Also a **device-token claim**
   (`owner_device`, §5.2) and room kept in each mailbox's blob storage
   for one blob from the owner's own devices (§6.8). §6.8: the upload limit restated as what a relay
   can and must do: refuse a declared length over `max_blob_bytes`
