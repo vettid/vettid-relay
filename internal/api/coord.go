@@ -109,6 +109,12 @@ func WithBlobPaceWindow(d time.Duration) Option {
 	return func(s *Server) { s.blobPaceWindow = d }
 }
 
+// WithBlobCommitTimeout bounds a blob upload's commit, and apart its
+// cleanup after a failed one (default 30 s; tests).
+func WithBlobCommitTimeout(d time.Duration) Option {
+	return func(s *Server) { s.blobCommitWait = d }
+}
+
 // WithWakeBus publishes every deposit's mailbox to other relay processes.
 // Signals they publish are delivered here through Server.Wake.
 func WithWakeBus(b WakeBus) Option { return func(s *Server) { s.bus = b } }

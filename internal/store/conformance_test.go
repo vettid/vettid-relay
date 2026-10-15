@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,14 +12,28 @@ import (
 )
 
 func TestConformanceSQLite(t *testing.T) {
+	var mu sync.Mutex
+	dirs := map[store.Backend]string{}
 	storetest.Run(t, storetest.Harness{
 		New: func(t *testing.T, now func() time.Time) store.Backend {
-			s, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "relay.db"), store.WithClock(now))
+			dir := t.TempDir()
+			s, err := store.Open(context.Background(), filepath.Join(dir, "relay.db"), store.WithClock(now))
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { s.Close() })
+			mu.Lock()
+			dirs[s] = dir
+			mu.Unlock()
 			return s
+		},
+		// Staged bodies are files next to the database.
+		Bodies: func(s store.Backend) int {
+			mu.Lock()
+			dir := dirs[s]
+			mu.Unlock()
+			n, _ := filepath.Glob(filepath.Join(dir, ".relay-blob-staging-*", ".relay-blob-staged-*"))
+			return len(n)
 		},
 	})
 }

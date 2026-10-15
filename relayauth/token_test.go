@@ -134,6 +134,12 @@ func TestTokenNegative(t *testing.T) {
 			strings.Replace(vecClaims, `"exp":"2026-07-10T00:00:00Z"`, `"exp":"tomorrow"`, 1),
 			strings.Replace(vecClaims, `}`, `,"quota":{"msgs":-1}}`, 1),
 			strings.Replace(vecClaims, `}`, `,"quota":{"bytes":1.5}}`, 1),
+			// owner_device (0.9.2): only the literal true is valid.
+			strings.Replace(vecClaims, `}`, `,"owner_device":false}`, 1),
+			strings.Replace(vecClaims, `}`, `,"owner_device":null}`, 1),
+			strings.Replace(vecClaims, `}`, `,"owner_device":"true"}`, 1),
+			strings.Replace(vecClaims, `}`, `,"owner_device":1}`, 1),
+			strings.Replace(vecClaims, `}`, `,"owner_device":{}}`, 1),
 			vecClaims + `{}`,
 			"\xff" + vecClaims,
 		} {
@@ -145,6 +151,30 @@ func TestTokenNegative(t *testing.T) {
 		c, err := ParseToken(SignToken(recipient, []byte(m)), pub)
 		if err != nil || c.Quota == nil || *c.Quota.Msgs != 5 || *c.Quota.Bytes != 1024 {
 			t.Fatalf("quota: %+v %v", c.Quota, err)
+		}
+	})
+	t.Run("owner_device", func(t *testing.T) {
+		c, err := ParseToken(vecToken, pub)
+		if err != nil || c.OwnerDevice {
+			t.Fatalf("absent claim: %+v %v", c, err)
+		}
+		m := strings.Replace(vecClaims, `}`, `,"owner_device":true}`, 1)
+		if c, err = ParseToken(SignToken(recipient, []byte(m)), pub); err != nil || !c.OwnerDevice {
+			t.Fatalf("owner_device true: %+v %v", c, err)
+		}
+		// Minted back, it is the same claim (and absent when false).
+		c.Iat, c.Exp = c.Iat.UTC(), c.Exp.UTC()
+		tok, err := MintToken(recipient, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := VerifyToken(tok, pub); err != nil || !strings.HasSuffix(string(got), `,"owner_device":true}`) {
+			t.Fatalf("minted %s %v", got, err)
+		}
+		c.OwnerDevice = false
+		tok, _ = MintToken(recipient, c)
+		if got, _ := VerifyToken(tok, pub); strings.Contains(string(got), "owner_device") {
+			t.Fatalf("minted %s", got)
 		}
 	})
 }

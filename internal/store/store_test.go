@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -470,6 +471,131 @@ func TestMigrateFromV1(t *testing.T) {
 	}
 	if got, err := s.Lease(ctx, "old", 10, time.Minute); err != nil || len(got) != 1 || got[0].ID != m.ID || got[0].TokenJTI != "j1" {
 		t.Fatalf("v3 token_jti: %+v %v", got, err)
+	}
+}
+
+// A database of a 0.9.1 relay (schema v4), whose blob rows have an empty
+// sender (and older ones a real one), upgrades in place: rows without a
+// sender count against the mailbox's cap and no sender's share, and are
+// listed without one; staged bodies left by a stopped process go at Open.
+func TestMigrateFromV4BlobSenders(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "relay.db")
+	db, err := sql.Open("sqlite", dsn(path, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	far := time.Now().Add(time.Hour).UnixMilli()
+	if _, err := db.Exec(migrations[0] + migrations[1] + migrations[2] + migrations[3] + fmt.Sprintf(`; PRAGMA user_version=4;
+		INSERT INTO mailboxes(mailbox_id,pubkey,created_at) VALUES('a',x'00',0);
+		INSERT INTO blobs(blob_id,mailbox_id,size,created_at,expires_at,sender_sub,data) VALUES('01J00000000000000000000001','a',100,0,%d,'',x'00');
+		INSERT INTO blobs(blob_id,mailbox_id,size,created_at,expires_at,sender_sub,data) VALUES('01J00000000000000000000002','a',200,0,%d,'s1',x'00');`, far, far)); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	// A staging folder left by a process that stopped mid-upload: its
+	// lock is free.
+	left := filepath.Join(dir, stagingPrefix+"stale")
+	if err := os.MkdirAll(left, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(left, stagingLock), nil, 0o600)
+	if err := os.WriteFile(filepath.Join(left, stagePrefix+"left-behind"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := os.Stat(left); !os.IsNotExist(err) {
+		t.Fatalf("staged body left behind: %v", err)
+	}
+	var v int
+	s.r.QueryRow("PRAGMA user_version").Scan(&v)
+	if v != schemaVersion {
+		t.Fatalf("user_version %d", v)
+	}
+	if u, err := s.BlobUsage(ctx, "a", "s1", "", false); err != nil || u != (BlobUsage{MailboxBytes: 300, SenderBytes: 200, SenderBlobs: 1}) {
+		t.Fatalf("usage %+v %v", u, err)
+	}
+	if u, _ := s.BlobUsage(ctx, "a", "s2", "", false); u.SenderBlobs != 0 {
+		t.Fatalf("an empty sender counted: %+v", u)
+	}
+	bs, _, used, err := s.ListBlobs(ctx, "a", "", 10)
+	if err != nil || len(bs) != 2 || bs[0].Sender != "" || bs[1].Sender != "s1" || used != 300 {
+		t.Fatalf("list %+v %d %v", bs, used, err)
+	}
+}
+
+// Two stores on one folder (two databases, or a second process): each
+// stages in its own folder, and neither removes the other's while it is
+// open; the folder goes at Close.
+func TestStagingFoldersPerProcess(t *testing.T) {
+	dir := t.TempDir()
+	a, err := Open(ctx, filepath.Join(dir, "a.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := a.StageBlob(ctx, "m", 3, bytes.NewReader([]byte("abc")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Open(ctx, filepath.Join(dir, "b.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.stageDir == b.stageDir {
+		t.Fatal("one staging folder for two stores")
+	}
+	if n, _ := filepath.Glob(filepath.Join(a.stageDir, stagePrefix+"*")); len(n) != 1 {
+		t.Fatalf("the other store removed a live staged body: %v", n)
+	}
+	st.Discard(ctx)
+	a.Close()
+	b.Close()
+	if n, _ := filepath.Glob(filepath.Join(dir, stagingPrefix+"*")); len(n) != 0 {
+		t.Fatalf("staging folders left at Close: %v", n)
+	}
+}
+
+// Stores starting at the same time in one folder never remove each
+// other's staging folders (each is locked before it can be found).
+func TestStagingFoldersConcurrentOpen(t *testing.T) {
+	dir := t.TempDir()
+	const n = 8
+	stores := make([]*Store, n)
+	staged := make([]StagedBlob, n)
+	var wg sync.WaitGroup
+	for round := 0; round < 3; round++ {
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				s, err := Open(ctx, filepath.Join(dir, fmt.Sprintf("r%d-%d.db", round, i)))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				stores[i] = s
+				if staged[i], err = s.StageBlob(ctx, "m", 1, bytes.NewReader([]byte("x"))); err != nil {
+					t.Error(err)
+				}
+			}(i)
+		}
+		wg.Wait()
+		if t.Failed() {
+			t.FailNow()
+		}
+		for i, s := range stores {
+			if n, _ := filepath.Glob(filepath.Join(s.stageDir, stagePrefix+"*")); len(n) != 1 {
+				t.Fatalf("round %d: store %d lost its staged body", round, i)
+			}
+		}
+		for i, s := range stores {
+			staged[i].Discard(ctx)
+			s.Close()
+		}
 	}
 }
 

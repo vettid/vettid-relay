@@ -1,6 +1,7 @@
 package dynamo_test
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -20,9 +21,21 @@ func TestConformanceDynamo(t *testing.T) {
 		}
 		return st
 	}
+	var mu sync.Mutex
+	buckets := map[store.Backend]*fakes3.Server{}
 	storetest.Run(t, storetest.Harness{
 		New: func(t *testing.T, now func() time.Time) store.Backend {
-			return mk(t, ddblocal.Table(t, db), fakes3.New(t), now)
+			s3 := fakes3.New(t)
+			st := mk(t, ddblocal.Table(t, db), s3, now)
+			mu.Lock()
+			buckets[st] = s3
+			mu.Unlock()
+			return st
+		},
+		Bodies: func(s store.Backend) int {
+			mu.Lock()
+			defer mu.Unlock()
+			return buckets[s].Len()
 		},
 		// Two relay processes: separate Store instances (own caches and ID
 		// generators) on one table and bucket.

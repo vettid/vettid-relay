@@ -98,6 +98,11 @@ type limitsBody struct {
 	ClaimTTLSeconds             int64  `json:"claim_ttl_seconds"`
 	MaxBlobBytes                *int64 `json:"max_blob_bytes,omitempty"`
 	BlobTTLSeconds              *int64 `json:"blob_ttl_seconds,omitempty"`
+	// 0.9.2 (§6.1, §6.8): a mailbox's blob storage cap, one sender key's
+	// share of it in bytes and in blobs.
+	MaxMailboxBlobBytes *int64 `json:"max_mailbox_blob_bytes,omitempty"`
+	MaxSenderBlobBytes  *int64 `json:"max_sender_blob_bytes,omitempty"`
+	MaxSenderBlobs      *int64 `json:"max_sender_blobs,omitempty"`
 }
 
 type registerResponse struct {
@@ -119,6 +124,8 @@ func (s *Server) limits() limitsBody {
 	if s.cfg.BlobsEnabled {
 		mb, ttl := s.cfg.MaxBlobBytes, int64(s.cfg.BlobTTL/time.Second)
 		l.MaxBlobBytes, l.BlobTTLSeconds = &mb, &ttl
+		cap, share, n := s.cfg.MailboxMaxBlobBytes, s.cfg.SenderBlobBytes(), s.cfg.MaxSenderBlobs
+		l.MaxMailboxBlobBytes, l.MaxSenderBlobBytes, l.MaxSenderBlobs = &cap, &share, &n
 	}
 	return l
 }
@@ -275,8 +282,8 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrTokenUsed):
 		s.writeError(w, fail(CodeTokenUsed))
 		return
-	case errors.Is(err, store.ErrQuota):
-		s.writeError(w, fail(CodeQuotaExceeded))
+	case errors.Is(err, store.ErrQuota): // token or mailbox
+		s.writeError(w, quotaFail(err))
 		return
 	case errors.Is(err, store.ErrRevoked): // the mailbox was deleted and re-registered mid-request
 		s.writeError(w, fail(CodeTokenRevoked))

@@ -1,6 +1,6 @@
 # VettID Relay Protocol
 
-**Version:** 0.9.1 (draft; the §7.2 resource limits are proposed and await approval)
+**Version:** 0.9.2 (draft)
 **Status:** Pre-implementation draft for review
 
 ## 1. Purpose & design principles
@@ -133,6 +133,7 @@ whitespace). The footer and implicit assertion are empty in v1.
 | `jti` | MUST | unique token ID (ULID recommended); the revocation handle |
 | `scope` | MUST | `deposit` (sender-bound) or `deposit_open` (one-shot open token, §5.6) |
 | `quota` | MAY | `{ "msgs": n, "bytes": n }` — cap on this token's total deposits; relay enforces best-effort per relay instance |
+| `owner_device` | MAY | (0.9.2) `true`: the issuing mailbox's owner minted this token for one of its **own devices**, so blob uploads under it may use the room the relay keeps for them (§6.8). Only `true` is valid; any other value is `token_invalid`. The relay trusts it because only the owner's key signs tokens for its mailbox; it does not change any other check |
 
 **Lifetime cap.** A relay MAY refuse tokens whose `exp − iat` exceeds its
 `max_token_lifetime_seconds` (`token_invalid`) and MUST advertise that limit at
@@ -254,7 +255,11 @@ POST /v1/register                    (signed request; key being registered)
 ```
 
 (`max_blob_bytes` and `blob_ttl_seconds` are present only if the relay supports
-blob transfer, §6.8.)
+blob transfer, §6.8.) (0.9.2) A relay that supports blobs also
+advertises `max_mailbox_blob_bytes` (a mailbox's blob storage cap,
+67108864 in the reference relay), `max_sender_blob_bytes` (one
+sender key's share of it) and `max_sender_blobs` (how many blobs one
+sender key may hold in one mailbox) (§6.8).
 
 - `X-VettID-Key` MUST equal `pubkey` (proof of possession via the request
   signature).
@@ -411,8 +416,9 @@ grace.
 ### 6.8 Blob transfer (files up to relay blob limit)
 
 A relay MAY support ephemeral blob transfer for payloads larger than
-`max_payload_bytes` (e.g., images and small files; intended ceiling ~5 MB of
-plaintext plus encryption overhead). Blob support is OPTIONAL; relays that
+`max_payload_bytes` (e.g., images and small files; the reference relay's
+ceiling is `max_blob_bytes` = 8 MiB of ciphertext, which VettID's photo
+attachments use, VAULT-MESSAGING §10.5.1). Blob support is OPTIONAL; relays that
 support it advertise `max_blob_bytes` in the registration `limits` object.
 Blobs reuse the existing authorization machinery — no new token type.
 
@@ -426,9 +432,55 @@ Content-Type: application/octet-stream
 - Authorization is identical to deposit (§5.3, all 8 steps), with byte-size
   counted against the token's `quota.bytes` if present and against the
   mailbox's blob storage cap.
-- Body MUST NOT exceed `max_blob_bytes` (default **8,388,608 bytes**); relays
-  MUST enforce this limit during streaming, not after buffering
-  → `payload_too_large`.
+- (0.9.2) **The mailbox's blob storage is shared** by every
+  depositor (the owner's own devices, all its peers) and by the claims
+  the mailbox created (§6.9). So that one sender cannot fill it for all
+  the others:
+  - an upload MUST carry `Content-Length` (else `bad_request`), and the
+    relay MUST check the token's `quota.bytes`, the mailbox's cap and
+    the sender's share against that declared length **before reading
+    the body** (in §5.3 step 8, after the signature), refusing with
+    `quota_exceeded` and `Connection: close`; it checks again what it
+    actually stored;
+  - one sender key's blobs in one mailbox MUST NOT exceed
+    `max_sender_blob_bytes`, at most 2 × `max_blob_bytes` (the
+    reference relay: 16 MiB, so a quarter of the 64 MiB cap), **nor
+    `max_sender_blobs` in number** (the reference relay: 16), so that
+    tiny blobs (the smallest is 46 bytes) cannot fill the mailbox's
+    list; an upload over either is `quota_exceeded`;
+  - **room for the owner's own devices** (0.9.2): the relay MUST keep
+    `max_blob_bytes` of every mailbox's blob storage for uploads under
+    a token with `owner_device: true` (§5.2). An upload under any other
+    token is refused (`quota_exceeded`, `quota: "mailbox_blobs"`) when
+    it would leave less than `max_blob_bytes` free; an upload under a
+    device token, and a claim the owner creates (§6.9), may use the
+    whole cap. So peers filling a mailbox can never stop its
+    owner's phone from uploading one photo;
+  - to enforce the share, the relay MUST keep each blob's sender key
+    with the blob, for as long as the blob exists (vettid-relay #10
+    dropped that column as unread; the relay pull request that builds
+    0.9.2 restores it);
+  - a `quota_exceeded` error body carries `quota` (§7.1): `token`,
+    `mailbox` (the message quota), `mailbox_blobs` (the blob storage
+    cap) or `sender_blobs` (the sender's share), so that a client can
+    tell a token it may renew from storage only the owner can free.
+- Body MUST NOT exceed `max_blob_bytes` (default **8,388,608 bytes**)
+  → `payload_too_large`. A relay MUST refuse an upload whose declared
+  length (`Content-Length`) exceeds it before reading the body, and MUST
+  stop reading and refuse a body that grows beyond it while it is read,
+  so that it never holds more than `max_blob_bytes` (plus its read
+  buffer) of one upload. A relay MAY hold the whole body in memory before
+  storing it: the request signature's digest (§4.1) covers the whole
+  body, and the reference relay buffers each upload, at most
+  `max_blob_bytes`, verifies the digest and only then stores it.
+  A relay MAY also load a blob whole to serve it (the reference relay's
+  SQLite store does). (0.9.2: before, this item said
+  "relays MUST enforce this limit during streaming, not after
+  buffering", which the reference relay meets for the limit but not for
+  the buffering it seemed to forbid.) What one upload may hold is bounded
+  here; how many uploads run at once, and how many bytes a client may
+  move, are rate limits (§7.2, limits 12 and 13: a blob byte budget per
+  authenticated key under a network ceiling, and transfer slots).
 - For the signed-request digest (§4.1), `hex(SHA-256(body))` is computed over
   the raw ciphertext bytes.
 - Blobs SHOULD be stored outside the message database (e.g., as files on disk)
@@ -448,6 +500,35 @@ DELETE /v1/blob/{blob_id}            (owner-signed)
 → 204    (idempotent)
 ```
 
+```
+POST /v1/blobs                       (owner-signed; 0.9.2)
+{ "after": "<blob_id>"?, "max": <n>? }
+→ 200 { "blobs": [ { "blob_id": "<ULID>", "size": n, "sender": "<base64 pubkey>"?,
+                     "created_at": "<RFC3339>", "expires_at": "<RFC3339>" } ],
+        "next": "<blob_id>"?, "used_bytes": n, "max_bytes": n }
+```
+
+- The paging parameters are in the **signed body**, not the query
+  string: the request digest (§4.1) does not cover the query string,
+  so two page requests in the same millisecond would have identical
+  signatures and the second would be refused `replay_detected`; in the
+  body they differ, and the relay knows they were not altered. (A body
+  of at most 1 KiB, read under the short deadline of §7.2.)
+- The owner's list of the blobs in its own mailbox, oldest first, in
+  pages of at most `max` (1–500, default 100), continued with `after` =
+  `next` (exclusive) until a page has no `next`; and the bytes used
+  against `max_mailbox_blob_bytes` (claims included). It lets an owner
+  delete blobs nobody will fetch (an abandoned upload, a peer's upload
+  whose message never came) instead of waiting `blob_ttl_seconds` with
+  its storage full: the owner deletes every id it does not expect, and
+  needs nothing else for that.
+- `sender` is OPTIONAL: the uploading key, which the relay keeps anyway
+  for the per-sender share. A relay that returns it lets an owner act
+  on its own devices' uploads only (VettID's
+  `message.attachment.discard`, VAULT-MESSAGING §10.5.1); without it an
+  owner can still purge. Only the owner sees the list; it is not an
+  existence oracle for anyone else.
+
 - **TTL:** blobs are a transfer mechanism, not storage. Default
   `blob_ttl_seconds` = 604800 (7 days); the sweeper deletes expired blobs.
   Recipients SHOULD fetch promptly and persist the content in their own
@@ -461,7 +542,8 @@ payload carries `{ blob_id, key, content_hash, filename, mime, size }`. The
 relay observes only ciphertext and sizes; the recipient cannot fetch a blob it
 hasn't been told about, and verifies `content_hash` after decryption. Blob
 metadata (filename, type) MUST travel only inside the E2E message, never in
-relay-visible fields.
+relay-visible fields. (0.9.2) VettID's own format is VAULT-MESSAGING §5.5:
+the hash there is of the uploaded bytes and is checked before decryption.
 
 Additional error code: `blob_unknown`.
 
@@ -711,6 +793,10 @@ any proxy or load balancer in front of the relay.
 ```
 { "code": "<canonical_code>", "message": "<human readable>", "retry_after": <seconds, optional> }
 ```
+
+(0.9.2) A `quota_exceeded` body also carries `"quota"`:
+`token`, `mailbox`, `mailbox_blobs` or `sender_blobs` (§6.8). Clients
+ignore members they do not know.
 
 Canonical codes and their HTTP statuses:
 
@@ -1176,7 +1262,7 @@ by a rate limit (§6.4). Clients SHOULD retry a `429` no
 sooner than `retry_after`, with their own jitter (a deposit, claim or blob
 transfer answered `429` under 11 to 13 is retried like any other; deposits
 and blob uploads SHOULD carry a `Content-Length`, since without one they
-are charged the largest body; an upload SHOULD send its body without
+are charged the largest body (0.9.2: blob uploads MUST, §6.8); an upload SHOULD send its body without
 pauses, since one that stops moving is dropped with `400`); SHOULD treat
 `mailbox_unknown` on their **own** mailbox as final until they have
 registered again (stop collecting, register, resume; or stop, if the
@@ -1377,7 +1463,34 @@ The push gateway API is specified separately.
 
 ## 10. Changelog
 
-- **0.9.1 (proposed)** — an upload that finds no transfer slot free cuts
+- **0.9.2** — blob transfer for VettID's photo attachments
+  (VAULT-MESSAGING 0.32.0); **approved by the owner 2026-10-15**
+  (vettid.org #288), on top of 0.9.1. Not built: the relay code
+  follows in a relay pull request. Also a **device-token claim**
+  (`owner_device`, §5.2) and room kept in each mailbox's blob storage
+  for one blob from the owner's own devices (§6.8). §6.8: the upload limit restated as what a relay
+  can and must do: refuse a declared length over `max_blob_bytes`
+  before reading, stop a body that grows past it, never hold more than
+  `max_blob_bytes` of one upload; buffering the whole body (which the
+  request signature's digest needs) is allowed, and so is loading a
+  blob whole to serve it. Before, the text said "during streaming, not
+  after buffering". **The mailbox's blob storage is shared**:
+  uploads MUST carry `Content-Length`, checked against the token's
+  quota, the mailbox's cap and a new **per-sender share**
+  (`max_sender_blob_bytes`, at most 2 × `max_blob_bytes`, and
+  `max_sender_blobs` in number) before the body is read, the relay
+  keeping each blob's sender key for it; `quota_exceeded` says which
+  (`quota` in the error body, §7.1); the limits advertised at
+  registration (§6.1); a new owner-signed, paged **`POST /v1/blobs`**
+  (its paging in the signed body)
+  lists the mailbox's blobs (the sender key optional), so an owner can
+  delete orphans. The "intended ceiling
+  ~5 MB" is replaced by the reference relay's 8 MiB; the informative
+  claim-check flow points to VettID's own format. Rate limits on blobs
+  (transfer slots, byte budgets per key and per network) are 0.9.0's
+  and 0.9.1's (§7.2) and are not restated
+- **0.9.1** — as built in vettid-relay #11; approved by the owner
+  2026-10-15. An upload that finds no transfer slot free cuts
   off the slowest evictable upload and takes its slot (§7.2, limit 13).
   Evictable means: older than 5 s, from another network (IPv4 address or
   IPv6 /48), and older than 30 s or from a network that has held upload
@@ -1387,7 +1500,8 @@ The push gateway API is specified separately.
   answered `429` with `retry_after` 2 and `Connection: close`; its sent
   bytes stay charged. No per-address upload limit. New counter
   `blob_evicted` and configuration variable `RELAY_BLOB_EVICT_MIN_AGE`.
-- **0.9.0 (proposed)** — resource limits, as built in vettid-relay (§7.2,
+- **0.9.0** — resource limits, as built in vettid-relay #10; approved by
+  the owner 2026-10-15 (§7.2,
   no wire change). Byte budgets: what a network asks the
   relay to store (deposits, claims: 11, per authenticated key 64 KiB/s,
   burst 2 MiB, under a network ceiling of 1 MiB/s, burst 32 MiB) and its

@@ -48,6 +48,10 @@ type Harness struct {
 	// SweepGrace is how long after a rotated mailbox's deletion time the
 	// backend's Sweep is guaranteed to have removed it.
 	SweepGrace time.Duration
+	// Bodies counts the blob bodies a backend made by New holds outside
+	// its database (staged or committed): S3 objects, staged files. Nil
+	// if it holds none there.
+	Bodies func(s store.Backend) int
 }
 
 var ctx = context.Background()
@@ -111,6 +115,12 @@ func Run(t *testing.T, h Harness) {
 		{"RegisterAfterRotationGrace", testRegisterAfterGrace},
 		{"RotatedMailboxLeavesTombstone", testRotatedTombstone},
 		{"RotatedMailboxTombstoneAcrossProcesses", testRotatedTombstoneAcrossProcesses},
+		{"BlobSenderShare", testBlobSenderShare},
+		{"BlobQuotaPrecedence", testBlobQuotaPrecedence},
+		{"BlobUsage", testBlobUsage},
+		{"ListBlobs", testListBlobs},
+		{"StagedBlobs", testStagedBlobs},
+		{"ConcurrentBlobSenderShare", testConcurrentBlobShare},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, h) })
@@ -1195,5 +1205,376 @@ func testRotatedTombstoneAcrossProcesses(t *testing.T, h Harness) {
 		if _, err := s.Deposit(ctx, "old", "s", []byte("x"), time.Hour, old); !errors.Is(err, store.ErrRevoked) {
 			t.Fatalf("process %d: pre-rotation token: %v", i, err)
 		}
+	}
+}
+
+// put stores a blob of n bytes from sender into mailbox with the share
+// limits given.
+func put(s store.Backend, mailbox, sender string, n int, capBytes, shareBytes, shareBlobs int64) (store.BlobInfo, error) {
+	return s.PutBlob(ctx, store.BlobPut{Mailbox: mailbox, Sender: sender, Size: int64(n), TTL: time.Hour,
+		Limits: store.Limits{MailboxMaxBytes: capBytes}, SenderMaxBytes: shareBytes, SenderMaxBlobs: shareBlobs}, bytes.NewReader(make([]byte, n)))
+}
+
+func wantQuota(t *testing.T, err error, kind store.QuotaKind) {
+	t.Helper()
+	if !errors.Is(err, store.ErrQuota) || store.QuotaOf(err) != kind {
+		t.Fatalf("got %v, want quota %q", err, kind)
+	}
+}
+
+// 0.9.2 (§6.8): one sender key's blobs in one mailbox are bounded in bytes
+// and in number; other senders and other mailboxes are not affected; a
+// delete or an expiry gives the share back; a blob without a sender (from
+// before 0.9.2) counts against no share.
+func testBlobSenderShare(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	mustRegister(t, s, "b", 2)
+	const capB, share, count = 1 << 20, 2000, 3
+	if _, err := put(s, "a", "s1", 1000, capB, share, count); err != nil {
+		t.Fatal(err)
+	}
+	b2, err := put(s, "a", "s1", 1000, capB, share, count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = put(s, "a", "s1", 1, capB, share, count)
+	wantQuota(t, err, store.QuotaSenderBlobs)
+	_, err = put(s, "a", "s1", share+1, capB, share, count) // can never fit
+	wantQuota(t, err, store.QuotaSenderBlobs)
+	if _, err := put(s, "a", "s2", 1000, capB, share, count); err != nil {
+		t.Fatalf("another sender: %v", err)
+	}
+	if _, err := put(s, "b", "s1", 1000, capB, share, count); err != nil {
+		t.Fatalf("another mailbox: %v", err)
+	}
+	if _, err := put(s, "a", "", 5000, capB, share, count); err != nil { // no sender: no share
+		t.Fatalf("legacy blob: %v", err)
+	}
+	// A delete gives the share back (and is idempotent about it).
+	for i := 0; i < 2; i++ {
+		if err := s.DeleteBlob(ctx, "a", b2.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := put(s, "a", "s1", 1000, capB, share, count); err != nil {
+		t.Fatalf("after a delete: %v", err)
+	}
+	_, err = put(s, "a", "s1", 1, capB, share, count)
+	wantQuota(t, err, store.QuotaSenderBlobs)
+	// The number of blobs: tiny blobs cannot fill the list.
+	for i := 0; i < count; i++ {
+		if _, err := put(s, "a", "s3", 46, capB, share, count); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = put(s, "a", "s3", 46, capB, share, count)
+	wantQuota(t, err, store.QuotaSenderBlobs)
+	// Expired blobs leave the share.
+	c.Add(2 * time.Hour)
+	for i := 0; i < count; i++ {
+		if _, err := put(s, "a", "s3", 46, capB, share, count); err != nil {
+			t.Fatalf("after expiry %d: %v", i, err)
+		}
+	}
+	if _, err := put(s, "a", "s1", 2000, capB, share, count); err != nil {
+		t.Fatalf("after expiry: %v", err)
+	}
+}
+
+// The mailbox's cap comes before the sender's share, which comes before
+// the token's quota; the cap counts the mailbox's claims.
+func testBlobQuotaPrecedence(t *testing.T, h Harness) {
+	s, _ := h.open(t)
+	mustRegister(t, s, "a", 1)
+	if _, _, err := s.PutClaim(ctx, "a", make([]byte, 500), time.Hour, 3000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := put(s, "a", "s1", 2000, 3000, 2000, 16); err != nil {
+		t.Fatal(err)
+	}
+	q := i64(10)
+	lim := store.Limits{MailboxMaxBytes: 3000, TokenJTI: "j", TokenExpires: time.Now().Add(time.Hour), TokenQuotaBytes: q}
+	try := func(n int, l store.Limits) error {
+		_, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Sender: "s1", Size: int64(n), TTL: time.Hour, Limits: l,
+			SenderMaxBytes: 2000, SenderMaxBlobs: 16}, bytes.NewReader(make([]byte, n)))
+		return err
+	}
+	wantQuota(t, try(600, lim), store.QuotaMailboxBlobs) // all three exceeded
+	lim.MailboxMaxBytes = 1 << 20
+	wantQuota(t, try(600, lim), store.QuotaSenderBlobs) // share and token
+	_, err := put(s, "a", "s2", 0, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("empty blob: %v", err)
+	}
+	wantQuota(t, func() error {
+		_, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Sender: "s2", Size: 11, TTL: time.Hour, Limits: lim,
+			SenderMaxBytes: 2000, SenderMaxBlobs: 16}, bytes.NewReader(make([]byte, 11)))
+		return err
+	}(), store.QuotaToken)
+	if _, err := s.Deposit(ctx, "a", "s", []byte("x"), time.Hour, store.Limits{MailboxMaxMsgs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Deposit(ctx, "a", "s", []byte("x"), time.Hour, store.Limits{MailboxMaxMsgs: 1})
+	wantQuota(t, err, store.QuotaMailbox)
+	_, err = s.Deposit(ctx, "a", "s", []byte("xx"), time.Hour, store.Limits{TokenJTI: "d", TokenExpires: time.Now().Add(time.Hour), TokenQuotaBytes: i64(1)})
+	wantQuota(t, err, store.QuotaToken)
+	_, _, err = s.PutClaim(ctx, "a", make([]byte, 1000), time.Hour, 3000)
+	wantQuota(t, err, store.QuotaMailboxBlobs)
+}
+
+func testBlobUsage(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	lim := store.Limits{TokenJTI: "j", TokenExpires: c.Now().Add(time.Hour), TokenQuotaBytes: i64(1 << 20)}
+	for _, n := range []int{100, 200} {
+		if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Sender: "s1", Size: int64(n), TTL: time.Hour, Limits: lim}, bytes.NewReader(make([]byte, n))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := put(s, "a", "s2", 400, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.PutClaim(ctx, "a", make([]byte, 50), time.Hour, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, fresh := range []bool{false, true} {
+		u, err := s.BlobUsage(ctx, "a", "s1", "j", fresh)
+		if err != nil || u != (store.BlobUsage{MailboxBytes: 750, SenderBytes: 300, SenderBlobs: 2, TokenBytes: 300}) {
+			t.Fatalf("usage (fresh %v): %+v %v", fresh, u, err)
+		}
+	}
+	if u, err := s.BlobUsage(ctx, "a", "nobody", "", false); err != nil || u != (store.BlobUsage{MailboxBytes: 750}) {
+		t.Fatalf("usage of another sender: %+v %v", u, err)
+	}
+	c.Add(2 * time.Hour) // all expired
+	if u, err := s.BlobUsage(ctx, "a", "s1", "", true); err != nil || u.SenderBlobs != 0 || u.SenderBytes != 0 || u.MailboxBytes != 0 {
+		t.Fatalf("usage after expiry: %+v %v", u, err)
+	}
+}
+
+// The owner's list: its mailbox's unexpired blobs in id order, paged, with
+// the sender where known, and the bytes the cap is checked against.
+func testListBlobs(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	mustRegister(t, s, "b", 2)
+	var ids []string
+	for i := 0; i < 7; i++ {
+		sender := fmt.Sprintf("s%d", i%2)
+		if i == 6 {
+			sender = "" // a blob from before 0.9.2
+		}
+		b, err := put(s, "a", sender, 10+i, 0, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Sender != sender || b.CreatedAt.IsZero() {
+			t.Fatalf("put info %+v", b)
+		}
+		ids = append(ids, b.ID)
+		c.Add(time.Millisecond)
+	}
+	if _, err := put(s, "b", "s0", 99, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.PutClaim(ctx, "a", make([]byte, 1000), time.Hour, 0); err != nil {
+		t.Fatal(err)
+	}
+	var got []store.BlobInfo
+	after := ""
+	for page := 0; ; page++ {
+		bs, next, used, err := s.ListBlobs(ctx, "a", after, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if used != 1000+10+11+12+13+14+15+16 {
+			t.Fatalf("used %d", used)
+		}
+		got = append(got, bs...)
+		if next == "" {
+			if len(bs) != 1 || page != 2 {
+				t.Fatalf("last page %d: %d blobs", page, len(bs))
+			}
+			break
+		}
+		if len(bs) != 3 || next != bs[2].ID {
+			t.Fatalf("page %d: %d blobs, next %q", page, len(bs), next)
+		}
+		after = next
+	}
+	if len(got) != 7 {
+		t.Fatalf("%d blobs listed", len(got))
+	}
+	for i, b := range got {
+		want := fmt.Sprintf("s%d", i%2)
+		if i == 6 {
+			want = ""
+		}
+		if b.ID != ids[i] || b.Size != int64(10+i) || b.Sender != want || !b.ExpiresAt.After(c.Now()) || b.CreatedAt.IsZero() {
+			t.Fatalf("blob %d: %+v", i, b)
+		}
+	}
+	// A page of exactly what is left has no next.
+	if bs, next, _, err := s.ListBlobs(ctx, "a", ids[3], 3); err != nil || len(bs) != 3 || next != "" {
+		t.Fatalf("exact page: %d %q %v", len(bs), next, err)
+	}
+	// Deleted and expired blobs are not listed.
+	if err := s.DeleteBlob(ctx, "a", ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if bs, _, _, _ := s.ListBlobs(ctx, "a", "", 500); len(bs) != 6 || bs[0].ID != ids[1] {
+		t.Fatalf("after a delete: %d", len(bs))
+	}
+	c.Add(2 * time.Hour)
+	if bs, next, used, err := s.ListBlobs(ctx, "a", "", 500); err != nil || len(bs) != 0 || next != "" || used != 0 {
+		t.Fatalf("after expiry: %d %q %d %v", len(bs), next, used, err)
+	}
+	if bs, _, _, err := s.ListBlobs(ctx, "nobody", "", 10); err != nil || len(bs) != 0 {
+		t.Fatalf("unknown mailbox: %d %v", len(bs), err)
+	}
+}
+
+type failingReader struct{ n int }
+
+func (f *failingReader) Read(p []byte) (int, error) {
+	if f.n <= 0 {
+		return 0, errors.New("the client went away")
+	}
+	k := min(len(p), f.n)
+	f.n -= k
+	return k, nil
+}
+
+// A staged body is invisible and counts against nothing until committed;
+// a stage that fails, a discarded stage and a commit that fails (and is
+// then discarded) leave no body behind.
+func testStagedBlobs(t *testing.T, h Harness) {
+	s, _ := h.open(t)
+	mustRegister(t, s, "a", 1)
+	bodies := func() int {
+		if h.Bodies == nil {
+			return 0
+		}
+		return h.Bodies(s)
+	}
+	base := bodies()
+	for name, r := range map[string]io.Reader{
+		"short":   bytes.NewReader(make([]byte, 999)),
+		"long":    bytes.NewReader(make([]byte, 1001)),
+		"failing": &failingReader{n: 500},
+	} {
+		if st, err := s.StageBlob(ctx, "a", 1000, r); err == nil || st != nil {
+			t.Fatalf("%s body staged: %v", name, err)
+		}
+		if n := bodies(); n != base {
+			t.Fatalf("%s body left %d bodies", name, n-base)
+		}
+	}
+	st, err := s.StageBlob(ctx, "a", 1000, bytes.NewReader(make([]byte, 1000)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := s.BlobUsage(ctx, "a", "s", "", true); u.MailboxBytes != 0 {
+		t.Fatalf("a staged body counts: %+v", u)
+	}
+	if bs, _, _, _ := s.ListBlobs(ctx, "a", "", 10); len(bs) != 0 {
+		t.Fatal("a staged body is listed")
+	}
+	for i := 0; i < 2; i++ {
+		if err := st.Discard(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := bodies(); n != base {
+		t.Fatalf("discard left %d bodies", n-base)
+	}
+	if _, err := st.Commit(ctx, store.BlobPut{Mailbox: "a", Size: 1000, TTL: time.Hour}); err == nil {
+		t.Fatal("a discarded body was committed")
+	}
+	// A commit refused (quota), then discarded.
+	st, err = s.StageBlob(ctx, "a", 1000, bytes.NewReader(make([]byte, 1000)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Commit(ctx, store.BlobPut{Mailbox: "a", Size: 999, TTL: time.Hour}); err == nil {
+		t.Fatal("committed with another size")
+	}
+	_, err = st.Commit(ctx, store.BlobPut{Mailbox: "a", Sender: "s", Size: 1000, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 999}})
+	wantQuota(t, err, store.QuotaMailboxBlobs)
+	st.Discard(ctx)
+	if n := bodies(); n != base {
+		t.Fatalf("refused commit left %d bodies", n-base)
+	}
+	// A commit after the mailbox was deleted.
+	st, err = s.StageBlob(ctx, "a", 10, bytes.NewReader(make([]byte, 10)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), c0(), c0().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Commit(ctx, store.BlobPut{Mailbox: "a", Size: 10, TTL: time.Hour}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("commit into a deleted mailbox: %v", err)
+	}
+	st.Discard(ctx)
+	if n := bodies(); n != base {
+		t.Fatalf("commit into a deleted mailbox left %d bodies", n-base)
+	}
+	// A committed body is read back whole; Discard after it changes nothing.
+	mustRegister(t, s, "c", 3)
+	data := bytes.Repeat([]byte("q"), 70_000)
+	st, err = s.StageBlob(ctx, "c", int64(len(data)), bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := st.Commit(ctx, store.BlobPut{Mailbox: "c", Sender: "s", Size: int64(len(data)), TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Discard(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, rc, err := s.OpenBlob(ctx, "c", info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(rc)
+	rc.Close()
+	if !bytes.Equal(b, data) || got.Sender != "s" || got.Size != int64(len(data)) {
+		t.Fatalf("committed blob: %+v, %d bytes", got, len(b))
+	}
+}
+
+func c0() time.Time { return NewClock().Now() }
+
+// The share holds under concurrent uploads by one sender, on any number of
+// processes.
+func testConcurrentBlobShare(t *testing.T, h Harness) {
+	a, b, _ := h.pair(t)
+	mustRegister(t, a, "a", 1)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok, quota := 0, 0
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(s store.Backend) {
+			defer wg.Done()
+			_, err := put(s, "a", "s1", 10, 1<<20, 1<<20, 4)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				ok++
+			case store.QuotaOf(err) == store.QuotaSenderBlobs:
+				quota++
+			default:
+				t.Error(err)
+			}
+		}([]store.Backend{a, b}[i%2])
+	}
+	wg.Wait()
+	if ok != 4 || quota != 6 {
+		t.Fatalf("%d stored, %d refused; want 4 and 6", ok, quota)
 	}
 }

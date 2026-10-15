@@ -197,7 +197,7 @@ func TestEvictionAccountingConcurrent(t *testing.T) {
 		u := f.newUploadFrom("old", string(rune('a'+i)), "x")
 		u.cut = func() { cuts.Add(1) }
 		u.add(i)
-		r, e := s.acquireUpload(u)
+		r, e := s.acquireUpload(u, nil)
 		if e != nil {
 			t.Fatal(e.code)
 		}
@@ -212,7 +212,7 @@ func TestEvictionAccountingConcurrent(t *testing.T) {
 			defer wg.Done()
 			u := f.newUploadFrom("new", "n", string(rune('A'+i)))
 			u.cut = func() { cuts.Add(1) }
-			if r, e := s.acquireUpload(u); e == nil {
+			if r, e := s.acquireUpload(u, nil); e == nil {
 				admitted.Add(1)
 				r()
 				r() // a second release is harmless
@@ -243,7 +243,7 @@ func TestEvictionRacesCompletion(t *testing.T) {
 	s := f.s
 	for i := 0; i < 300; i++ {
 		old := f.newUpload("a", "x")
-		relOld, e := s.acquireUpload(old)
+		relOld, e := s.acquireUpload(old, nil)
 		if e != nil {
 			t.Fatal(e.code)
 		}
@@ -253,7 +253,7 @@ func TestEvictionRacesCompletion(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); finished.Store(old.state.CompareAndSwap(upReading, upDone)) }()
-		go func() { defer wg.Done(); relNew, _ = s.acquireUpload(f.newUploadFrom("m", "b", "y")) }()
+		go func() { defer wg.Done(); relNew, _ = s.acquireUpload(f.newUploadFrom("m", "b", "y"), nil) }()
 		wg.Wait()
 		switch {
 		case finished.Load() && relNew != nil:
@@ -447,7 +447,7 @@ func TestNetClocksPruned(t *testing.T) {
 	gone, back, busy := f.newUploadFrom("gone", "a", "x"), f.newUploadFrom("back", "b", "x"), f.newUploadFrom("busy", "c", "x")
 	var rels []func()
 	for _, u := range []*upload{gone, back, busy} {
-		r, e := s.acquireUpload(u)
+		r, e := s.acquireUpload(u, nil)
 		if e != nil {
 			t.Fatal(e.code)
 		}

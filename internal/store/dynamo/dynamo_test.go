@@ -1,6 +1,7 @@
 package dynamo_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -85,3 +86,67 @@ func TestCollectDropsExpired(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A sender's share item has no TTL: it is deleted when it lists no blob,
+// whether its blobs were deleted or expired and recounted.
+func TestSenderItemsDoNotAccumulate(t *testing.T) {
+	db := ddblocal.Client(t)
+	table := ddblocal.Table(t, db)
+	c := storetest.NewClock()
+	s, err := dynamo.New(dynamo.Config{Table: table, DB: db, S3: fakes3.New(t).Client(), Bucket: "b", Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	senderItems := func() int {
+		out, err := db.Query(ctx, &dynamodb.QueryInput{
+			TableName:                 aws.String(table),
+			KeyConditionExpression:    aws.String("pk = :pk AND begins_with(sk, :p)"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":pk": pk("a"), ":p": &types.AttributeValueMemberS{Value: "BS#"}},
+			ConsistentRead:            aws.Bool(true),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, it := range out.Items {
+			if _, ok := it["ttl_s"]; ok {
+				t.Fatal("a sender item has a TTL")
+			}
+		}
+		return len(out.Items)
+	}
+	put := func(sender string, ttl time.Duration) store.BlobInfo {
+		b, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Sender: sender, Size: 10, TTL: ttl, Limits: store.Limits{MailboxMaxBytes: 1 << 20},
+			SenderMaxBytes: 1 << 20, SenderMaxBlobs: 16}, bytesReader(10))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	b1, b2 := put("s1", time.Hour), put("s1", time.Hour)
+	put("s2", time.Minute)
+	if n := senderItems(); n != 2 {
+		t.Fatalf("%d sender items", n)
+	}
+	s.DeleteBlob(ctx, "a", b1.ID)
+	if n := senderItems(); n != 2 {
+		t.Fatalf("after one delete: %d", n)
+	}
+	s.DeleteBlob(ctx, "a", b2.ID)
+	if n := senderItems(); n != 1 {
+		t.Fatalf("s1's item outlived its blobs: %d", n)
+	}
+	// s2's blob expires; a recount of the mailbox removes it, and its
+	// sender's item with it.
+	c.Add(2 * time.Minute)
+	if _, _, _, err := s.ListBlobs(ctx, "a", "", 10); err != nil { // a first page recounts
+		t.Fatal(err)
+	}
+	if n := senderItems(); n != 0 {
+		t.Fatalf("s2's item outlived its expired blob: %d", n)
+	}
+}
+
+func bytesReader(n int) *bytes.Reader { return bytes.NewReader(make([]byte, n)) }

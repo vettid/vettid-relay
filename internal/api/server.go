@@ -53,6 +53,7 @@ type Server struct {
 
 	smallBodyTimeout time.Duration // how long a small body has to arrive (handlers.go)
 	blobPaceWindow   time.Duration // period of cfg.BlobPaceBytes (blobs.go)
+	blobCommitWait   time.Duration // bound on an upload's commit, and apart on its cleanup (blobs.go)
 	claimLimit       RateLimiter   // unauthenticated claim GETs, per IPv4 / IPv6 /64
 	webLimit         RateLimiter   // everything outside /v1/ and /healthz, per IPv4 / IPv6 /64 (always in-process)
 
@@ -60,13 +61,14 @@ type Server struct {
 	hsts bool     // public base URL is https: send Strict-Transport-Security
 
 	hub      *hub
-	wsOpen   atomic.Int64   // WebSocket sessions holding a slot (cfg.MaxWebSocketSessions)
-	health   storeHealth    // /healthz: the last store ping
-	healthTO time.Duration  // how long that ping may take (healthPingTimeout; tests shorten it)
-	bus      WakeBus        // cross-process wake-on-deposit (nil: single process)
-	hints    EmptyHints     // known-empty mailboxes (nil: always query)
-	forceGen atomic.Uint64  // bumped by WakeAll: collectors then query for real
-	xfers    *blobTransfers // blob transfers in progress (slots, blobs.go)
+	wsOpen   atomic.Int64      // WebSocket sessions holding a slot (cfg.MaxWebSocketSessions)
+	health   storeHealth       // /healthz: the last store ping
+	healthTO time.Duration     // how long that ping may take (healthPingTimeout; tests shorten it)
+	bus      WakeBus           // cross-process wake-on-deposit (nil: single process)
+	hints    EmptyHints        // known-empty mailboxes (nil: always query)
+	forceGen atomic.Uint64     // bumped by WakeAll: collectors then query for real
+	xfers    *blobTransfers    // blob transfers in progress (slots, blobs.go)
+	blobRes  *blobReservations // blob uploads' reserved quota (blobquota.go)
 	mux      *http.ServeMux
 }
 
@@ -146,7 +148,8 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		mux:   http.NewServeMux(),
 		hub:   newHub(),
 
-		xfers: newBlobTransfers(),
+		xfers:   newBlobTransfers(),
+		blobRes: newBlobReservations(),
 
 		byteLimit:     ratelimit.New(cfg.RateIPBytesPerSec, cfg.RateIPBytesBurst, 200_000),
 		blobByteLimit: ratelimit.New(cfg.RateBlobBytesPerSec, cfg.RateBlobBytesBurst, 200_000),
@@ -161,6 +164,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 
 		smallBodyTimeout: smallBodyTimeout,
 		blobPaceWindow:   config.BlobPaceWindow,
+		blobCommitWait:   blobCommitTimeout,
 		healthTO:         healthPingTimeout,
 		subLimit:         ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
 		claimLimit:       ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
@@ -226,6 +230,7 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("PUT /v1/blob/{mailbox_id}", s.handleBlobPut)
 		s.mux.HandleFunc("GET /v1/blob/{blob_id}", s.handleBlobGet)
 		s.mux.HandleFunc("DELETE /v1/blob/{blob_id}", s.handleBlobDelete)
+		s.mux.HandleFunc("POST /v1/blobs", s.handleBlobList)
 	}
 	s.webRoutes()
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { s.writeError(w, fail(CodeNotFound)) })

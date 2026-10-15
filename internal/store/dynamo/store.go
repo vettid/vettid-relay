@@ -14,7 +14,8 @@
 //	MB#<mailbox>  D#<kind>#<value> denylist entry: exp
 //	MB#<mailbox>  T#<jti>          token quota usage: msgs, bytes, exp
 //	MB#<mailbox>  X#<jti>          consumed one-shot open token: exp
-//	MB#<mailbox>  B#<ulid>         blob metadata: sz, exp, sender (body in S3)
+//	MB#<mailbox>  B#<ulid>         blob metadata: sz, cr, exp, snd (the uploading key; absent before 0.9.2); body in S3 at blobs/<mailbox>/<ulid>
+//	MB#<mailbox>  BS#<sender>      a sender's share of the mailbox's blobs (0.9.2): e_<ulid> = {s: size, e: exp} per blob, b (bytes), n (blobs), v; no TTL
 //	MB#<mailbox>  C#<claim id>     claim marker (counts toward the storage cap)
 //	CL#<claim id> CL               claim: mb, sz, exp, body
 //
@@ -647,11 +648,12 @@ func withZero(v item) item { v[":zero"] = avN(0); return v }
 // dropExpired deletes one expired item found while scanning a mailbox
 // (no counter change: callers recount or never counted it).
 func (s *Store) dropExpired(ctx context.Context, mailbox, sk string, now time.Time) error {
-	_, err := s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+	out, err := s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName:                 &s.cfg.Table,
 		Key:                       key(mbPK(mailbox), sk),
 		ConditionExpression:       aws.String("exp <= :now"),
 		ExpressionAttributeValues: item{":now": avN(ms(now))},
+		ReturnValues:              types.ReturnValueAllOld,
 	})
 	if err != nil && !isCCF(err) {
 		return err
@@ -659,9 +661,19 @@ func (s *Store) dropExpired(ctx context.Context, mailbox, sk string, now time.Ti
 	switch {
 	case strings.HasPrefix(sk, "M#"):
 		return s.deleteKey(ctx, mbPK(mailbox), leaseSK(strings.TrimPrefix(sk, "M#")))
-	case strings.HasPrefix(sk, "B#") && s.cfg.S3 != nil:
-		_, err := s.cfg.S3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.cfg.Bucket, Key: aws.String(blobKey(mailbox, strings.TrimPrefix(sk, "B#")))})
-		return err
+	case strings.HasPrefix(sk, "B#"):
+		id := strings.TrimPrefix(sk, "B#")
+		if out != nil && len(out.Attributes) > 0 {
+			// It leaves its sender's share with it (the counters are
+			// recounted by the caller).
+			if err := s.leaveShare(ctx, mailbox, getS(out.Attributes, "snd"), id, getN0(out.Attributes, "sz")); err != nil {
+				return err
+			}
+		}
+		if s.cfg.S3 != nil {
+			_, err := s.cfg.S3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.cfg.Bucket, Key: aws.String(blobKey(mailbox, id))})
+			return err
+		}
 	}
 	return nil
 }

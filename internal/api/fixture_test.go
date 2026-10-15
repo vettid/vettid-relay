@@ -49,6 +49,7 @@ type fixture struct {
 	s      *Server
 	ts     *httptest.Server
 	reg    *metrics.Registry
+	s3     *fakes3.Server // the blob bucket, with RELAY_TEST_API_STORE=dynamodb
 }
 
 // newFixture starts a relay on an httptest server. Server and store share a
@@ -142,6 +143,7 @@ func (f *fixture) backend() func() store.Backend {
 	}
 	db := ddblocal.Client(f.t)
 	table, s3 := ddblocal.Table(f.t, db), fakes3.New(f.t)
+	f.s3 = s3
 	return func() store.Backend {
 		st, err := dynamo.New(dynamo.Config{Table: table, Bucket: "blobs", DB: db, S3: s3.Client(), Now: f.clk.now})
 		if err != nil {
