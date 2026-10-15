@@ -60,14 +60,15 @@ func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 	// The key is the claim's creator, the mailbox owner whose signature
 	// authorizeOwner verified; and its network's ceiling.
 	network, owner, n := s.network(r), auth.EncodeKey(mb.PubKey), int64(len(body))
-	if e := s.takeKeyAndNetwork(limKeyBytes, s.keyByteLimit, owner, limBytes, s.byteLimit, network, n); e != nil {
+	src, e := s.takeKeyAndNetwork(limKeyBytes, s.keyByteLimit, owner, limBytes, s.byteLimit, network, n)
+	if e != nil {
 		s.writeError(w, e)
 		return
 	}
 	id, exp, err := s.st.PutClaim(r.Context(), mb.ID, body, ttl, s.cfg.MailboxMaxBlobBytes)
 	if err != nil { // not stored: the charges are given back
-		s.refundBytes(limKeyBytes, s.keyByteLimit, owner, n)
-		s.refundBytes(limBytes, s.byteLimit, network, n)
+		s.refundBytes(limKeyBytes, s.keyByteLimit, owner, n, 0)
+		s.refundBytes(limBytes, s.byteLimit, network, n, src)
 	}
 	switch {
 	case errors.Is(err, store.ErrQuota): // the mailbox's blob storage

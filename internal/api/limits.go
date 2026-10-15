@@ -32,7 +32,9 @@ import (
 // Two byte budgets per network bound what one network can make the relay
 // store and move, whatever number of keys and mailboxes it holds. They are
 // charged with a request's declared length (Content-Length) before its
-// body is read, and kept per process:
+// body is read. Shared (relay-wide since 0.9.4: with several
+// processes on one store, a per-process ceiling multiplied by the process
+// count could take the store's whole write capacity):
 //
 //	bytes       deposits (after §5.3 steps 1–6) and claims (after the
 //	            claim's signature verified).
@@ -75,8 +77,8 @@ const limWSNetworkHard = "ws_network_hard"
 
 var allLimiters = []string{limAddress, limKey, limSender, limRegister, limClaim, limWeb}
 
-// The byte budgets (per process): bytes and blob_bytes per network,
-// blob_key_bytes per authenticated key. They are reported after every
+// The byte budgets: bytes and blob_bytes per network (shared),
+// blob_key_bytes and key_bytes per authenticated key (per process). They are reported after every
 // other field of the "rate limits" line.
 const (
 	limBytes        = "bytes"
@@ -115,6 +117,36 @@ type ByteLimiter interface {
 	Ready(key string, now time.Time) (bool, time.Duration)
 	Charge(key string, n int64, now time.Time)
 	Burst() int64
+}
+
+// SourcedByteLimiter is implemented by a ByteLimiter with two backends
+// (internal/coord: the shared bucket, and a per-process one while the
+// shared one cannot be reached). AllowNFrom names the backend that took
+// a charge (src, never 0); RefundTo gives a refund back to that backend
+// only, so a refund never credits a bucket that was not charged (a
+// refund the shared bucket cannot take is dropped: the charge stands).
+type SourcedByteLimiter interface {
+	AllowNFrom(key string, n int64, now time.Time) (ok bool, wait time.Duration, src int)
+	RefundTo(key string, n int64, src int)
+}
+
+// allowNFrom is l.AllowN with the backend that took the charge (0 for a
+// limiter with one backend).
+func allowNFrom(l ByteLimiter, key string, n int64, now time.Time) (bool, time.Duration, int) {
+	if sl, ok := l.(SourcedByteLimiter); ok {
+		return sl.AllowNFrom(key, n, now)
+	}
+	ok, wait := l.AllowN(key, n, now)
+	return ok, wait, 0
+}
+
+// refundTo gives n bytes back to the backend src of l that took them.
+func refundTo(l ByteLimiter, key string, n int64, src int) {
+	if sl, ok := l.(SourcedByteLimiter); ok && src != 0 {
+		sl.RefundTo(key, n, src)
+		return
+	}
+	l.Refund(key, n)
 }
 
 // maxCounted bounds the per-minute tally of requests per network and per
@@ -200,22 +232,24 @@ func (s *Server) take(name string, l RateLimiter, key string) *apiError {
 
 // takeBytes charges n bytes to the byte budget l (name: limBytes or
 // limBlobBytes) of network, or returns the 429. Refused, it charges
-// nothing.
-func (s *Server) takeBytes(name string, l ByteLimiter, network string, n int64) *apiError {
-	ok, wait := l.AllowN(network, n, s.now())
+// nothing. src names the backend that took the charge, for refundBytes.
+func (s *Server) takeBytes(name string, l ByteLimiter, network string, n int64) (src int, e *apiError) {
+	ok, wait, src := allowNFrom(l, network, n, s.now())
 	if !ok {
 		s.rl.refused.With(name).Inc()
-		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
+		return 0, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
 	}
 	s.rl.allowed.With(name).Inc()
 	s.rl.tally(name, network, int(n), false)
-	return nil
+	return src, nil
 }
 
-// refundBytes gives back n bytes charged by takeBytes for a request that
-// stored or moved nothing (refused later, failed, or not stored).
-func (s *Server) refundBytes(name string, l ByteLimiter, network string, n int64) {
-	l.Refund(network, n)
+// refundBytes gives back n bytes charged by takeBytes (or
+// takeKeyAndNetwork, or forceBytes; src 0 for those) for a request that
+// stored or moved nothing (refused later, failed, or not stored), to the
+// backend src that took them.
+func (s *Server) refundBytes(name string, l ByteLimiter, network string, n int64, src int) {
+	refundTo(l, network, n, src)
 	s.rl.tally(name, network, -int(n), false)
 }
 
@@ -223,27 +257,31 @@ func (s *Server) refundBytes(name string, l ByteLimiter, network string, n int64
 // ceiling, or neither (the 429 of the one that refused).
 // (Used for blob downloads, whose key, the owner's, is verified first.)
 func (s *Server) takeBlobBytes(key, network string, n int64) *apiError {
-	return s.takeKeyAndNetwork(limBlobKeyBytes, s.blobKeyLimit, key, limBlobBytes, s.blobByteLimit, network, n)
+	_, e := s.takeKeyAndNetwork(limBlobKeyBytes, s.blobKeyLimit, key, limBlobBytes, s.blobByteLimit, network, n)
+	return e
 }
 
 // takeKeyAndNetwork charges n bytes to a verified key's budget (keyName,
 // keyL) and to its network's ceiling (netName, netL), or to neither.
-func (s *Server) takeKeyAndNetwork(keyName string, keyL ByteLimiter, key, netName string, netL ByteLimiter, network string, n int64) *apiError {
+// netSrc names the backend of netL that took the charge (refundBytes).
+func (s *Server) takeKeyAndNetwork(keyName string, keyL ByteLimiter, key, netName string, netL ByteLimiter, network string, n int64) (netSrc int, e *apiError) {
 	now := s.now()
-	if ok, wait := keyL.AllowN(key, n, now); !ok {
+	ok, wait, keySrc := allowNFrom(keyL, key, n, now)
+	if !ok {
 		s.rl.refused.With(keyName).Inc()
-		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
+		return 0, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
 	}
-	if ok, wait := netL.AllowN(network, n, now); !ok {
-		keyL.Refund(key, n)
+	ok, wait, netSrc = allowNFrom(netL, network, n, now)
+	if !ok {
+		refundTo(keyL, key, n, keySrc)
 		s.rl.refused.With(netName).Inc()
-		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
+		return 0, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
 	}
 	for _, x := range [][2]string{{keyName, key}, {netName, network}} {
 		s.rl.allowed.With(x[0]).Inc()
 		s.rl.tally(x[0], x[1], int(n), false)
 	}
-	return nil
+	return netSrc, nil
 }
 
 // chargeBlobKey charges n bytes to key's blob budget after the fact,

@@ -74,6 +74,12 @@ type Limiters struct {
 	Sender   RateLimiter // per sender key
 	Register RateLimiter // new mailboxes per client network
 	Claim    RateLimiter // unauthenticated claim GETs per client network
+
+	// The byte budgets' network ceilings (limits 11 and 12), relay-wide
+	// (0.9.4). The per-key byte budgets stay per process:
+	// keys are bounded by these ceilings.
+	Bytes     ByteLimiter // deposit and claim bytes per client network
+	BlobBytes ByteLimiter // blob upload and download bytes per client network
 }
 
 // WithRateLimiters replaces in-memory limiters with shared ones.
@@ -93,6 +99,12 @@ func WithRateLimiters(l Limiters) Option {
 		}
 		if l.Claim != nil {
 			s.claimLimit = l.Claim
+		}
+		if l.Bytes != nil {
+			s.byteLimit = l.Bytes
+		}
+		if l.BlobBytes != nil {
+			s.blobByteLimit = l.BlobBytes
 		}
 	}
 }

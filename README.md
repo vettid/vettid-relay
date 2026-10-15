@@ -135,9 +135,9 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits and blob uploads after the request signature verifies (§5.3 step 7): the token's `sub` is written by the mailbox owner, so a token naming someone else's key can't spend that key's budget. It's keyed by token `sub`, or by `jti` for open tokens. |
 | `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
 | `RELAY_RATE_KEY_BYTES_PER_SEC` / `RELAY_RATE_KEY_BYTES_BURST` | `65536` / `2097152` (64 KiB/s, 2 MiB) | Byte budget per key for what it asks the relay to store. For a deposit the key is the sender's (the token's `sub`, or an open token's signer), proved by the request signature only after the body: an empty budget is refused unread, and the key is charged once the signature verified, with the body's length (into debt if need be). For a claim the key is its creator's (the mailbox owner, proved first). Each vault of a vault host has its own. The burst must hold the largest deposit body and `RELAY_MAX_CLAIM_BYTES`. |
-| `RELAY_RATE_IP_BYTES_PER_SEC` / `RELAY_RATE_IP_BYTES_BURST` | `1048576` / `33554432` (1 MiB/s, 32 MiB) | The ceiling over all keys of one client network: deposits (charged with their declared length after the token verified, before the body is read; without a `Content-Length`, the largest deposit body) and claims (charged with the creator's key once the claim is authenticated). A deposit or claim that is then not stored (quota, signature, malformed body, store error) gets its charges back. Over either budget, `429 rate_limited` with `retry_after`, a deposit's body unread. Per relay process. Its rate and burst must be at least a key's. |
+| `RELAY_RATE_IP_BYTES_PER_SEC` / `RELAY_RATE_IP_BYTES_BURST` | `786432` / `8388608` (768 KiB/s, 8 MiB) | The ceiling over all keys of one client network: deposits (charged with their declared length after the token verified, before the body is read; without a `Content-Length`, the largest deposit body) and claims (charged with the creator's key once the claim is authenticated). A deposit or claim that is then not stored (quota, signature, malformed body, store error) gets its charges back. Over either budget, `429 rate_limited` with `retry_after`, a deposit's body unread. Relay-wide: with Valkey, one bucket per network for all relay processes (without Valkey, or while it is unreachable, per process). Its rate and burst must be at least a key's. |
 | `RELAY_RATE_BLOB_KEY_BYTES_PER_SEC` / `RELAY_RATE_BLOB_KEY_BYTES_BURST` | `1048576` / `33554432` (1 MiB/s, 32 MiB) | Byte budget for blobs per key: for an upload the sender's key (the token's `sub`, proved by the request signature only after the body), for a download the mailbox owner's (proved first). Each vault of a vault host has its own. An upload is refused unread if its key's budget is empty, but charged to it only once the signature has verified, with the bytes received (into debt if need be), so a token naming someone else's key can't spend that key's budget. The burst holds four blobs of the maximum size. Must hold `RELAY_MAX_BLOB_BYTES`. |
-| `RELAY_RATE_BLOB_BYTES_PER_SEC` / `RELAY_RATE_BLOB_BYTES_BURST` | `8388608` / `268435456` (8 MiB/s, 256 MiB) | The ceiling over all keys of one client network, charged for uploads with the declared length (or `RELAY_MAX_BLOB_BYTES` without one) after the token checks (§5.3 steps 1–6), before the body is read, and for downloads together with the owner's key budget (the blob's size, at most a key's burst, after the owner's signature verified; an empty budget refuses a download before the store is read; a download refused by one is charged to neither). An upload that stores nothing gets back only the part of its charge it never sent: every byte that reached the relay stays charged, whatever refused it (body failure, signature, quota, store). One refused a transfer slot (it held none) gets everything back. Over it, `429 rate_limited` with `retry_after`. Per relay process. With blobs enabled the ceiling's rate and burst must be at least a key's; every rate and burst must be greater than zero regardless. |
+| `RELAY_RATE_BLOB_BYTES_PER_SEC` / `RELAY_RATE_BLOB_BYTES_BURST` | `8388608` / `268435456` (8 MiB/s, 256 MiB) | The ceiling over all keys of one client network, charged for uploads with the declared length (or `RELAY_MAX_BLOB_BYTES` without one) after the token checks (§5.3 steps 1–6), before the body is read, and for downloads together with the owner's key budget (the blob's size, at most a key's burst, after the owner's signature verified; an empty budget refuses a download before the store is read; a download refused by one is charged to neither). An upload that stores nothing gets back only the part of its charge it never sent: every byte that reached the relay stays charged, whatever refused it (body failure, signature, quota, store). One refused a transfer slot (it held none) gets everything back. Over it, `429 rate_limited` with `retry_after`. Relay-wide: with Valkey, one bucket per network for all relay processes (without Valkey, or while it is unreachable, per process). With blobs enabled the ceiling's rate and burst must be at least a key's; every rate and burst must be greater than zero regardless. |
 | `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | Per-source-IP bucket for the web endpoints (§6.11) and every other path outside `/v1/` except `/healthz`. It's separate from the API bucket, so scanners never use up mailbox traffic's budget, and always in-process (per relay process, no Valkey round trip). |
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
 | `RELAY_ANDROID_CERT_SHA256` | the official VettID app's signing keys | Comma-separated SHA-256 certificate fingerprints for `assetlinks.json`, colon-separated or plain hex, any case (served in uppercase colon form). The built-in default (`config.DefaultAndroidCertFingerprints`: the production upload key and the two staging signers) lets a self-hosted relay open links in the official app with no configuration. Set but empty turns `assetlinks.json` off (404). |
@@ -164,26 +164,39 @@ version does not protect against. In short:
   record and store read; the budget of **new mailboxes**
   (`RELAY_RATE_REGISTER_*`); and two **byte budgets**, which bound what one
   network can make the relay store and move however many keys and
-  mailboxes it holds: for deposits and claims a ceiling of 1 MiB/s (burst
-  32 MiB, `RELAY_RATE_IP_BYTES_*`) on top of a budget per key, 64 KiB/s
+  mailboxes it holds: for deposits and claims a ceiling of 768 KiB/s (burst
+  8 MiB, `RELAY_RATE_IP_BYTES_*`) on top of a budget per key, 64 KiB/s
   (burst 2 MiB, `RELAY_RATE_KEY_BYTES_*`), and for blob uploads and downloads a ceiling
   of 8 MiB/s (burst 256 MiB, `RELAY_RATE_BLOB_BYTES_*`) on top of a budget
   per authenticated key, 1 MiB/s (burst 32 MiB, `RELAY_RATE_BLOB_KEY_BYTES_*`),
   so a vault host's vaults don't share one budget (a deposit's or an
   upload's key pays only once its signature has verified). They are charged
-  with the declared length before a body is read, never look at the
-  target, and are per process. Nothing else keyed on a network can refuse a request
+  with the declared length before a body is read, and never look at the
+  target. The two network ceilings are relay-wide (shared through Valkey
+  by every process, like the flood guard); the per-key budgets are per
+  process. Nothing else keyed on a network can refuse a request
   that is properly signed by a key with a mailbox. There is no penalty
   state.
 - A vault host of 900 vaults, at three messages a minute each of 4 KB
   (base64 makes 4 KB about 5.5 KB), each crossing the host about twice
   (to the peer's vault, and from a vault to its phone), stores about
-  0.5 MB/s: half the network's ceiling; at a message a minute, a sixth.
+  0.5 MB/s: 62% of the network's ceiling; at a message a minute, a fifth.
   Each vault has its own 64 KiB/s (about 12 messages a second) and a
   burst of 2 MiB (about 380 messages at once: a message to 300
-  connections). The 32 MiB ceiling burst holds a mass unlock (about two
-  deposits per vault, 10 MB) three times over; a mass unlock is paced by
-  the flood guard first anyway.
+  connections). A mass unlock (about two deposits per vault, 10 MB) is
+  paced by the flood guard to at most 100 deposits a second, about
+  0.5 MiB/s, under the ceiling's rate; the 8 MiB burst is for moments
+  above it. The ceiling is shared by all relay tasks, so one network's
+  bytes don't multiply with the task count. It bounds bytes, not
+  writes: a 4 KB message costs the DynamoDB table about 21 write units
+  with its collect and ack, so for small messages the flood guard bounds
+  a network's table use (about 2,500 units a second at 100 deposits a
+  second of about 5.5 KB, acks included), and a full 900-vault host
+  needs about 1,800 to 1,900 by itself. A table capped at 2,000 write
+  units a second is too small for one full host, so production's cap is
+  being raised to 10,000 (vettid.org's relay data stack); against it
+  one network's worst case is about a quarter and a full host about a
+  fifth. Size these limits as a share of the table's cap.
 - **Blob transfers**: at most 8 per process, of which at most 6 uploads
   (2 are kept for downloads); per mailbox at most 2 uploads and,
   separately, 2 downloads; one upload at a time per sender key and
@@ -301,9 +314,10 @@ version does not protect against. In short:
   rotate, denylist, claim: at most 16 KiB), which are read before the
   signature can be checked, have 10 s to arrive (13 kbit/s).
 - No limit is an oracle; there is no allowlist.
-- With Valkey the buckets are shared by all relay processes (the web bucket
-  and the per-mailbox collector cap are per process). If Valkey is
-  unreachable they fall back to per-process ones.
+- With Valkey the buckets are shared by all relay processes, the two
+  network byte ceilings included (the web bucket, the per-key byte
+  budgets and the per-mailbox collector cap are per process). If Valkey
+  is unreachable they fall back to per-process ones of the same size.
 
 **When to raise the flood guard.** A host's steady traffic reaches the
 rate (100/s) at about 2,500 idle vaults, 1,100 at a message a minute each,
@@ -468,12 +482,14 @@ other process sees, refuses or is woken by.
   `RELAY_MAX_WS_SESSIONS`, `RELAY_MAX_WS_SESSIONS_PER_NETWORK`,
   `RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD`,
   `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS`,
-  `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX`, the two byte budgets
-  (`RELAY_RATE_KEY_BYTES_*`, `RELAY_RATE_IP_BYTES_*`, `RELAY_RATE_BLOB_KEY_BYTES_*`,
-  `RELAY_RATE_BLOB_BYTES_*`), the log budget and
+  `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX`, the per-key byte budgets
+  (`RELAY_RATE_KEY_BYTES_*`, `RELAY_RATE_BLOB_KEY_BYTES_*`), the log budget and
   the replay-cache capacity bound each process's own resources. With N
-  processes behind a load balancer a network's byte budgets are up to N
-  times the configured ones. A client that reconnects to another
+  processes behind a load balancer a key's byte budgets are up to N
+  times the configured ones; its network's ceilings
+  (`RELAY_RATE_IP_BYTES_*`, `RELAY_RATE_BLOB_BYTES_*`) are not: they are
+  shared through Valkey (and per process only while Valkey is
+  unreachable). A client that reconnects to another
   process is counted there afresh.
 - **Mailbox quotas** are counters updated in the same transaction as the
   write. Acks, expiry and TTL deletions can leave them high; a failing quota
@@ -691,7 +707,7 @@ coordination tests, the whole API suite on DynamoDB, and a two-process e2e
 across processes for long-poll and WebSocket, one open token raced from both
 processes, one claim fetched concurrently from both, a request replayed to
 the other process, shared rate limits (the flood guard, the per-key limit,
-claim fetches), and a process stopping mid-test.
+claim fetches, the network byte ceilings for deposits and blob uploads), and a process stopping mid-test.
 
 Layout:
 

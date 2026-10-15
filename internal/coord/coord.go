@@ -9,6 +9,9 @@
 //     a client's limit is the same however the load balancer spreads it.
 //     If Valkey cannot be reached a per-process bucket takes over (limits
 //     are best-effort relay policy, availability matters more).
+//   - ByteLimiter: the byte budgets' network ceilings (§7.2 limits 11 and
+//     12), the same GCRA in bytes with the charge, forced charge, refund
+//     and look the API makes, each one atomic script; the same fallback.
 //   - WakeBus: wake-on-deposit across processes over sharded pub/sub. A lost
 //     signal never loses a message: collectors re-check the store when a
 //     long-poll ends, on every WebSocket ping, after any resubscription, and

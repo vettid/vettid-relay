@@ -29,6 +29,9 @@ func Client(t testing.TB) *dynamodb.Client {
 	t.Helper()
 	ep := os.Getenv(EnvEndpoint)
 	if ep == "" {
+		if os.Getenv("RELAY_TEST_REQUIRE_SHARED") == "1" {
+			t.Fatalf("%s not set, and RELAY_TEST_REQUIRE_SHARED=1", EnvEndpoint)
+		}
 		t.Skipf("%s not set (run `make test-dynamo`)", EnvEndpoint)
 	}
 	return dynamodb.New(dynamodb.Options{

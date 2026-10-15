@@ -218,7 +218,7 @@ func TestRateLimitConfig(t *testing.T) {
 // their variables, and the start-up checks between related limits.
 func TestResourceLimitConfig(t *testing.T) {
 	d := Defaults()
-	if d.RateKeyBytesPerSec != 64<<10 || d.RateKeyBytesBurst != 2<<20 || d.RateIPBytesPerSec != 1<<20 || d.RateIPBytesBurst != 32<<20 ||
+	if d.RateKeyBytesPerSec != 64<<10 || d.RateKeyBytesBurst != 2<<20 || d.RateIPBytesPerSec != 768<<10 || d.RateIPBytesBurst != 8<<20 ||
 		d.RateBlobKeyBytesPerSec != 1<<20 || d.RateBlobKeyBytesBurst != 32<<20 ||
 		d.RateBlobBytesPerSec != 8<<20 || d.RateBlobBytesBurst != 256<<20 ||
 		d.MaxBlobTransfersPerMailbox != 2 || d.MaxConcurrentBlobTransfers != 8 || d.BlobPaceBytes != 16<<10 ||
