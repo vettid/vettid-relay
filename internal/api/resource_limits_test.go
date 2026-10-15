@@ -670,7 +670,7 @@ func TestBlobKeyBudget(t *testing.T) {
 // drain a vault's budget by minting tokens that name its key.
 func TestForgedSubCannotDrainAKeyBudget(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) {
-		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 1 << 20
+		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 1<<20
 		c.RateBlobKeyBytesPerSec, c.RateBlobKeyBytesBurst = 0.001, 2000
 	})
 	mallory, victim, friend := newPrincipal(1), newPrincipal(2), newPrincipal(3)
