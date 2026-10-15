@@ -347,16 +347,16 @@ func TestBlobTransferAccounting(t *testing.T) {
 	ok(s.acquireDownload("a"))
 	ok(s.acquireDownload("a"))
 	busy(s.acquireDownload("a")) // 2 per mailbox
-	ok(s.acquireUpload("b", "x"))
-	ok(s.acquireUpload("c", "x")) // one per (mailbox, sender), not per sender
-	busy(s.acquireDownload("b"))  // 4 in the process
+	ok(s.acquireUpload(f.newUpload("b", "x")))
+	ok(s.acquireUpload(f.newUpload("c", "x"))) // one per (mailbox, sender), not per sender
+	busy(s.acquireDownload("b"))               // 4 in the process
 	for _, r := range rel {
 		r()
 	}
 	rel = nil
-	ok(s.acquireUpload("b", "x"))
-	ok(s.acquireUpload("b", "y"))
-	busy(s.acquireUpload("c", "z")) // uploads: at most 4 − 2
+	ok(s.acquireUpload(f.newUpload("b", "x")))
+	ok(s.acquireUpload(f.newUpload("b", "y")))
+	busy(s.acquireUpload(f.newUpload("c", "z"))) // uploads: at most 4 − 2
 	ok(s.acquireDownload("b"))
 	ok(s.acquireDownload("c"))
 	for _, r := range rel {
@@ -419,7 +419,7 @@ func TestResourceLimitsReport(t *testing.T) {
 	f.s.reportLimits()
 	line := lastLine(t, logs.String(), `"msg":"rate limits"`)
 	dep := len(depositBody([]byte("hello")))
-	want := fmt.Sprintf(`"ws_sessions_refused":0,"ws_network_refused":0,"ws_network_hard_refused":0,"bytes_peak":0,"bytes_refused":0,"bytes_busiest_per_min":%d,"blob_bytes_peak":0,"blob_bytes_refused":0,"blob_bytes_busiest_per_min":700,"blob_key_bytes_peak":0,"blob_key_bytes_refused":0,"blob_key_bytes_busiest_per_min":700,"key_bytes_peak":0,"key_bytes_refused":0,"key_bytes_busiest_per_min":%d,"blob_slots_refused":0,"blob_mailbox_slots_refused":0,"blob_sender_slots_refused":0}`, dep, dep)
+	want := fmt.Sprintf(`"ws_sessions_refused":0,"ws_network_refused":0,"ws_network_hard_refused":0,"bytes_peak":0,"bytes_refused":0,"bytes_busiest_per_min":%d,"blob_bytes_peak":0,"blob_bytes_refused":0,"blob_bytes_busiest_per_min":700,"blob_key_bytes_peak":0,"blob_key_bytes_refused":0,"blob_key_bytes_busiest_per_min":700,"key_bytes_peak":0,"key_bytes_refused":0,"key_bytes_busiest_per_min":%d,"blob_slots_refused":0,"blob_mailbox_slots_refused":0,"blob_sender_slots_refused":0,"blob_evicted":0}`, dep, dep)
 	if !strings.Contains(line, want) {
 		t.Fatalf("rate limits line:\n%s\nwant it to end with\n%s", line, want)
 	}
@@ -440,6 +440,7 @@ func TestResourceLimitsReport(t *testing.T) {
 		`relay_ratelimit_refused_total{limiter="blob_slots"} 0`,
 		`relay_ratelimit_refused_total{limiter="blob_mailbox_slots"} 0`,
 		`relay_ratelimit_refused_total{limiter="blob_sender_slots"} 0`,
+		`relay_ratelimit_refused_total{limiter="blob_evicted"} 0`,
 		`relay_ratelimit_busiest_per_minute{limiter="address"}`,
 	} {
 		if !strings.Contains(out.String(), w) {
@@ -471,7 +472,7 @@ func TestLogBudgetReported(t *testing.T) {
 	}
 	s.reportLimits()
 	line := lastLine(t, logs.String(), `"msg":"rate limits"`)
-	if !strings.Contains(line, `"log_dropped":7,"log_suppressed":9}`) {
+	if !strings.Contains(line, `"log_dropped":7,"log_suppressed":9,"blob_evicted":0}`) {
 		t.Fatalf("rate limits line: %s", line)
 	}
 	if n := strings.Count(logs.String(), `"msg":"request"`); n != 3 {
@@ -483,7 +484,7 @@ func TestLogBudgetReported(t *testing.T) {
 		t.Fatalf("metrics:\n%s", out.String())
 	}
 	s.reportLimits() // per minute
-	if line := lastLine(t, logs.String(), `"msg":"rate limits"`); !strings.Contains(line, `"log_dropped":0,"log_suppressed":0}`) {
+	if line := lastLine(t, logs.String(), `"msg":"rate limits"`); !strings.Contains(line, `"log_dropped":0,"log_suppressed":0,"blob_evicted":0}`) {
 		t.Fatalf("second minute: %s", line)
 	}
 }

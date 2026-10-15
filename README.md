@@ -116,6 +116,7 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_BLOB_TTL` | `168h` (7 d) | Blob lifetime (`blob_ttl_seconds`). |
 | `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` | `8` | Concurrent blob uploads plus downloads, per relay process. Each can hold up to `max_blob_bytes` in memory. Uploads may use all but `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` of them (6 by default): the rest are kept for downloads. An upload takes its slot only once its body has begun to arrive. Beyond it, `429 rate_limited` with `retry_after` 2. |
 | `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` | `2` | Uploads to one mailbox, and separately downloads by its owner, at a time per process; besides, one sender key has at most one upload to a mailbox at a time. Senders therefore can't keep an owner from its blobs. At least 1 and less than `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS`. Beyond it, `429 rate_limited` with `retry_after` 2. |
+| `RELAY_BLOB_EVICT_MIN_AGE` | `30s` | When a new upload finds no upload slot free (in the process, or in its mailbox), the slowest upload by bytes received per second that has run at least this long is cut off: it is answered `429 rate_limited` with `retry_after` 2 and the connection closed (its sent bytes stay charged), and the new upload takes its slot. If none has run this long, the new upload is refused as before. Counted as `blob_evicted`. |
 | `RELAY_BLOB_PACE_BYTES` | `16384` | A blob body, up or down, must move at least this many bytes in every 5 s, or the transfer is dropped (an upload is answered `400` with the connection closed) and its slot freed. No transfer takes longer than 5 minutes (an 8 MiB blob needs 28 KiB/s). |
 | `RELAY_MAILBOX_MAX_MESSAGES` | `10000` | Per-mailbox cap on stored messages (`quota_exceeded`). |
 | `RELAY_MAILBOX_MAX_BYTES` | `33554432` (32 MiB) | Per-mailbox cap on stored payload bytes (`quota_exceeded`); `0` means no cap. At least `RELAY_MAX_PAYLOAD_BYTES`. A mailbox that already holds more (the default was 128 MiB) keeps its messages and is collected as before; deposits to it are refused until acks or expiry bring it under the cap. |
@@ -187,9 +188,14 @@ version does not protect against. In short:
   mailbox. An upload takes its slot once its body has begun to arrive,
   and every transfer must keep a pace of 16 KiB per 5 s
   (`RELAY_BLOB_PACE_BYTES`) and finish within 5 minutes, or it is dropped
-  and its slot freed: one that trickles at the minimum pace holds its slot
-  up to 5 minutes. Refusals are counted as `blob_slots`,
-  `blob_mailbox_slots` and `blob_sender_slots`.
+  and its slot freed. When a new upload finds no slot free, the slowest
+  upload (by bytes received per second) that has run at least 30 s
+  (`RELAY_BLOB_EVICT_MIN_AGE`) is cut off with `429` and `retry_after` 2,
+  and the new one takes its slot, so a trickle can't hold a slot against
+  real uploads. There is no per-address upload limit: vault hosts upload
+  for hundreds of members. Refusals are counted as `blob_slots`,
+  `blob_mailbox_slots` and `blob_sender_slots`, cut-off uploads as
+  `blob_evicted`.
 - **Refunds.** A deposit or claim charged to a byte budget and then not
   stored gets its charge back, so a sender retrying against a full
   mailbox doesn't drain its network's budget. A blob upload that held a
@@ -291,7 +297,7 @@ budgets `bytes`, `blob_bytes` (per network) and `key_bytes`,
 `blob_key_bytes` (per key) (for these a request allowed or refused is counted, and
 `relay_ratelimit_busiest_bytes_per_minute` has the bytes of the busiest
 single network, or key); `relay_ratelimit_refused_total` also has
-`blob_slots`, `blob_mailbox_slots` and `blob_sender_slots`. Each process logs one `rate limits`
+`blob_slots`, `blob_mailbox_slots`, `blob_sender_slots` and `blob_evicted`. Each process logs one `rate limits`
 line a minute with the same figures, the number of networks the flood
 guard refused, and `collectors`, `parked` and `ws_sessions`: this line is
 what the limits are to be re-sized from. After the WebSocket refusals it
@@ -300,7 +306,8 @@ ends with `bytes_peak`, `bytes_refused`, `bytes_busiest_per_min`,
 `blob_key_bytes_peak`, `blob_key_bytes_refused`,
 `blob_key_bytes_busiest_per_min`, `key_bytes_peak`, `key_bytes_refused`,
 `key_bytes_busiest_per_min`, `blob_slots_refused`, `blob_mailbox_slots_refused`,
-`blob_sender_slots_refused`, `log_dropped` and `log_suppressed`.
+`blob_sender_slots_refused`, `log_dropped`, `log_suppressed` and
+`blob_evicted`.
 
 The simulation behind the numbers is a test:
 
