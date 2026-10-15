@@ -107,15 +107,18 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_TRUST_PROXY` | `false` | `true` means the client IP is the **last** `X-Forwarded-For` hop, which is the one the load balancer (AWS ALB) appends. Earlier hops are client-controlled and ignored. Enable this only behind a proxy that always appends. |
 | `RELAY_METRICS_ADDR` | `127.0.0.1:9090` | Prometheus `/metrics` listener. It must differ from the public address; an empty value disables it. Never expose it publicly. |
 | `RELAY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
+| `RELAY_LOG_INFO_RPS` / `RELAY_LOG_INFO_BURST` | `100` / `1000` | Log budget per relay process: info lines beyond it are dropped and counted (`log_dropped` in the `rate limits` line, `relay_log_lines_dropped_total`). The access lines of successful requests that change a mailbox's state (register, rotate, denylist, delete mailbox) have a second budget of the same size that other lines can't use up. Never dropped: the `rate limits` line (production alarms when it goes missing) and the process's start, drain and stop lines. Warn and error lines are not budgeted, but one message with the same `err`, `route` and `panic` values is written at most once per 10 s; the next one carries `repeated` (`log_suppressed`, `relay_log_lines_suppressed_total`). |
 | `RELAY_MAX_PAYLOAD_BYTES` | `262144` | Max decoded deposit payload (`max_payload_bytes`). |
-| `RELAY_MESSAGE_TTL` | `336h` (14 d) | Lifetime of an unacked message (`message_ttl_seconds`). |
+| `RELAY_MESSAGE_TTL` | `336h` (14 d) | Lifetime of an unacked message (`message_ttl_seconds`). An expired message is never delivered, but with the DynamoDB store its item stays stored until DynamoDB's TTL deletes it, typically within a few days of expiry. |
 | `RELAY_VISIBILITY_TIMEOUT` | `60s` | Lease length for collected, unacked messages (`visibility_timeout_seconds`). |
 | `RELAY_BLOBS_ENABLED` | `true` | Serve `/v1/blob` (§6.8) and advertise blob limits at registration. |
 | `RELAY_MAX_BLOB_BYTES` | `8388608` | Max blob size (`max_blob_bytes`), enforced while streaming. |
 | `RELAY_BLOB_TTL` | `168h` (7 d) | Blob lifetime (`blob_ttl_seconds`). |
-| `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` | `8` | Concurrent blob uploads plus downloads. Each can hold up to `max_blob_bytes` in memory. |
+| `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` | `8` | Concurrent blob uploads plus downloads, per relay process. Each can hold up to `max_blob_bytes` in memory. Uploads may use all but `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` of them (6 by default): the rest are kept for downloads. An upload takes its slot only once its body has begun to arrive. Beyond it, `429 rate_limited` with `retry_after` 2. |
+| `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` | `2` | Uploads to one mailbox, and separately downloads by its owner, at a time per process; besides, one sender key has at most one upload to a mailbox at a time. Senders therefore can't keep an owner from its blobs. At least 1 and less than `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS`. Beyond it, `429 rate_limited` with `retry_after` 2. |
+| `RELAY_BLOB_PACE_BYTES` | `16384` | A blob body, up or down, must move at least this many bytes in every 5 s, or the transfer is dropped (an upload is answered `400` with the connection closed) and its slot freed. No transfer takes longer than 5 minutes (an 8 MiB blob needs 28 KiB/s). |
 | `RELAY_MAILBOX_MAX_MESSAGES` | `10000` | Per-mailbox cap on stored messages (`quota_exceeded`). |
-| `RELAY_MAILBOX_MAX_BYTES` | `134217728` | Per-mailbox cap on stored payload bytes. |
+| `RELAY_MAILBOX_MAX_BYTES` | `33554432` (32 MiB) | Per-mailbox cap on stored payload bytes (`quota_exceeded`); `0` means no cap. At least `RELAY_MAX_PAYLOAD_BYTES`. A mailbox that already holds more (the default was 128 MiB) keeps its messages and is collected as before; deposits to it are refused until acks or expiry bring it under the cap. |
 | `RELAY_MAILBOX_MAX_BLOB_BYTES` | `67108864` | Per-mailbox storage cap (§8.8, §6.9). It counts blobs deposited to the mailbox plus claims the mailbox created. |
 | `RELAY_MAILBOX_MAX_DENYLIST` | `10000` | Per-mailbox cap on live denylist entries. |
 | `RELAY_ROTATION_GRACE` | `168h` (7 d) | How long a rotated-away mailbox keeps collecting before deletion (§6.7). |
@@ -126,8 +129,12 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `100` / `300` | Flood guard on `/v1/*` per client network (the IPv4 address or the IPv6 /64), applied before any parsing. One address may carry a whole vault host: see [Rate limiting](#rate-limiting) for when to raise it. |
 | `RELAY_RATE_KEY_RPS` / `RELAY_RATE_KEY_BURST` | `20` / `100` | Per-key bucket, applied once a request is authenticated: owner routes, registration and mailbox deletion. Keyed by the signing key. |
 | `RELAY_RATE_REGISTER_RPS` / `RELAY_RATE_REGISTER_BURST` | `1` / `30` | New mailboxes (registrations that create one, and rotations) per client network. Registering an existing key again is free. |
-| `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits after the request signature verifies (§5.3 step 7) and to blob uploads before their body is read. It's keyed by token `sub`, or by `jti` for open tokens. |
+| `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits and blob uploads after the request signature verifies (§5.3 step 7): the token's `sub` is written by the mailbox owner, so a token naming someone else's key can't spend that key's budget. It's keyed by token `sub`, or by `jti` for open tokens. |
 | `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
+| `RELAY_RATE_KEY_BYTES_PER_SEC` / `RELAY_RATE_KEY_BYTES_BURST` | `65536` / `2097152` (64 KiB/s, 2 MiB) | Byte budget per key for what it asks the relay to store. For a deposit the key is the sender's (the token's `sub`, or an open token's signer), proved by the request signature only after the body: an empty budget is refused unread, and the key is charged once the signature verified, with the body's length (into debt if need be). For a claim the key is its creator's (the mailbox owner, proved first). Each vault of a vault host has its own. The burst must hold the largest deposit body and `RELAY_MAX_CLAIM_BYTES`. |
+| `RELAY_RATE_IP_BYTES_PER_SEC` / `RELAY_RATE_IP_BYTES_BURST` | `1048576` / `33554432` (1 MiB/s, 32 MiB) | The ceiling over all keys of one client network: deposits (charged with their declared length after the token verified, before the body is read; without a `Content-Length`, the largest deposit body) and claims (charged with the creator's key once the claim is authenticated). A deposit or claim that is then not stored (quota, signature, malformed body, store error) gets its charges back. Over either budget, `429 rate_limited` with `retry_after`, a deposit's body unread. Per relay process. Its rate and burst must be at least a key's. |
+| `RELAY_RATE_BLOB_KEY_BYTES_PER_SEC` / `RELAY_RATE_BLOB_KEY_BYTES_BURST` | `1048576` / `33554432` (1 MiB/s, 32 MiB) | Byte budget for blobs per key: for an upload the sender's key (the token's `sub`, proved by the request signature only after the body), for a download the mailbox owner's (proved first). Each vault of a vault host has its own. An upload is refused unread if its key's budget is empty, but charged to it only once the signature has verified, with the bytes received (into debt if need be), so a token naming someone else's key can't spend that key's budget. The burst holds four blobs of the maximum size. Must hold `RELAY_MAX_BLOB_BYTES`. |
+| `RELAY_RATE_BLOB_BYTES_PER_SEC` / `RELAY_RATE_BLOB_BYTES_BURST` | `8388608` / `268435456` (8 MiB/s, 256 MiB) | The ceiling over all keys of one client network, charged for uploads with the declared length (or `RELAY_MAX_BLOB_BYTES` without one) after the token checks (§5.3 steps 1–6), before the body is read, and for downloads together with the owner's key budget (the blob's size, at most a key's burst, after the owner's signature verified; an empty budget refuses a download before the store is read; a download refused by one is charged to neither). An upload that stores nothing gets back only the part of its charge it never sent: every byte that reached the relay stays charged, whatever refused it (body failure, signature, quota, store). One refused a transfer slot (it held none) gets everything back. Over it, `429 rate_limited` with `retry_after`. Per relay process. With blobs enabled the ceiling's rate and burst must be at least a key's; every rate and burst must be greater than zero regardless. |
 | `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | Per-source-IP bucket for the web endpoints (§6.11) and every other path outside `/v1/` except `/healthz`. It's separate from the API bucket, so scanners never use up mailbox traffic's budget, and always in-process (per relay process, no Valkey round trip). |
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
 | `RELAY_ANDROID_CERT_SHA256` | the official VettID app's signing keys | Comma-separated SHA-256 certificate fingerprints for `assetlinks.json`, colon-separated or plain hex, any case (served in uppercase colon form). The built-in default (`config.DefaultAndroidCertFingerprints`: the production upload key and the two staging signers) lets a self-hosted relay open links in the official app with no configuration. Set but empty turns `assetlinks.json` off (404). |
@@ -151,10 +158,43 @@ version does not protect against. In short:
   `RELAY_RATE_SENDER_*`).
 - Per network there is the **flood guard** (`RELAY_RATE_IP_*`), first,
   before anything is parsed, so it bounds every signature check, replay
-  record and store read; and the budget of **new mailboxes**
-  (`RELAY_RATE_REGISTER_*`). Nothing else keyed on a network can refuse a
-  request that is properly signed by a key with a mailbox. There is no
-  penalty state.
+  record and store read; the budget of **new mailboxes**
+  (`RELAY_RATE_REGISTER_*`); and two **byte budgets**, which bound what one
+  network can make the relay store and move however many keys and
+  mailboxes it holds: for deposits and claims a ceiling of 1 MiB/s (burst
+  32 MiB, `RELAY_RATE_IP_BYTES_*`) on top of a budget per key, 64 KiB/s
+  (burst 2 MiB, `RELAY_RATE_KEY_BYTES_*`), and for blob uploads and downloads a ceiling
+  of 8 MiB/s (burst 256 MiB, `RELAY_RATE_BLOB_BYTES_*`) on top of a budget
+  per authenticated key, 1 MiB/s (burst 32 MiB, `RELAY_RATE_BLOB_KEY_BYTES_*`),
+  so a vault host's vaults don't share one budget (a deposit's or an
+  upload's key pays only once its signature has verified). They are charged
+  with the declared length before a body is read, never look at the
+  target, and are per process. Nothing else keyed on a network can refuse a request
+  that is properly signed by a key with a mailbox. There is no penalty
+  state.
+- A vault host of 900 vaults, at three messages a minute each of 4 KB
+  (base64 makes 4 KB about 5.5 KB), each crossing the host about twice
+  (to the peer's vault, and from a vault to its phone), stores about
+  0.5 MB/s: half the network's ceiling; at a message a minute, a sixth.
+  Each vault has its own 64 KiB/s (about 12 messages a second) and a
+  burst of 2 MiB (about 380 messages at once: a message to 300
+  connections). The 32 MiB ceiling burst holds a mass unlock (about two
+  deposits per vault, 10 MB) three times over; a mass unlock is paced by
+  the flood guard first anyway.
+- **Blob transfers**: at most 8 per process, of which at most 6 uploads
+  (2 are kept for downloads); per mailbox at most 2 uploads and,
+  separately, 2 downloads; one upload at a time per sender key and
+  mailbox. An upload takes its slot once its body has begun to arrive,
+  and every transfer must keep a pace of 16 KiB per 5 s
+  (`RELAY_BLOB_PACE_BYTES`) and finish within 5 minutes, or it is dropped
+  and its slot freed: one that trickles at the minimum pace holds its slot
+  up to 5 minutes. Refusals are counted as `blob_slots`,
+  `blob_mailbox_slots` and `blob_sender_slots`.
+- **Refunds.** A deposit or claim charged to a byte budget and then not
+  stored gets its charge back, so a sender retrying against a full
+  mailbox doesn't drain its network's budget. A blob upload that held a
+  transfer slot and stored nothing gets back only what it never sent:
+  holding a slot with a trickle always costs the bytes trickled.
 - A **WebSocket session** passes these limits once, at its upgrade. After
   that:
   - It has a window of 128 messages sent and not yet acked. The relay
@@ -219,6 +259,8 @@ version does not protect against. In short:
     network is at its ceiling), and at the end of the `rate limits` line
     as `ws_sessions_refused`, `ws_network_refused` and
     `ws_network_hard_refused`.
+- On owner routes the mailbox is looked up before the replay record is
+  written, so a signed request under a key without a mailbox writes none.
 - A deposit's body is read only after its token has verified (§5.3 steps
   1–6 need only headers). A request refused before its body was read is
   answered at once with `Connection: close`. Small bodies (register,
@@ -244,10 +286,21 @@ nothing identifies a client): `relay_ratelimit_allowed_total`,
 the busiest bucket of each limiter got in the last full minute; 1000 means
 something was refused), `relay_ratelimit_busiest_per_minute` (requests of
 the busiest single network and of the busiest single key). Limiters:
-`address`, `key`, `sender`, `register`, `claim`, `web`. Each process logs
-one `rate limits` line a minute with the same figures, the number of
-networks the flood guard refused, and `collectors`, `parked` and
-`ws_sessions`: this line is what the limits are to be re-sized from.
+`address`, `key`, `sender`, `register`, `claim`, `web`, and the byte
+budgets `bytes`, `blob_bytes` (per network) and `key_bytes`,
+`blob_key_bytes` (per key) (for these a request allowed or refused is counted, and
+`relay_ratelimit_busiest_bytes_per_minute` has the bytes of the busiest
+single network, or key); `relay_ratelimit_refused_total` also has
+`blob_slots`, `blob_mailbox_slots` and `blob_sender_slots`. Each process logs one `rate limits`
+line a minute with the same figures, the number of networks the flood
+guard refused, and `collectors`, `parked` and `ws_sessions`: this line is
+what the limits are to be re-sized from. After the WebSocket refusals it
+ends with `bytes_peak`, `bytes_refused`, `bytes_busiest_per_min`,
+`blob_bytes_peak`, `blob_bytes_refused`, `blob_bytes_busiest_per_min`,
+`blob_key_bytes_peak`, `blob_key_bytes_refused`,
+`blob_key_bytes_busiest_per_min`, `key_bytes_peak`, `key_bytes_refused`,
+`key_bytes_busiest_per_min`, `blob_slots_refused`, `blob_mailbox_slots_refused`,
+`blob_sender_slots_refused`, `log_dropped` and `log_suppressed`.
 
 The simulation behind the numbers is a test:
 
@@ -305,7 +358,10 @@ bucket of 20/s, burst 40 ("old": this code with `main`'s limits, not
   - replay-cache size
   - sweeps, and rows removed by kind
   - the draining flag
-- **Logs.** Logs are JSON on stdout, one access line per request. Each line
+- **Logs.** Logs are JSON on stdout, one access line per request (at
+  debug level for `429` answers, healthy `/healthz` probes and empty
+  collects), within the log budget (`RELAY_LOG_INFO_RPS`; successful
+  state-changing requests have a budget of their own). Each line
   has the route *pattern* (never the raw path, which contains ids), status,
   error code, sizes, duration and, where relevant, the `msg_id` or
   `blob_id`. Payloads, blob bytes, tokens, signatures, public keys, mailbox
@@ -341,8 +397,8 @@ other process sees, refuses or is woken by.
   checked on every read; TTL only reclaims space. A message is one item
   (the payload as binary), so `RELAY_MAX_PAYLOAD_BYTES` is capped at
   380,000 with this store.
-- **Blob bodies** are S3 objects `blobs/<mailbox>/<blob id>`; metadata and
-  the storage quota are in DynamoDB. Give the bucket a lifecycle rule that
+- **Blob bodies** are S3 objects `blobs/<mailbox>/<blob id>`; metadata (size
+  and expiry; not the sender) and the storage quota are in DynamoDB. Give the bucket a lifecycle rule that
   expires objects a day after `RELAY_BLOB_TTL` (deleted or purged blobs are
   removed directly).
 - **Valkey** holds the replay cache (`SET NX PX`, 91 s), the rate-limit
@@ -370,8 +426,13 @@ other process sees, refuses or is woken by.
 - **Per-process limits.** `RELAY_MAX_COLLECTORS_PER_MAILBOX`,
   `RELAY_MAX_WS_SESSIONS`, `RELAY_MAX_WS_SESSIONS_PER_NETWORK`,
   `RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD`,
-  `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` and the replay-cache capacity
-  bound each process's own resources. A client that reconnects to another
+  `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS`,
+  `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX`, the two byte budgets
+  (`RELAY_RATE_KEY_BYTES_*`, `RELAY_RATE_IP_BYTES_*`, `RELAY_RATE_BLOB_KEY_BYTES_*`,
+  `RELAY_RATE_BLOB_BYTES_*`), the log budget and
+  the replay-cache capacity bound each process's own resources. With N
+  processes behind a load balancer a network's byte budgets are up to N
+  times the configured ones. A client that reconnects to another
   process is counted there afresh.
 - **Mailbox quotas** are counters updated in the same transaction as the
   write. Acks, expiry and TTL deletions can leave them high; a failing quota

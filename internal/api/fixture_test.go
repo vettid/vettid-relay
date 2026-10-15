@@ -81,6 +81,10 @@ func newFixtureFull(t *testing.T, mut func(*config.Config), logw io.Writer, opts
 	cfg.RateSenderPerSec, cfg.RateSenderBurst = 1000, 1000
 	cfg.RateClaimPerSec, cfg.RateClaimBurst = 1000, 1000
 	cfg.RateWebPerSec, cfg.RateWebBurst = 1000, 1000
+	cfg.RateIPBytesPerSec, cfg.RateIPBytesBurst = 1<<30, 1<<30
+	cfg.RateKeyBytesPerSec, cfg.RateKeyBytesBurst = 1<<30, 1<<30
+	cfg.RateBlobBytesPerSec, cfg.RateBlobBytesBurst = 1<<30, 1<<30
+	cfg.RateBlobKeyBytesPerSec, cfg.RateBlobKeyBytesBurst = 1<<30, 1<<30
 	if mut != nil {
 		mut(&cfg)
 	}

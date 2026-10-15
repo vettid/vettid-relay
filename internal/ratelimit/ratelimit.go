@@ -39,6 +39,15 @@ func New(rate float64, burst int, maxKeys int) *Limiter {
 // Allow consumes one token for key. When refused it returns the wait until
 // a token is available (at least one second).
 func (l *Limiter) Allow(key string, now time.Time) (bool, time.Duration) {
+	return l.AllowN(key, 1, now)
+}
+
+// AllowN consumes n tokens for key (a byte budget charges a request's
+// bytes), or none: when refused it returns the wait until n tokens are
+// available (at least one second). A request of more than the burst is
+// never allowed; callers keep their largest request within it.
+func (l *Limiter) AllowN(key string, n int64, now time.Time) (bool, time.Duration) {
+	need := float64(max(n, 0))
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b, ok := l.buckets[key]
@@ -57,20 +66,87 @@ func (l *Limiter) Allow(key string, now time.Time) (bool, time.Duration) {
 		b.tokens = math.Min(l.burst, b.tokens+el*l.rate)
 		b.last = now
 	}
-	if b.tokens >= 1 {
-		b.tokens--
+	if b.tokens >= need && need <= l.burst {
+		b.tokens -= need
 		if used := 1 - b.tokens/l.burst; used > l.peak {
 			l.peak = used
 		}
 		return true, 0
 	}
 	l.peak = 1
-	wait := time.Duration((1 - b.tokens) / l.rate * float64(time.Second))
+	wait := time.Duration((math.Min(need, l.burst) - b.tokens) / l.rate * float64(time.Second))
 	if wait < time.Second {
 		wait = time.Second
 	}
 	return false, wait
 }
+
+// Charge takes n tokens from key's bucket unconditionally: the bucket
+// may go into debt (below zero), which later requests then wait out. It
+// is for a cost known only after the fact (bytes already received from a
+// caller identified only then).
+func (l *Limiter) Charge(key string, n int64, now time.Time) {
+	if n <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[key]
+	if !ok {
+		// Unlike AllowN, Charge cannot refuse a new key when the table is
+		// full (the cost has been incurred), so the table may pass maxKeys
+		// here. It stays bounded: Charge follows a request that was let
+		// through by Ready on the same key and by the per-network and
+		// per-process limits before it, and buckets that have refilled are
+		// pruned as usual.
+		if len(l.buckets) >= l.maxKeys {
+			l.pruneLocked(now)
+		}
+		b = &bucket{tokens: l.burst, last: now}
+		l.buckets[key] = b
+	}
+	if el := now.Sub(b.last).Seconds(); el > 0 {
+		b.tokens = math.Min(l.burst, b.tokens+el*l.rate)
+		b.last = now
+	}
+	b.tokens -= float64(n)
+	if used := 1 - b.tokens/l.burst; used > l.peak {
+		l.peak = math.Min(used, 1)
+	}
+}
+
+// Refund gives back n tokens taken from key's bucket (a request charged
+// in advance that turned out to cost nothing), up to the burst.
+func (l *Limiter) Refund(key string, n int64) {
+	if n <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if b, ok := l.buckets[key]; ok {
+		b.tokens = math.Min(l.burst, b.tokens+float64(n))
+	}
+}
+
+// Ready reports whether key's bucket holds at least one token, without
+// taking any; if not, how long until it does (at least one second; a
+// bucket in debt waits its debt out).
+func (l *Limiter) Ready(key string, now time.Time) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[key]
+	if !ok {
+		return true, 0
+	}
+	have := math.Min(l.burst, b.tokens+math.Max(now.Sub(b.last).Seconds(), 0)*l.rate)
+	if have >= 1 {
+		return true, 0
+	}
+	return false, max(time.Duration((1-have)/l.rate*float64(time.Second)), time.Second)
+}
+
+// Burst returns the bucket size.
+func (l *Limiter) Burst() int64 { return int64(l.burst) }
 
 // pruneLocked drops buckets that have refilled completely (indistinguishable
 // from a fresh bucket).

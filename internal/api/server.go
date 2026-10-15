@@ -46,22 +46,28 @@ type Server struct {
 	regLimit RateLimiter // new mailboxes per client network
 	rl       *limiterMetrics
 
+	byteLimit     ByteLimiter // bytes of deposits and claims, per client network (per process)
+	blobByteLimit ByteLimiter // bytes of blob uploads and downloads, per client network: the ceiling (per process)
+	blobKeyLimit  ByteLimiter // bytes of blob uploads and downloads, per authenticated key (per process)
+	keyByteLimit  ByteLimiter // bytes of deposits and claims, per authenticated key (per process); byteLimit is the network's ceiling
+
 	smallBodyTimeout time.Duration // how long a small body has to arrive (handlers.go)
+	blobPaceWindow   time.Duration // period of cfg.BlobPaceBytes (blobs.go)
 	claimLimit       RateLimiter   // unauthenticated claim GETs, per IPv4 / IPv6 /64
 	webLimit         RateLimiter   // everything outside /v1/ and /healthz, per IPv4 / IPv6 /64 (always in-process)
 
 	web  *webDocs // /connect, /.well-known/assetlinks.json, /robots.txt (§6.11)
 	hsts bool     // public base URL is https: send Strict-Transport-Security
 
-	hub       *hub
-	wsOpen    atomic.Int64  // WebSocket sessions holding a slot (cfg.MaxWebSocketSessions)
-	health    storeHealth   // /healthz: the last store ping
-	healthTO  time.Duration // how long that ping may take (healthPingTimeout; tests shorten it)
-	bus       WakeBus       // cross-process wake-on-deposit (nil: single process)
-	hints     EmptyHints    // known-empty mailboxes (nil: always query)
-	forceGen  atomic.Uint64 // bumped by WakeAll: collectors then query for real
-	blobSlots chan struct{} // bounds concurrent blob transfers
-	mux       *http.ServeMux
+	hub      *hub
+	wsOpen   atomic.Int64   // WebSocket sessions holding a slot (cfg.MaxWebSocketSessions)
+	health   storeHealth    // /healthz: the last store ping
+	healthTO time.Duration  // how long that ping may take (healthPingTimeout; tests shorten it)
+	bus      WakeBus        // cross-process wake-on-deposit (nil: single process)
+	hints    EmptyHints     // known-empty mailboxes (nil: always query)
+	forceGen atomic.Uint64  // bumped by WakeAll: collectors then query for real
+	xfers    *blobTransfers // blob transfers in progress (slots, blobs.go)
+	mux      *http.ServeMux
 }
 
 type serverMetrics struct {
@@ -140,7 +146,12 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		mux:   http.NewServeMux(),
 		hub:   newHub(),
 
-		blobSlots: make(chan struct{}, cfg.MaxConcurrentBlobTransfers),
+		xfers: newBlobTransfers(),
+
+		byteLimit:     ratelimit.New(cfg.RateIPBytesPerSec, cfg.RateIPBytesBurst, 200_000),
+		blobByteLimit: ratelimit.New(cfg.RateBlobBytesPerSec, cfg.RateBlobBytesBurst, 200_000),
+		blobKeyLimit:  ratelimit.New(cfg.RateBlobKeyBytesPerSec, cfg.RateBlobKeyBytesBurst, 200_000),
+		keyByteLimit:  ratelimit.New(cfg.RateKeyBytesPerSec, cfg.RateKeyBytesBurst, 200_000),
 
 		replay:   auth.NewReplayCache(cfg.ReplayCacheMax),
 		ipLimit:  ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
@@ -149,6 +160,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		rl:       newLimiterMetrics(reg),
 
 		smallBodyTimeout: smallBodyTimeout,
+		blobPaceWindow:   config.BlobPaceWindow,
 		healthTO:         healthPingTimeout,
 		subLimit:         ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
 		claimLimit:       ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),
@@ -169,6 +181,10 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 	if rc, ok := s.replay.(interface{ Len() int }); ok {
 		reg.GaugeFunc("relay_replay_cache_entries", "Entries in the signature replay cache.", func() int64 { return int64(rc.Len()) })
 	}
+	if lb, ok := log.Handler().(logCounts); ok {
+		reg.CounterFunc("relay_log_lines_dropped_total", "Info log lines not written: over the log budget (RELAY_LOG_INFO_RPS).", lb.Dropped)
+		reg.CounterFunc("relay_log_lines_suppressed_total", "Warn and error log lines not written: the same message was written in the last 10 s.", lb.Suppressed)
+	}
 	reg.GaugeFunc("relay_active_collectors", "Active collectors (parked long-polls and WebSocket sessions).", func() int64 { return int64(s.hub.collectors()) })
 	reg.GaugeFunc("relay_draining", "1 while the relay is draining for shutdown.", func() int64 {
 		if s.draining.Load() {
@@ -181,7 +197,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
 			c.Sweep(now)
 		}
-		for _, l := range []RateLimiter{s.ipLimit, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit} {
+		for _, l := range []any{s.ipLimit, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit, s.byteLimit, s.blobByteLimit, s.blobKeyLimit, s.keyByteLimit} {
 			if p, ok := l.(interface{ Prune(time.Time) }); ok {
 				p.Prune(now)
 			}

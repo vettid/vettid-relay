@@ -350,10 +350,10 @@ func testQuotas(t *testing.T, h Harness) {
 	if _, err := s.Deposit(ctx, "a", "s", make([]byte, 6), time.Hour, tb); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 5, TTL: time.Hour, Limits: tb}, bytes.NewReader(make([]byte, 5))); !errors.Is(err, store.ErrQuota) {
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 5, TTL: time.Hour, Limits: tb}, bytes.NewReader(make([]byte, 5))); !errors.Is(err, store.ErrQuota) {
 		t.Fatalf("token bytes quota on blob: %v", err)
 	}
-	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 4, TTL: time.Hour, Limits: tb}, bytes.NewReader(make([]byte, 4))); err != nil {
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 4, TTL: time.Hour, Limits: tb}, bytes.NewReader(make([]byte, 4))); err != nil {
 		t.Fatal(err)
 	}
 	// A failed deposit charges nothing to the token.
@@ -499,7 +499,7 @@ func testRotatedMailboxPurged(t *testing.T, h Harness) {
 	if _, err := s.Deposit(ctx, "old", "s", []byte("x"), 30*24*time.Hour, store.Limits{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "old", SenderSub: "s", Size: 3, TTL: 30 * 24 * time.Hour}, bytes.NewReader([]byte("abc"))); err != nil {
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "old", Size: 3, TTL: 30 * 24 * time.Hour}, bytes.NewReader([]byte("abc"))); err != nil {
 		t.Fatal(err)
 	}
 	claim, _, err := s.PutClaim(ctx, "old", []byte("c"), 24*time.Hour, 0)
@@ -534,17 +534,17 @@ func testBlobs(t *testing.T, h Harness) {
 	mustRegister(t, s, "a", 1)
 	mustRegister(t, s, "b", 2)
 	data := bytes.Repeat([]byte("z"), 1000)
-	info, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 1000, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data))
+	info, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 1000, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(info.ID) != 26 || !info.ExpiresAt.Equal(c.Now().Add(time.Hour)) {
 		t.Fatalf("info %+v", info)
 	}
-	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 1000, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data)); !errors.Is(err, store.ErrQuota) {
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 1000, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data)); !errors.Is(err, store.ErrQuota) {
 		t.Fatalf("mailbox blob cap: %v", err)
 	}
-	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 10, TTL: time.Hour}, bytes.NewReader(data)); err == nil {
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 10, TTL: time.Hour}, bytes.NewReader(data)); err == nil {
 		t.Fatal("size mismatch must fail")
 	}
 	got, rc, err := s.OpenBlob(ctx, "a", info.ID)
@@ -572,7 +572,7 @@ func testBlobs(t *testing.T, h Harness) {
 	if _, _, err := s.OpenBlob(ctx, "a", info.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("deleted blob: %v", err)
 	}
-	info2, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 1000, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data))
+	info2, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 1000, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("cap not freed by delete: %v", err)
 	}
@@ -587,7 +587,7 @@ func testBlobs(t *testing.T, h Harness) {
 		t.Fatal("delete must be idempotent")
 	}
 	// Expired blobs no longer count toward the cap.
-	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 1000, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data)); err != nil {
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 1000, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 1500}}, bytes.NewReader(data)); err != nil {
 		t.Fatalf("cap after expiry: %v", err)
 	}
 }
@@ -740,7 +740,7 @@ func testClaims(t *testing.T, h Harness) {
 	if _, _, err := s.PutClaim(ctx, "a", make([]byte, 600), time.Hour, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 500, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 1000}}, bytes.NewReader(make([]byte, 500))); !errors.Is(err, store.ErrQuota) {
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 500, TTL: time.Hour, Limits: store.Limits{MailboxMaxBytes: 1000}}, bytes.NewReader(make([]byte, 500))); !errors.Is(err, store.ErrQuota) {
 		t.Fatalf("blob over shared cap: %v", err)
 	}
 	if _, _, err := s.PutClaim(ctx, "a", make([]byte, 401), time.Hour, 1000); !errors.Is(err, store.ErrQuota) {
@@ -878,7 +878,7 @@ func testDeleteMailbox(t *testing.T, h Harness) {
 	if _, err := s.Deposit(ctx, "a", "s", []byte("o"), time.Hour, store.Limits{TokenJTI: "open", TokenExpires: exp, ConsumeJTI: true}); err != nil {
 		t.Fatal(err)
 	}
-	blob, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 3, TTL: time.Hour}, bytes.NewReader([]byte("abc")))
+	blob, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 3, TTL: time.Hour}, bytes.NewReader([]byte("abc")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -909,7 +909,7 @@ func testDeleteMailbox(t *testing.T, h Harness) {
 	if _, err := s.Deposit(ctx, "a", "s", []byte("late"), time.Hour, store.Limits{}); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("deposit after delete: %v", err)
 	}
-	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 1, TTL: time.Hour}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrNotFound) {
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 1, TTL: time.Hour}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("blob put after delete: %v", err)
 	}
 	if _, _, err := s.PutClaim(ctx, "a", []byte("c"), time.Hour, 0); !errors.Is(err, store.ErrNotFound) {
@@ -984,7 +984,7 @@ func testDeleteReRegister(t *testing.T, h Harness) {
 	if _, err := s.Deposit(ctx, "a", "s", []byte("old token"), time.Hour, old); !errors.Is(err, store.ErrRevoked) {
 		t.Fatalf("token from before the deletion: %v", err)
 	}
-	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", SenderSub: "s", Size: 1, TTL: time.Hour, Limits: old}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrRevoked) {
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "a", Size: 1, TTL: time.Hour, Limits: old}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrRevoked) {
 		t.Fatalf("blob with a token from before the deletion: %v", err)
 	}
 	fresh := store.Limits{TokenJTI: "q", TokenIssuedAt: nb, TokenExpires: exp, TokenQuotaMsgs: i64(3), MailboxMaxMsgs: 3}
@@ -1061,7 +1061,7 @@ func testDeleteAcrossProcesses(t *testing.T, h Harness) {
 	if _, err := b.Deposit(ctx, "m", "s", []byte("x"), time.Hour, lim); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("deposit on the other process: %v", err)
 	}
-	if _, err := b.PutBlob(ctx, store.BlobPut{Mailbox: "m", SenderSub: "s", Size: 1, TTL: time.Hour, Limits: lim}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrNotFound) {
+	if _, err := b.PutBlob(ctx, store.BlobPut{Mailbox: "m", Size: 1, TTL: time.Hour, Limits: lim}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("blob on the other process: %v", err)
 	}
 	if _, err := a.Register(ctx, "m", key(1)); err != nil {
@@ -1162,7 +1162,7 @@ func testRotatedTombstone(t *testing.T, h Harness) {
 	if _, err := s.Deposit(ctx, "old", "s", []byte("x"), time.Hour, old); !errors.Is(err, store.ErrRevoked) {
 		t.Fatalf("revoked pre-rotation token after re-registration: %v", err)
 	}
-	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "old", SenderSub: "s", Size: 1, TTL: time.Hour, Limits: old}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrRevoked) {
+	if _, err := s.PutBlob(ctx, store.BlobPut{Mailbox: "old", Size: 1, TTL: time.Hour, Limits: old}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrRevoked) {
 		t.Fatalf("blob with a pre-rotation token: %v", err)
 	}
 	fresh := store.Limits{TokenJTI: "fresh", TokenIssuedAt: removed.Add(90 * time.Second), TokenExpires: exp}

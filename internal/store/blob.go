@@ -12,12 +12,13 @@ import (
 
 // BlobPut describes a blob upload that has already been authorized and whose
 // body has already been bounded to Size bytes by the caller.
+// A blob's sender is not stored: nothing reads it (a deposit's sender is
+// kept, and returned to the recipient, §6.3).
 type BlobPut struct {
-	Mailbox   string
-	SenderSub string
-	Size      int64
-	TTL       time.Duration
-	Limits    Limits // MailboxMaxBytes = per-mailbox blob storage cap
+	Mailbox string
+	Size    int64
+	TTL     time.Duration
+	Limits  Limits // MailboxMaxBytes = per-mailbox blob storage cap
 }
 
 // BlobInfo is blob metadata visible to the API layer. Blob content metadata
@@ -80,10 +81,12 @@ func (s *Store) PutBlob(ctx context.Context, p BlobPut, r io.Reader) (BlobInfo, 
 		return BlobInfo{}, err
 	}
 	info := BlobInfo{ID: s.newID(now), Mailbox: p.Mailbox, Size: p.Size, ExpiresAt: now.Add(p.TTL).UTC()}
+	// sender_sub is kept in the schema (existing databases have it) and
+	// left empty.
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO blobs(blob_id, mailbox_id, size, created_at, expires_at, sender_sub, data)
-		 VALUES(?,?,?,?,?,?,?)`,
-		info.ID, p.Mailbox, p.Size, ms(now), ms(info.ExpiresAt), p.SenderSub, data); err != nil {
+		 VALUES(?,?,?,?,?,'',?)`,
+		info.ID, p.Mailbox, p.Size, ms(now), ms(info.ExpiresAt), data); err != nil {
 		return BlobInfo{}, err
 	}
 	return info, tx.Commit()

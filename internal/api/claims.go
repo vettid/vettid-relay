@@ -54,7 +54,21 @@ func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeBadRequest))
 		return
 	}
+	// A claim is stored: it draws on the network's byte budget, like a
+	// deposit. (Its small body is read before the signature can be
+	// checked, so it is charged once the claim is authenticated.)
+	// The key is the claim's creator, the mailbox owner whose signature
+	// authorizeOwner verified; and its network's ceiling.
+	network, owner, n := s.network(r), auth.EncodeKey(mb.PubKey), int64(len(body))
+	if e := s.takeKeyAndNetwork(limKeyBytes, s.keyByteLimit, owner, limBytes, s.byteLimit, network, n); e != nil {
+		s.writeError(w, e)
+		return
+	}
 	id, exp, err := s.st.PutClaim(r.Context(), mb.ID, body, ttl, s.cfg.MailboxMaxBlobBytes)
+	if err != nil { // not stored: the charges are given back
+		s.refundBytes(limKeyBytes, s.keyByteLimit, owner, n)
+		s.refundBytes(limBytes, s.byteLimit, network, n)
+	}
 	switch {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))

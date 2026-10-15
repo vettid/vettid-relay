@@ -1,6 +1,6 @@
 # VettID Relay Protocol
 
-**Version:** 0.7.0 (draft)
+**Version:** 0.9.0 (draft; the §7.2 resource limits are proposed and await approval)
 **Status:** Pre-implementation draft for review
 
 ## 1. Purpose & design principles
@@ -32,7 +32,7 @@ Conformance keywords MUST, SHOULD, MAY are per RFC 2119.
 | Identity & signing | Ed25519 (RFC 8032) |
 | Deposit tokens | PASETO v4.public (Ed25519-signed) |
 | Hashing | SHA-256 |
-| Message IDs | ULID (Crockford base32, 26 chars) |
+| Message IDs | ULID (Crockford base32, 26 chars, upper case). Clients MUST send an id exactly as the relay issued it; a relay need not accept another spelling |
 | Transport | HTTPS (TLS ≥ 1.2); WebSocket over TLS for streaming collect |
 
 All base64 in this spec is standard RFC 4648 base64 **with** padding unless
@@ -279,7 +279,12 @@ POST /v1/mailbox/{mailbox_id}        (deposit token §5 + signed request §4.1)
 - Larger content uses the **claim-check convention**: the deposited payload is a
   small encrypted envelope pointing at externally stored ciphertext. Blob
   storage is explicitly out of protocol scope.
-- The relay assigns the ULID; per-mailbox ULID order is arrival order.
+- The relay assigns the ULID; per-mailbox ULID order is arrival order: a
+  message deposited later never has a smaller id, whatever the relay's
+  clock does. (vettid-relay: with the shared store this holds per mailbox
+  across all processes; with the SQLite store it holds for the one process
+  that may use a database file, and after a restart against the messages
+  still stored.)
 - **Wake-on-deposit:** if the recipient has a parked long-poll request (§6.3) or
   an open WebSocket (§6.4), the relay SHOULD deliver the message to it
   immediately upon successful deposit, without waiting for a poll interval.
@@ -331,6 +336,38 @@ lease semantics. Client frames: `{ "ack": "<msg_id>" }`. WebSocket support is
 OPTIONAL for relays and clients; long-poll is the mandatory baseline. When the
 mailbox is deleted (§6.10) the relay closes the session with close code
 **4404** and reason `mailbox_unknown`.
+
+**The window (0.8.0).** A relay MAY bound the messages it has sent on a
+session that are not yet acked there (§7.2: vettid-relay sends more while
+fewer than 97 are outstanding, and up to 128 when whole batches are
+waiting), sending more only as acks arrive or leases end; clients SHOULD
+ack each message as soon as it is handled. An ack by
+`DELETE /v1/mailbox/{msg_id}` (§6.5) deletes the message but does not make
+room on the session before its lease ends. Order across redelivery is not
+guaranteed.
+
+Until the first lease of an unacked message ends, a session with a full
+window is sent nothing more (a message deposited then arrives when those
+leases end, up to one visibility timeout later). From then on vettid-relay
+sends the unacked ones again in passes from the oldest to the newest the
+session had been sent when the pass began: once per visibility timeout a
+batch, taken before anything else when it is due, of at least 32 messages
+and of 96 when nothing else is outstanding (which needs the previous batch
+to have been written out in time: a slow reader gets a smaller batch,
+never under 32). New messages are sent the rest of the time; they wait
+only for a due batch's frames, unless the session itself has left more
+than 64 unacked. An unacked message is thus sent again once in every pass.
+A pass over n such messages is at most ⌈n/32⌉ batches, one visibility
+timeout apart and never more than two: at most ⌈n/32⌉ visibility timeouts
+for a session that acks the new messages it gets, 2⌈n/32⌉ in the worst
+case, ⌈n/96⌉ for a session with nothing else outstanding, until the
+message is acked or expires.
+
+**Close codes (0.8.0).** A frame that is anything else, or whose `msg_id`
+is not a ULID in upper case, ends the session with close code **1008** (a
+frame larger than the relay reads, 1,024 bytes in vettid-relay, ends it
+with **1009**). A session ended because an ack frame was refused by a rate
+limit (§7.2) is closed with **1013** and reason `rate_limited`.
 
 ### 6.5 Ack
 
@@ -645,7 +682,10 @@ or the IPv6 /64), with a budget **separate** from the `/v1` limits (§7.2), so
 that scanning can never use up the budget of mailbox traffic. The limiter
 SHOULD be local to the relay process (no shared-store round trip), so
 scanner bursts stay cheap. Over the limit: `429` `rate_limited` with
-`retry_after` (§7.1, §7.2) and `Cache-Control: no-store`.
+`retry_after` (§7.1, §7.2) and `Cache-Control: no-store`. The health check
+is outside every limit, so what a request to it costs is bounded another
+way: a relay SHOULD answer it (`/healthz` in vettid-relay) from a store
+check no older than a few seconds (vettid-relay: 2 s).
 
 **Logging.** Nothing about these requests that could identify an invitation
 or a visitor is logged. The fragment never reaches the relay; in addition, a
@@ -703,39 +743,66 @@ with a separate budget.
 
 The rest of this section (0.7.0) says how a relay SHOULD limit, and gives
 the reference relay's numbers. None of it is visible to a client except as
-fewer or more `429`s.
+fewer or more `429`s (to WebSocket upgrades too, under limits 7 to 9, and
+to deposits, claims and blob transfers under limits 11 to 13), as a blob
+transfer dropped when its body stalls (13) and, on a WebSocket session,
+as close code 1013 `rate_limited` when an ack frame is refused by a rate
+limit (§6.4).
 
 **Principle.** A client's address is the right key for a limit only while
 the caller is unauthenticated. Addresses are shared: every vault on a vault
 host reaches the relay from that host's one address (hundreds of vaults),
 and phones behind a carrier NAT share theirs. So once a request is
 attributed to a key, the relay limits the **key**. "Network" below means
-the IPv4 address or the IPv6 /64.
+the IPv4 address or the IPv6 /64. (Whoever holds a larger IPv6 prefix holds
+many networks, a /48 65,536 of them: every per-network limit below then
+binds per /64 only, and what bounds such a holder is what is not keyed on
+a network: the per-process and per-key limits.)
 
 **The limits.**
 
 | | Limit | Key | vettid-relay default | Applies |
 |---|---|---|---|---|
 | 1 | flood guard | network | 100/s, burst 300 | to every `/v1` request, first, before anything is parsed |
-| 2 | per key | signing key | 20/s, burst 100 | once the request is authenticated: on owner routes after the signature verified, was no replay, and the signer's mailbox exists; on registration and mailbox deletion after the signature verified |
+| 2 | per key | signing key | 20/s, burst 100 | once the request is authenticated: on owner routes after the signature verified, was no replay, and the signer's mailbox exists; on registration and mailbox deletion after the signature verified; and to every ack frame of a WebSocket session (§6.4) that does not name a message sent on that session and still leased to it (a message received elsewhere, an id acked before, an ack after the lease ended, an id that names nothing): such a frame draws on the flood guard (1) and on this limit like the `DELETE /v1/mailbox/{msg_id}` it stands for, and the session is closed with 1013 `rate_limited` when either is empty. An ack frame is uncharged once for each message in the window: a duplicate ack is charged, and so is a duplicate ack after a lease ended |
 | 3 | new mailboxes | network | 1/s, burst 30 | to a registration that creates a mailbox, and to a rotation (§6.7). Registering an existing key again draws nothing (clients do that routinely, §6.1) |
-| 4 | per sender | token `sub` (an open token's `jti`, §5.6) | 5/s, burst 20 | to deposits, after §5.3 step 7; to blob uploads after step 6, before their body |
+| 4 | per sender | token `sub` (an open token's `jti`, §5.6) | 5/s, burst 20 | to deposits and blob uploads, after §5.3 step 7 (the token's `sub` is written by the mailbox owner; only the signature proves the sender) |
 | 5 | claim fetches | network | 1/s, burst 10 | to `GET /v1/claim/{id}` (§6.9), the one unauthenticated operation |
 | 6 | collectors | mailbox | 4 | to parked long-polls and WebSocket sessions together |
+| 7 | WebSocket sessions | relay process | 4,000 | to upgrades of `GET /v1/mailbox/ws`; beyond it `429` with `retry_after` 5. Long-poll is not affected |
+| 8 | WebSocket sessions per network | network, per relay process | 1,024 | to an upgrade for a mailbox that already has a WebSocket session on that process; the first session of a mailbox is admitted beyond it, up to 9. `429` with `retry_after` 5 |
+| 9 | WebSocket sessions per network, ceiling | network, per relay process | 2,000 | to every upgrade, a mailbox's first session included: no network holds more on a process. `429` with `retry_after` 5. At least 8 and at most 7 |
+| 10 | WebSocket window | session | 128 messages | to messages sent on a session and not yet acked there: the relay leases a further batch (32) only while it fits, so it pauses at 97 or more outstanding, until acks arrive or leases end |
+| 11 | stored bytes | authenticated key, and network as a ceiling; per relay process | per key 64 KiB/s, burst 2 MiB; per network 1 MiB/s, burst 32 MiB | charged in bytes. Deposits: the key is the sender's, the token's `sub` (an open token's signer), which the request signature proves only after the body (§5.3 step 7); so after step 6 and **before the body is read**, the network's ceiling is charged with the declared body length (without a `Content-Length`, the largest deposit body) and the key's budget is only checked (an empty one is refused, and the deposit is not read); once the signature has verified, the key's budget is charged with the body's length, unconditionally (it may go into debt). Claim creation (§6.9): the key is the claim's creator, the mailbox owner whose signature verified; key and network are charged together with the claim's length (refused by either, charged to neither). A deposit or claim that is then not stored (quota, signature, malformed body, store failure) is refunded. `429` with `retry_after` |
+| 12 | blob bytes | authenticated key, and network as a ceiling; per relay process | per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst 256 MiB | charged in bytes. Blob uploads: the key is the token's `sub`, which the mailbox owner wrote and the request signature proves only after the body (§5.3 step 7); so after §5.3 steps 1–6 and before the body is read, the network's ceiling is charged with the declared length (without one, the largest blob) and the key's budget is only checked (an empty one is refused unread); once the signature has verified the key's budget is charged with the bytes received, unconditionally (it may go into debt). Blob downloads: after the owner's signature verified, the owner's key and the network's ceiling are charged together with the blob's size, at most a key's burst (refused by either, charged to neither). An upload that stores nothing is refunded only the part of its network charge it never sent: the bytes that reached the relay stay charged whatever refused it (body failure, signature, quota, store failure); an upload refused a transfer slot (13), which held none, is refunded entirely. A download by an owner whose budget, or whose network's, is empty is refused before the store is read. `429` with `retry_after` |
+| 13 | blob transfers | relay process; mailbox; sender and mailbox | 8 per process; per mailbox 2 uploads and, apart, 2 downloads; 1 upload per sender key and mailbox; uploads at most 8 − 2 = 6 per process | to blob uploads once their body has begun to arrive (an upload that has sent nothing holds no slot), and to blob downloads; the mailbox is the recipient's for an upload and the owner's for a download. Uploads never take a mailbox's download slots nor the 2 process slots kept for downloads. `429` with `retry_after` 2. A transfer's body must move at least 16 KiB in every 5 s and finish within 5 minutes, or the transfer is dropped (an upload is answered `400` with `Connection: close`): an upload that trickles at the minimum pace holds its slot up to 5 minutes |
 
 Nothing else is keyed on a network. A request that is properly signed by a
 key with a mailbox can be refused on account of its network only by the
-flood guard (1) and, if it would create a mailbox, by the new-mailbox
-budget (3): no client is refused for what another client behind its
-address did, beyond those two. There is no penalty state: a relay that
+flood guard (1), by the byte budgets for what it would store or move (11,
+and 12's ceiling) and, if it would create a mailbox, by the new-mailbox budget (3): no
+client is refused for what another client behind its address did, beyond
+those. There is no penalty state: a relay that
 refuses a network does so only for as long as its bucket is empty.
 
 **Order of checks.** The flood guard comes before everything a request
 can cost: every signature verification, replay record (§4.1) and store
 read happens after it, so the guard bounds them all. Then, per request:
 the body size limit; for deposits and blob uploads the header-only steps
-of §5.3 (1–6) **before the body is read**; the signature and the replay
-check; the mailbox lookup; the per-key or per-sender limit. A request that
+of §5.3 (1–6) **before the body is read**, then for deposits the byte
+budget's network ceiling (11, with a look at the key's) and for blob
+uploads the blob byte budget's network ceiling (12, with a look at the
+key's), still before the body is read; the signature; then for deposits
+the key's byte budget (11), for deposits and blob uploads the per-sender
+limit (4), and for blob uploads the key's blob budget (12); on owner
+routes the mailbox lookup **before** the replay check, so that a key
+without a mailbox writes no replay record (a deposit's mailbox was looked
+up in step 1); the per-key or per-sender limit; for claims the byte
+budgets (11: the creator's key and its network), for blob downloads an empty blob budget (12) refuses before
+the store is read, then the transfer slot (13), the store read and the
+charge with the blob's size; for blob uploads the transfer slot (13) once
+the body begins to arrive. A charge for a request that ends up storing
+nothing is refunded as limits 11 and 12 say. A request that
 is refused before its body has been read SHOULD be answered at once with
 `Connection: close`, not after waiting for the body. A small body that
 has to be read before the request can be authenticated (registration,
@@ -748,12 +815,18 @@ closed.
 mailbox, key, token or claim exists, except to the holder of the key
 concerned. The network limits never look at a request's target (the
 new-mailbox budget is consulted only for the holder of the key being
-registered). The key and sender limits apply only after the caller has
+registered; the byte budgets are charged for a deposit only after its
+mailbox is known to exist, which a deposit's answer says to anyone, and
+for a claim or a blob download only to the key's holder). The key and sender limits apply only after the caller has
 proved the key is its own.
 
 **`retry_after`** is the whole seconds until one request is allowed, at
-least 1. A mailbox at its collector maximum gets 1; a relay that cannot
-reach its replay store sheds signed requests with 5.
+least 1 (for a byte budget: the whole seconds until the request's bytes
+are there). A mailbox at its collector maximum gets 1; a process or a
+mailbox without a free blob transfer slot (13) gets 2; a relay process at
+its maximum of WebSocket sessions (7), a network at its maximum (8) or at
+its ceiling (9), and a relay that cannot reach its replay store answer
+with 5.
 
 **Where the numbers come from (informative).** One unlocked vault, read
 from vettid-vault (`vault/relay.go`, `vault/inbound.go`, relayclient),
@@ -785,6 +858,58 @@ does the same on its own mailbox.
 - *Per key, 20/s, burst 100.* 500 times an idle vault; a message costs its
   recipient two requests, so 10 messages a second sustained; the burst is
   three full batches of 32 with their acks.
+- *Stored bytes, per key 64 KiB/s, burst 2 MiB; per network 1 MiB/s,
+  burst 32 MiB.* The per-mailbox caps do not bound a network: mailboxes
+  and keys cost nothing. At the flood guard alone one address could store
+  about 26 MB a second (100 deposits of 262,144 bytes). Messages pass
+  through vaults (phone → own vault → peer vault → peer phone), and a
+  vault host carries hundreds of vaults behind one address, so the budget
+  is per key, the vault's own, under a ceiling for the network. A key's
+  burst of 2 MiB is about 380 messages of 4 KB (base64 makes 4 KB about
+  5.5 KB) at once, a message to 300 connections; 64 KiB/s is about 12
+  messages a second sustained, far above one member. A host of 900 vaults
+  at three messages a minute each, each crossing the host about twice,
+  stores about 0.5 MB/s, half the 1 MiB/s ceiling (a sixth at a message a
+  minute); the 32 MiB burst holds a mass unlock (about two deposits per
+  vault, 10 MB) three times over, and a mass unlock is paced by the flood
+  guard first. The ceiling is also what one network can cost the store:
+  1 MiB/s is about 1,050 write units a second, half of the production
+  table's ceiling of 2,000 from one process. Charges are on the declared
+  body length (base64 included) and are refunded for a deposit that is
+  then not stored.
+- *Blob bytes, per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst
+  256 MiB.* Attachments go phone → own vault → peer vault → peer phone,
+  so they pass through vaults, and a vault host carries hundreds of vaults
+  behind one address: a single budget per network would throttle the
+  whole host as one. So the budget is per authenticated key, the vault's
+  (or phone's) own, and the network has a ceiling above it. A vault
+  forwards each attachment twice (it downloads it from its mailbox and
+  uploads it onward), so a key's burst of 32 MiB is two maximum-size
+  attachments through a vault at once, or four blobs from a phone; 1 MiB/s
+  sustained is far above any one member. A host of 900 members each
+  sending five 1 MB attachments a day, each crossing the host 2 to 4
+  times, moves about 0.2 MB/s on average; a peak hour at ten times that
+  is a quarter of the 8 MiB/s ceiling, and the 256 MiB burst holds 32
+  maximum-size attachments crossing at once. Memory is bounded by the
+  transfer slots (13), not by the budget: 8 transfers of 8 MiB, 64 MiB a
+  process. 8 MiB/s (67 Mbit/s) is about what one small relay task can
+  move, and bounds a network's blob egress at about 0.7 TB a day per
+  process (an estimate: about $65 a day at $0.09/GB).
+- *Blob transfers, 8 per process; per mailbox 2 uploads and 2 downloads;
+  one upload per sender and mailbox; 16 KiB per 5 s.* A blob is held in
+  memory while it moves, so transfers are bounded. Uploads and downloads
+  are counted apart so that senders cannot keep an owner from its blobs,
+  and one sender cannot take both of a mailbox's upload slots. The slot
+  is taken only once an upload's body arrives and is dropped when the
+  body stops moving, so a client that announces uploads and stalls holds
+  no slot, and one that stalls part-way holds it for 5 s; one that keeps
+  the minimum pace holds it up to the 5-minute maximum.
+- *Refunds.* The byte budgets bound what is stored, so a deposit or
+  claim that stores nothing is given its charge back: a vault host's
+  sender retrying against a full mailbox does not drain its host's budget.
+  A blob upload that held a transfer slot keeps charged every byte it
+  sent, whatever then refuses it, so holding an upload slot always costs
+  the bytes trickled while holding it.
 - *New mailboxes, 1/s, burst 30.* Members enrolling on one host or behind
   one NAT are a few an hour; 30 covers a batch (a test run, a small
   migration). The burst matters only for the first seconds: the rate is
@@ -817,11 +942,20 @@ sender's budget, and an unauthorized deposit's body is not read.
   address can keep about 2,500 parked (100/s × 25 s; 500 before), plus the
   burst: at a measured 42 KiB each, about 105 to 120 MiB across the
   relay's processes. WebSocket sessions cost one request each and do not
-  end: an address can hold 4 per mailbox it registered **on each relay
-  process**, 30 mailboxes at once and one more a second, so about 14,500
-  sessions per process after an hour (640 MiB at a measured 45 KiB): more
-  than a process has. (Before, registrations were not budgeted at all and
-  this took minutes.)
+  end. A network can hold 1,024 **on each relay process** (8) after about
+  4 minutes, and beyond that one per mailbox it registered up to 2,000 (9;
+  about 88 MiB at a measured 45 KiB) after about 20 minutes, and no more:
+  one network cannot fill a process (7: 4,000), two can. The counts are
+  per process, so a network can hold 2,000 on each process; and per
+  network, so the holder of a larger IPv6 prefix is bounded by 7 only. A
+  vault host with more than 2,000 vaults behind one address on one process
+  exceeds 9: its further vaults are refused the upgrade and must collect
+  by long-poll, or the operator raises it. (Clients SHOULD fall back to
+  long-poll on a `429` upgrade; a client that only retries the WebSocket
+  stays without a collector.) A session that does not ack costs, with no
+  request, up to its window (10) in leases per visibility timeout and as
+  many uncharged ack frames: about 2 of each a second per session, about
+  4,300 a second for the 2,000 sessions of one network on a process.
 - **A deposit's body can still be made to stall.** It is read after the
   deposit token verified but before the request signature and the
   per-sender limit, and it has no deadline of its own. Anyone with one
@@ -841,6 +975,50 @@ sender's budget, and an unauthorized deposit's body is not read.
 - **The new-mailbox budget is per address** (1/s): anyone behind an
   address can use it up, and other enrolments and rotations from that
   address then wait their turn.
+- **Storage and its cost are bounded per network by limits 11 and 12, and
+  relay-wide only by the deployment** (the store's throughput ceiling, the
+  blob bucket's expiry). The byte budgets are per process: behind N relay
+  processes a network can store up to N times 1 MiB/s, and with two or
+  more it can reach the production table's write ceiling (2,000 units a
+  second) by itself, which throttles every tenant. Many addresses
+  together can still fill the relay up to the deployment's ceiling. Per
+  mailbox, vettid-relay keeps at most 10,000 messages and 32 MiB of them
+  (and 64 MiB of blobs and claims); a mailbox above a lowered cap keeps
+  what it holds and takes no deposit until it is under the cap again.
+  Expired messages are never delivered but may stay stored for a few days
+  until the store's expiry removes them.
+- **Mailboxes never expire.** One address can create 86,400 a day (3);
+  each is small, but their number only grows (see "Later").
+- **Upload slots are shared by all networks on a process.** One address
+  with three mailboxes of its own and two sender keys for each (it mints
+  its own tokens) can hold the 6 upload slots of a process by keeping each
+  upload at the minimum pace for up to 5 minutes. That costs it the bytes
+  it sends, about 960 KiB per slot per round (16 KiB every 5 s), some 6
+  MiB per round of all 6, well inside its blob budgets: other senders'
+  uploads on that process are answered `429` until a slot frees. Uploads
+  alone cannot keep owners from their blobs: 2 process slots and each
+  mailbox's download slots are never given to uploads.
+- **Download slots are shared by all networks on a process too.** An
+  address with its own mailboxes and blobs can download them slowly at the
+  minimum pace and hold all 8 slots of a process, each for up to 5
+  minutes (a blob of about 960 KiB lasts that long at the pace), at the
+  cost of each blob's size from its blob budgets (12): about 8 MiB per
+  round of 8, well inside them. Other owners' downloads on that process are
+  then answered `429` until a slot frees.
+- **Blob keys cost nothing.** Anyone with a mailbox mints tokens for
+  fresh sender keys, each with its own blob budget (12), so what bounds
+  one network's blob traffic is the network's ceiling, 8 MiB/s per
+  process, not the key's budget; a vault host's honest traffic shares
+  that ceiling with anything else behind its address. The reverse does
+  not hold: a token whose `sub` names another's key (anyone can mint one
+  for their own mailbox) cannot spend that key's budget, which is charged
+  only once the request signature has proved the key.
+- **Byte keys cost nothing (11 too).** Fresh sender keys each have their
+  own deposit budget, so what bounds one network's deposits is its
+  ceiling, 1 MiB/s per process, which a vault host shares with anything
+  else behind its address. A token whose `sub` names another's key
+  cannot spend that key's budget: it is charged only once the signature
+  has proved the key.
 - **Many addresses at once:** no per-network limit helps; that is the load
   balancer's, the scaling policy's and, if ever needed, a web ACL's job.
 
@@ -851,11 +1029,13 @@ the measurement named says it is needed; the relay reports all of them
 | Mechanism | What it adds | Measurement that justifies it |
 |---|---|---|
 | a higher flood guard (rate and burst: 200/s, burst 4,000 was reviewed for hosts of 1,000 to 2,000 vaults) | larger hosts | rate: the busiest address at half the guard for minutes (3,000 requests a minute). Burst: refusals of a known host after relay deploys or mass unlocks |
-| caps on parked collectors per network and process, with the first collector of a mailbox always admitted; a maximum lifetime for WebSocket sessions | bounded memory for parked connections | collectors per process against its memory; any WebSocket use |
+| caps on parked long-polls per network and process (WebSocket sessions have theirs: 7, 8, 9); session counts shared between processes; a maximum lifetime for WebSocket sessions | bounded memory for parked connections | collectors per process against its memory; refusals under 8 and 9; sessions per process |
 | body memory counted as it arrives, a pace for bodies (deposits included), separate pools | bounded memory and time for stalled bodies: the follow-up for the deposit case above | connections held open in body reads; process memory under stalled requests |
 | a per-network budget of failed authentications, with signature-first handling for a network that used it up | garbage refused cheaply | refusals and error rates by code from single addresses |
 | holding a key that signs properly but has no mailbox, with a growing `retry_after` | an orphaned client stops costing a store read per retry | `mailbox_unknown` answers per minute |
 | refused-deposit budgets per sender and per (sender, mailbox) | a sender spraying refused deposits | refused deposits by code |
+| byte budgets shared between processes | a network's byte budget the same however its requests are spread | `bytes_busiest_per_min` near the budget on several processes at once |
+| expiry of a mailbox not collected from for 400 days (the longest reconnect-token lifetime) | the number of mailboxes stops only growing | mailbox count against active collectors |
 
 **No allowlist.** The relay does not exempt known addresses (vault hosts).
 An allowlist would be a second configuration to keep right as hosts come
@@ -863,8 +1043,10 @@ and go, and would give whoever gains use of a listed address an unlimited
 relay.
 
 **Shared state.** With several relay processes, limits 1 to 5 are shared
-(their observable budget is the same however requests are spread); limit
-6 is per process. If the shared store cannot be reached, the shared limits
+(their observable budget is the same however requests are spread); limits
+6 to 9 and 11 to 13 are per process (a client that reconnects to another
+process is counted there afresh), and 10, with the order of re-sends, is
+each session's own. If the shared store cannot be reached, the shared limits
 fall back to per-process buckets (limits are best-effort policy;
 availability matters more), while signed requests are shed with `429` as
 long as replays cannot be recorded (§4.1).
@@ -877,31 +1059,122 @@ the number of networks the flood guard refused; and the parked collectors
 and WebSocket sessions it carries. These are what the limits above are to
 be re-sized from. vettid-relay exports `relay_ratelimit_allowed_total`,
 `relay_ratelimit_refused_total`, `relay_ratelimit_peak_permille` (by
-limiter: `address`, `key`, `sender`, `register`, `claim`, `web`),
+limiter: `address`, `key`, `sender`, `register`, `claim`, `web`;
+`relay_ratelimit_refused_total` also has `ws_sessions`, `ws_network` and
+`ws_network_hard`, the upgrades refused under 7, 8 and 9, which the
+`rate limits` line ends with as `ws_sessions_refused`,
+`ws_network_refused` and `ws_network_hard_refused`; and, added in 0.9.0,
+the byte budgets `bytes` (11, the network's ceiling), `key_bytes` (11,
+per key), `blob_bytes` (12, the network's ceiling) and `blob_key_bytes`
+(12, per key), and the blob
+transfers refused under 13, `blob_slots` (the process) and
+`blob_mailbox_slots` (the mailbox) and `blob_sender_slots` (the sender's
+upload to that mailbox)),
 `relay_ratelimit_busiest_per_minute` (`address`, `key`),
+`relay_ratelimit_busiest_bytes_per_minute` (`bytes`, `blob_bytes`,
+`blob_key_bytes`, `key_bytes`: the bytes charged to the busiest single
+network or key),
 `relay_active_collectors`, `relay_parked_collectors` and
 `relay_ws_sessions`, and logs all of it once a minute in one `rate limits`
-line.
+line, which after the WebSocket refusals ends with `bytes_peak`,
+`bytes_refused`, `bytes_busiest_per_min`, `blob_bytes_peak`,
+`blob_bytes_refused`, `blob_bytes_busiest_per_min`, `blob_key_bytes_peak`,
+`blob_key_bytes_refused`, `blob_key_bytes_busiest_per_min`,
+`key_bytes_peak`, `key_bytes_refused`, `key_bytes_busiest_per_min`,
+`blob_slots_refused`,
+`blob_mailbox_slots_refused`, `blob_sender_slots_refused`, `log_dropped`
+and `log_suppressed`. A relay SHOULD bound its own log volume without
+losing what an operator relies on: vettid-relay writes at most 100 info
+lines a second per process (burst 1,000; the rest are counted in
+`log_dropped`); the request lines of successful registrations, rotations, denylist
+changes and mailbox deletions draw on a second budget of the same size, which other
+lines cannot use up; it logs refusals (`429`) at debug; it writes one warn
+or error message with the same error, route and panic at most once per
+10 s (the rest counted in `log_suppressed`); and it never drops the `rate
+limits` line (a deployment can alarm when it goes missing) or its own
+start, drain and stop lines.
 
 **Configuration (informative).** vettid-relay reads, each as `_RPS` and
 `_BURST`: `RELAY_RATE_IP` (1), `RELAY_RATE_KEY` (2),
 `RELAY_RATE_REGISTER` (3), `RELAY_RATE_SENDER` (4),
 `RELAY_RATE_CLAIM_GET` (5), `RELAY_RATE_WEB` (§6.11); and
-`RELAY_MAX_COLLECTORS_PER_MAILBOX` (6). Every rate and burst must be
-greater than zero.
+`RELAY_MAX_COLLECTORS_PER_MAILBOX` (6), `RELAY_MAX_WS_SESSIONS` (7),
+`RELAY_MAX_WS_SESSIONS_PER_NETWORK` (8) and
+`RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD` (9), with 8 ≤ 9 ≤ 7 (the relay
+refuses to start otherwise). The window (10) is not configurable.
+`RELAY_RATE_KEY_BYTES` and `RELAY_RATE_IP_BYTES` (11: per key, and the
+network's ceiling), `RELAY_RATE_BLOB_KEY_BYTES` and
+`RELAY_RATE_BLOB_BYTES` (12: per key, and the network's ceiling), each as
+`_PER_SEC` and `_BURST`, in bytes; `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS`
+and `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` (13), and
+`RELAY_BLOB_PACE_BYTES` (per 5 s); `RELAY_MAILBOX_MAX_BYTES` (32 MiB);
+`RELAY_LOG_INFO_RPS` and `RELAY_LOG_INFO_BURST`. The relay refuses to
+start unless a key's burst under 11 holds the largest deposit body and
+the largest claim, the network's ceiling under 11 is at least a key's
+rate and burst, the mailbox cap holds at least one message and, with blobs
+enabled, a key's burst under 12 holds the largest blob, the network's
+ceiling is at least a key's rate and burst, and the per-mailbox
+transfers are fewer than the process's. Every rate, every burst and the
+blob pace must be greater than zero, whether blobs are enabled or not.
 
-**Clients.** Nothing changes on the wire. Clients SHOULD retry a `429` no
-sooner than `retry_after`, with their own jitter; SHOULD treat
+**Clients.** Nothing changes on the wire, except for WebSocket sessions
+(0.8.0): an upgrade can be answered `429` under limits 7 to 9, and a
+session can be closed with 1013 `rate_limited` when an ack frame is refused
+by a rate limit (§6.4). Clients SHOULD retry a `429` no
+sooner than `retry_after`, with their own jitter (a deposit, claim or blob
+transfer answered `429` under 11 to 13 is retried like any other; deposits
+and blob uploads SHOULD carry a `Content-Length`, since without one they
+are charged the largest body; an upload SHOULD send its body without
+pauses, since one that stops moving is dropped with `400`); SHOULD treat
 `mailbox_unknown` on their **own** mailbox as final until they have
 registered again (stop collecting, register, resume; or stop, if the
 mailbox was deleted on purpose) instead of asking again every second; and
-SHOULD treat `timestamp_stale` as a wrong local clock and back off.
+SHOULD treat `timestamp_stale` as a wrong local clock and back off. A
+client whose WebSocket upgrade is answered `429` SHOULD collect by
+long-poll and try the WebSocket again no sooner than `retry_after`, with
+backoff; a client whose session is closed with 1013 SHOULD back off before
+reconnecting.
 
 ### 7.3 Versioning
 
 The URL prefix (`/v1`) is the major version. Backward-compatible additions
 (new optional fields, new endpoints) bump the spec's minor version without a
 prefix change. This document carries a semver and a changelog (§10).
+
+### 7.4 The HTTP/2 front end (deployment, 0.7.1)
+
+A relay that serves HTTP/2, itself or through a load balancer, announces
+how many requests a client may have open on one connection
+(`SETTINGS_MAX_CONCURRENT_STREAMS`, RFC 9113 §6.5.2). For most clients
+the number does not matter. For a vault host it does: every vault on the
+host holds one long-poll (§6.3) on connections they all share, and the
+host's enclave decides how many connections to open from the limit the
+relay announces (VAULT-MESSAGING §12.2.1).
+
+- A relay's front end **MUST NOT announce exactly 100** concurrent
+  streams. 100 is what the vault's HTTP/2 library (Go's) assumes before
+  a host has announced anything, and the library does not say when the
+  announcement arrived. A connection that reads 100 is therefore
+  trusted only once it has answered a request: until then it carries 1
+  request, after a second fewer than 32, and when its first requests
+  are all long-polls that can last up to 25 s, during which the host's
+  other vaults wait (VAULT-MESSAGING §12.2.1; VAULT-RELAY-SCALING
+  §10.4).
+- It **SHOULD announce at least 128**. Below **32** a vault host opens
+  no second connection at all, so that a relay cannot split the vaults
+  of a host over many connections and tell them apart: every request
+  beyond the limit then waits for a stream.
+- HTTP/2 already requires PING frames to be answered (RFC 9113 §6.7). A
+  vault host depends on it: it pings a connection after 15 s without a
+  frame and closes it when no answer comes within 10 s.
+
+These are requirements on a deployment, not on the wire format, and
+nothing in `/v1` changes. relay.vettid.org is behind an AWS Application
+Load Balancer, which announces 128 and answers pings; the value is not
+configurable there (read from its `SETTINGS` frame on 2026-10-12).
+Anyone who puts another front end before a relay that vault hosts use
+(another load balancer, a CDN, a reverse proxy) checks the number it
+announces first. Some servers and proxies default to exactly 100.
 
 ## 8. Security considerations
 
@@ -1052,6 +1325,50 @@ The push gateway API is specified separately.
 
 ## 10. Changelog
 
+- **0.9.0 (proposed)** — resource limits, as built in vettid-relay (§7.2,
+  no wire change). Byte budgets: what a network asks the
+  relay to store (deposits, claims: 11, per authenticated key 64 KiB/s,
+  burst 2 MiB, under a network ceiling of 1 MiB/s, burst 32 MiB) and its
+  blob traffic (uploads and downloads: 12, per authenticated key 1 MiB/s,
+  burst 32 MiB, under a network ceiling of 8 MiB/s, burst 256 MiB),
+  charged with the declared length before the body is read, `429` with
+  `retry_after`, refunded when nothing is stored. Blob transfers (13): 8
+  per process, uploads and downloads counted apart per mailbox (2 each),
+  one upload per sender and mailbox, 2 process slots kept for downloads,
+  a slot held only while the body moves, a pace of 16 KiB per 5 s and at
+  most 5 minutes per transfer. The per-sender limit (4) applies to blob
+  uploads after the signature, as to deposits. Owner routes look the mailbox up before writing
+  the replay record. The reference relay's mailbox cap goes from 128 MiB
+  to 32 MiB; it bounds its log volume. New counters, `rate limits` fields
+  and configuration variables; nothing removed or renamed.
+- **0.8.0** — WebSocket sessions are bounded, as built in vettid-relay #9;
+  approved by the owner 2026-10-13. Until now the limits of §7.2 applied
+  to a session's upgrade request only. Now (§6.4, §7.2): a relay process
+  carries a maximum of sessions (7: 4,000 in the reference relay), and of
+  one network a maximum (8: 1,024) beyond which only the first session of
+  a mailbox is admitted, up to a ceiling (9: 2,000); a refused upgrade is
+  `429` with `retry_after` 5 and long-poll is not affected. A session has
+  a window of messages sent and not yet acked (10: 128); a session that
+  lets leases end is sent the unacked messages again in rationed batches,
+  one per visibility timeout, with new messages in between. An ack frame
+  that does not answer a message in the window is charged to the flood
+  guard and the key's limit like the `DELETE` it stands for. Close codes:
+  **1008** for a frame that is not an ack of a well-formed id, **1013**
+  with reason `rate_limited` when a charged ack is refused. Message ids
+  are upper case and clients MUST send them as issued (§2); ULID order
+  holds whatever the relay's clock does (§6.2). The health check answers
+  from a store check a few seconds old at most (§6.11). New refusal
+  counts and three configuration variables (§7.2). For clients: fall back
+  to long-poll on a `429` upgrade, back off after 1013; no new endpoint,
+  field or error code.
+- **0.7.1** — a deployment requirement, no wire change (§7.4, new): a
+  relay's HTTP/2 front end MUST NOT announce exactly 100 concurrent
+  streams and SHOULD announce at least 128 (and vault hosts rely on
+  its answers to PING frames).
+  The requirement was already made of VettID's relay in
+  VAULT-MESSAGING 0.27.2 §12.2.1 and VAULT-RELAY-SCALING §10.4; it is
+  stated here because it binds whoever deploys a relay. relay.vettid.org
+  announces 128.
 - **0.7.0** — rate limiting by key (§7.2, rewritten; §8 item 5). The
   single per-address bucket in front of `/v1` (20 requests a second in the
   reference relay) counted every client behind an address as one: about 500

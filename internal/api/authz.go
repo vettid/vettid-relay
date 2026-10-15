@@ -157,11 +157,16 @@ func (s *Server) authorizeSigner(r *http.Request, bodyHash [32]byte) (auth.Signe
 }
 
 // authorizeOwner authenticates an owner route (collect, ack, denylist,
-// rotate, blob get/delete): the request is signed by X-VettID-Key and that
-// key is the registered pubkey of the mailbox it derives. An unregistered
-// signer gets mailbox_unknown.
+// rotate, blob get/delete, claim put/delete): the request is signed by
+// X-VettID-Key and that key is the registered pubkey of the mailbox it
+// derives. An unregistered signer gets mailbox_unknown.
+//
+// The mailbox is looked up before the replay record is written: a key
+// without a mailbox is refused without one, so signed requests under
+// fresh keys cannot fill the replay store. (The lookup is made in any
+// case; only its order changes.)
 func (s *Server) authorizeOwner(ctx context.Context, r *http.Request, bodyHash [32]byte) (store.Mailbox, *apiError) {
-	sr, e := s.authorizeSigner(r, bodyHash)
+	sr, e := s.verifySignature(r, bodyHash)
 	if e != nil {
 		return store.Mailbox{}, e
 	}
@@ -175,6 +180,9 @@ func (s *Server) authorizeOwner(ctx context.Context, r *http.Request, bodyHash [
 	}
 	if subtle.ConstantTimeCompare(mb.PubKey, sr.Key) != 1 {
 		return store.Mailbox{}, fail(CodeMailboxUnknown)
+	}
+	if e := s.checkReplay(sr); e != nil {
+		return store.Mailbox{}, e
 	}
 	// The per-key limit applies only now: the caller has proved the key is
 	// its own and has a mailbox, so only its owner ever sees this 429.

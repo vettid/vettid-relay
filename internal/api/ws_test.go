@@ -721,8 +721,8 @@ func TestWebSocketNetworkCap(t *testing.T) {
 	refused(a, host, "ws_network", 3) // host still holds 2: a's other session and b's
 	open(a, other)                    // 5 again
 	f.s.reportLimits()
-	if out := logs.String(); !strings.Contains(out, `"ws_sessions_refused":1,"ws_network_refused":3,"ws_network_hard_refused":0}`) {
-		t.Fatalf("rate limits line does not end with the session refusals:\n%s", out)
+	if out := logs.String(); !strings.Contains(out, `"ws_sessions_refused":1,"ws_network_refused":3,"ws_network_hard_refused":0,"bytes_peak":`) {
+		t.Fatalf("rate limits line lacks the session refusals, followed by the byte budgets:\n%s", out)
 	}
 	f.s.hub.mu.Lock()
 	nets := fmt.Sprint(f.s.hub.nets)
@@ -830,8 +830,8 @@ func TestWebSocketNetworkCeiling(t *testing.T) {
 	open(p[4], other) // 5: the process is full
 	refused(p[5], other, "ws_sessions", 1)
 	f.s.reportLimits()
-	if out := logs.String(); !strings.Contains(out, `"ws_sessions_refused":1,"ws_network_refused":1,"ws_network_hard_refused":2}`) {
-		t.Fatalf("rate limits line does not end with the session refusals:\n%s", out)
+	if out := logs.String(); !strings.Contains(out, `"ws_sessions_refused":1,"ws_network_refused":1,"ws_network_hard_refused":2,"bytes_peak":`) {
+		t.Fatalf("rate limits line lacks the session refusals, followed by the byte budgets:\n%s", out)
 	}
 }
 

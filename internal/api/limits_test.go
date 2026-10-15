@@ -152,8 +152,8 @@ func TestFloodGuardBoundsReplayRecords(t *testing.T) {
 	f := newFixtureWith(t, func(c *config.Config) { c.RateIPPerSec, c.RateIPBurst = 0.01, 5 },
 		func(*fixture) []Option { return []Option{WithReplayGuard(g)} })
 	limited := 0
-	for i := byte(0); i < 50; i++ { // properly signed, each under a fresh key
-		if code, _, _ := f.from(hostA, collectReq(newPrincipal(100+i))); code == 429 {
+	for i := byte(0); i < 50; i++ { // properly signed registrations, each of a fresh key
+		if code, _, _ := f.from(hostA, registerReq(newPrincipal(100+i))); code == 429 {
 			limited++
 		}
 	}

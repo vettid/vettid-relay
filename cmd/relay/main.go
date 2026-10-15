@@ -26,6 +26,7 @@ import (
 	"github.com/vettid/vettid-relay/internal/api"
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/coord"
+	"github.com/vettid/vettid-relay/internal/logbudget"
 	"github.com/vettid/vettid-relay/internal/metrics"
 	"github.com/vettid/vettid-relay/internal/sweep"
 )
@@ -47,11 +48,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "relay: invalid configuration:", err)
 		os.Exit(2)
 	}
-	log := newLogger(cfg.LogLevel)
+	log := newLogger(cfg)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	if err := run(ctx, cfg, log, nil); err != nil {
-		log.Error("relay exited with error", "err", err)
+		log.ErrorContext(lifecycle, "relay exited with error", "err", err)
 		os.Exit(1)
 	}
 }
@@ -104,9 +105,15 @@ func runHealthcheck(cfg config.Config) int {
 	return 0
 }
 
-func newLogger(level string) *slog.Logger {
+// lifecycle is the context of the process's own lines (start, drain,
+// stop, store close): they are exempt from the log budget.
+var lifecycle = logbudget.Exempt(context.Background())
+
+// newLogger writes JSON lines to stdout at RELAY_LOG_LEVEL, within the log
+// budget (internal/logbudget).
+func newLogger(cfg config.Config) *slog.Logger {
 	var l slog.Level
-	switch strings.ToLower(level) {
+	switch strings.ToLower(cfg.LogLevel) {
 	case "debug":
 		l = slog.LevelDebug
 	case "warn":
@@ -116,7 +123,7 @@ func newLogger(level string) *slog.Logger {
 	default:
 		l = slog.LevelInfo
 	}
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}))
+	return slog.New(logbudget.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}), cfg.LogInfoPerSec, cfg.LogInfoBurst))
 }
 
 // run serves until ctx is cancelled (SIGTERM/SIGINT in production), then
@@ -133,9 +140,9 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 	}
 	defer func() {
 		if err := st.Close(); err != nil {
-			log.Error("close store", "err", err)
+			log.ErrorContext(lifecycle, "close store", "err", err)
 		} else {
-			log.Info("store closed")
+			log.InfoContext(lifecycle, "store closed")
 		}
 	}()
 
@@ -209,14 +216,14 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 	if ready != nil {
 		close(ready)
 	}
-	log.Info("relay started", "listen", cfg.ListenAddr, "metrics", cfg.MetricsAddr,
+	log.InfoContext(lifecycle, "relay started", "listen", cfg.ListenAddr, "metrics", cfg.MetricsAddr,
 		"base_url", cfg.BaseURL, "trust_proxy", cfg.TrustProxy, "store", cfg.Store, "shared_coordination", cfg.ValkeyAddr != "",
 		"version", buildVersion())
 
 	var runErr error
 	select {
 	case <-ctx.Done():
-		log.Info("shutdown signal received; draining", "timeout", cfg.ShutdownTimeout.String())
+		log.InfoContext(lifecycle, "shutdown signal received; draining", "timeout", cfg.ShutdownTimeout.String())
 	case err := <-errc:
 		if !errors.Is(err, http.ErrServerClosed) {
 			runErr = err
@@ -229,15 +236,15 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 	sctx, scancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer scancel()
 	if err := srv.Drain(sctx); err != nil {
-		log.Warn("websocket drain incomplete", "err", err)
+		log.WarnContext(lifecycle, "websocket drain incomplete", "err", err)
 	}
 	if err := pub.Shutdown(sctx); err != nil {
-		log.Warn("http shutdown incomplete; closing remaining connections", "err", err)
+		log.WarnContext(lifecycle, "http shutdown incomplete; closing remaining connections", "err", err)
 		pub.Close()
 	}
 	if msrv != nil {
 		msrv.Close()
 	}
-	log.Info("relay stopped")
+	log.InfoContext(lifecycle, "relay stopped")
 	return runErr
 }

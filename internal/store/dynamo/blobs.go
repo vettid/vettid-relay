@@ -107,7 +107,6 @@ func (s *Store) PutBlob(ctx context.Context, p store.BlobPut, r io.Reader) (stor
 		Item: item{
 			"pk": avS(mbPK(p.Mailbox)), "sk": avS(blobSK(info.ID)),
 			"sz": avN(p.Size), "exp": avN(ms(info.ExpiresAt)), "ttl_s": avN(ttlSec(info.ExpiresAt)),
-			"sender": avS(p.SenderSub),
 		},
 		ConditionExpression: aws.String("attribute_not_exists(sk)"),
 	}}}

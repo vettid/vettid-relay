@@ -25,7 +25,7 @@ type family struct {
 	name, help, typ, label string
 	mu                     sync.Mutex
 	series                 map[string]*atomic.Int64 // label value → value
-	fn                     func() int64             // gauge func, if set
+	fn                     func() int64             // gauge or counter func, if set
 }
 
 // New returns an empty registry.
@@ -93,6 +93,13 @@ func (r *Registry) Gauge(name, help string) Gauge {
 // GaugeFunc registers a gauge whose value is computed at scrape time.
 func (r *Registry) GaugeFunc(name, help string, fn func() int64) {
 	f := r.family(name, help, "gauge", "")
+	f.fn = fn
+}
+
+// CounterFunc registers a counter whose value is read at scrape time
+// (fn must never decrease).
+func (r *Registry) CounterFunc(name, help string, fn func() int64) {
+	f := r.family(name, help, "counter", "")
 	f.fn = fn
 }
 

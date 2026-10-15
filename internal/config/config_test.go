@@ -212,3 +212,83 @@ func TestRateLimitConfig(t *testing.T) {
 		}
 	}
 }
+
+// The resource limits: byte budgets per network, blob transfer slots and
+// pace, the mailbox's stored-bytes cap and the log budget. Their defaults,
+// their variables, and the start-up checks between related limits.
+func TestResourceLimitConfig(t *testing.T) {
+	d := Defaults()
+	if d.RateKeyBytesPerSec != 64<<10 || d.RateKeyBytesBurst != 2<<20 || d.RateIPBytesPerSec != 1<<20 || d.RateIPBytesBurst != 32<<20 ||
+		d.RateBlobKeyBytesPerSec != 1<<20 || d.RateBlobKeyBytesBurst != 32<<20 ||
+		d.RateBlobBytesPerSec != 8<<20 || d.RateBlobBytesBurst != 256<<20 ||
+		d.MaxBlobTransfersPerMailbox != 2 || d.MaxConcurrentBlobTransfers != 8 || d.BlobPaceBytes != 16<<10 ||
+		d.MailboxMaxBytes != 32<<20 || d.LogInfoPerSec != 100 || d.LogInfoBurst != 1000 {
+		t.Fatalf("defaults differ from README.md: %+v", d)
+	}
+	c, err := Load(env(map[string]string{
+		"RELAY_RATE_KEY_BYTES_PER_SEC":         "131072",
+		"RELAY_RATE_KEY_BYTES_BURST":           "4194304",
+		"RELAY_RATE_IP_BYTES_PER_SEC":          "524288",
+		"RELAY_RATE_IP_BYTES_BURST":            "16777216",
+		"RELAY_RATE_BLOB_KEY_BYTES_PER_SEC":    "2097152",
+		"RELAY_RATE_BLOB_KEY_BYTES_BURST":      "16777216",
+		"RELAY_RATE_BLOB_BYTES_PER_SEC":        "16777216",
+		"RELAY_RATE_BLOB_BYTES_BURST":          "134217728",
+		"RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "3",
+		"RELAY_BLOB_PACE_BYTES":                "65536",
+		"RELAY_LOG_INFO_RPS":                   "50",
+		"RELAY_LOG_INFO_BURST":                 "200",
+		"RELAY_MAILBOX_MAX_BYTES":              "0",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RateKeyBytesPerSec != 131072 || c.RateKeyBytesBurst != 4<<20 || c.RateIPBytesPerSec != 524288 || c.RateIPBytesBurst != 16<<20 || c.RateBlobKeyBytesPerSec != 2<<20 || c.RateBlobKeyBytesBurst != 16<<20 || c.RateBlobBytesPerSec != 16<<20 || c.RateBlobBytesBurst != 128<<20 ||
+		c.MaxBlobTransfersPerMailbox != 3 || c.BlobPaceBytes != 65536 || c.LogInfoPerSec != 50 || c.LogInfoBurst != 200 || c.MailboxMaxBytes != 0 {
+		t.Fatalf("%+v", c)
+	}
+	for _, bad := range []map[string]string{
+		{"RELAY_RATE_IP_BYTES_PER_SEC": "0"},
+		{"RELAY_RATE_BLOB_BYTES_PER_SEC": "0"},
+		{"RELAY_LOG_INFO_RPS": "0"},
+		{"RELAY_LOG_INFO_BURST": "0"},
+		// The burst must hold the largest deposit body (about 350 KiB at the default payload size).
+		{"RELAY_RATE_KEY_BYTES_BURST": "300000"},
+		{"RELAY_RATE_KEY_BYTES_BURST": "0"},
+		{"RELAY_RATE_KEY_BYTES_PER_SEC": "0"},
+		// The network's ceiling at least a key's burst and rate.
+		{"RELAY_RATE_IP_BYTES_BURST": "2097151"},
+		{"RELAY_RATE_IP_BYTES_PER_SEC": "65535"},
+		{"RELAY_RATE_IP_BYTES_BURST": "0"},
+		// A key's blob burst must hold the largest blob, and the network's
+		// ceiling at least a key's burst and rate.
+		{"RELAY_RATE_BLOB_KEY_BYTES_BURST": "8388607"},
+		{"RELAY_RATE_BLOB_KEY_BYTES_PER_SEC": "0"},
+		{"RELAY_RATE_BLOB_BYTES_BURST": "33554431"},
+		{"RELAY_RATE_BLOB_BYTES_PER_SEC": "1048575"},
+		// Per-mailbox slots: at least 1, fewer than the process's.
+		{"RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "0"},
+		{"RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "9"},
+		{"RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "8"}, // nothing left for downloads
+		{"RELAY_BLOB_PACE_BYTES": "0"},
+		// A mailbox cap below one message.
+		{"RELAY_MAILBOX_MAX_BYTES": "1000"},
+	} {
+		if _, err := Load(env(bad)); err == nil {
+			t.Errorf("%v: expected an error", bad)
+		}
+	}
+	// With blobs off, how the blob limits relate is not checked; every
+	// rate, burst and pace must still be greater than zero.
+	if _, err := Load(env(map[string]string{"RELAY_BLOBS_ENABLED": "false", "RELAY_RATE_BLOB_BYTES_BURST": "1", "RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "0"})); err != nil {
+		t.Fatalf("blobs off: %v", err)
+	}
+	for _, k := range []string{"RELAY_RATE_BLOB_BYTES_BURST", "RELAY_BLOB_PACE_BYTES"} {
+		if _, err := Load(env(map[string]string{"RELAY_BLOBS_ENABLED": "false", k: "0"})); err == nil {
+			t.Errorf("blobs off, %s=0: expected an error", k)
+		}
+	}
+	if got := Defaults().DepositBodyLimit(); got != 4*((262144+2)/3)+1024 {
+		t.Fatalf("deposit body limit %d", got)
+	}
+}
