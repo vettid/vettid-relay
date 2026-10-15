@@ -140,11 +140,11 @@ func TestAllowN(t *testing.T) {
 func TestRefundAndReady(t *testing.T) {
 	l := New(1, 100, 0)
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	if !l.Ready("a", now) || l.Burst() != 100 {
+	if !ready(l, "a", now) || l.Burst() != 100 {
 		t.Fatal("a fresh bucket is ready; burst 100")
 	}
 	l.AllowN("a", 100, now)
-	if l.Ready("a", now) {
+	if ready(l, "a", now) {
 		t.Fatal("an empty bucket is ready")
 	}
 	l.Refund("a", 60)
@@ -167,13 +167,32 @@ func TestChargeIntoDebt(t *testing.T) {
 	l := New(100, 100, 0)
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	l.Charge("a", 250, now) // 100 - 250 = -150
-	if l.Ready("a", now.Add(time.Second)) {
+	if ready(l, "a", now.Add(time.Second)) {
 		t.Fatal("ready while in debt")
 	}
-	if !l.Ready("a", now.Add(1510*time.Millisecond)) {
+	if !ready(l, "a", now.Add(1510*time.Millisecond)) {
 		t.Fatal("not ready once the debt is paid")
 	}
 	if p := l.Peak(); p != 1 {
 		t.Fatalf("peak %v", p)
+	}
+}
+
+func ready(l *Limiter, key string, now time.Time) bool {
+	ok, _ := l.Ready(key, now)
+	return ok
+}
+
+// Ready says how long a bucket in debt waits.
+func TestReadyWait(t *testing.T) {
+	l := New(100, 100, 0)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l.Charge("a", 250, now) // -150: 151 tokens to wait for, at 100 a second
+	if ok, wait := l.Ready("a", now); ok || wait != 1510*time.Millisecond {
+		t.Fatalf("ok=%v wait=%v", ok, wait)
+	}
+	l.Charge("b", 100, now) // 0: one token in 10 ms, reported as 1 s
+	if ok, wait := l.Ready("b", now); ok || wait != time.Second {
+		t.Fatalf("ok=%v wait=%v", ok, wait)
 	}
 }

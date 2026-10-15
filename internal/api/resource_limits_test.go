@@ -686,3 +686,37 @@ func TestForgedSubCannotDrainAKeyBudget(t *testing.T) {
 	f.expectFrom(hostB, up, 201, "")
 	f.expectFrom(hostB, up, 429, CodeRateLimited) // now the victim's own 2,000 are spent
 }
+
+// Blob uploads draw on the per-sender limit only after the signature, as
+// deposits do: tokens that name another's key cannot empty that key's
+// sender budget, which its deposits share.
+func TestForgedSubCannotDrainASenderBudget(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) { c.RateSenderPerSec, c.RateSenderBurst = 0.001, 2 })
+	mallory, victim, friend := newPrincipal(1), newPrincipal(2), newPrincipal(3)
+	f.register(mallory)
+	f.register(friend)
+	forged := f.mint(mallory, victim, nil)
+	for i := 0; i < 10; i++ {
+		f.expectFrom(hostA, req{method: "PUT", path: "/v1/blob/" + mallory.mbx, body: []byte("x"), signer: &mallory, token: forged}, 401, CodeSignatureInvalid)
+	}
+	tok := f.mint(friend, victim, nil)
+	f.expectFrom(hostB, depositReq(friend, victim, tok, "1"), 201, "")
+	f.expectFrom(hostB, req{method: "PUT", path: "/v1/blob/" + friend.mbx, body: []byte("2"), signer: &victim, token: tok}, 201, "")
+	f.expectFrom(hostB, depositReq(friend, victim, tok, "3"), 429, CodeRateLimited) // now its own 2 are spent
+}
+
+// A key in debt is told how long its debt takes to pay off.
+func TestBlobKeyDebtRetryAfter(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 1<<20
+		c.RateBlobKeyBytesPerSec, c.RateBlobKeyBytesBurst = 100, 1500
+	})
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	up := req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: make([]byte, 1000), signer: &sender, token: f.mint(owner, sender, nil)}
+	f.expectFrom(hostA, up, 201, "") // 500 left
+	f.expectFrom(hostA, up, 201, "") // charged after the fact: 500 in debt
+	if e := f.expectFrom(hostA, up, 429, CodeRateLimited); e.RetryAfter != 6 {
+		t.Fatalf("retry_after %d, want 6 (501 bytes at 100 a second)", e.RetryAfter)
+	}
+}

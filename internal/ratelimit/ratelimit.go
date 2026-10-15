@@ -93,6 +93,12 @@ func (l *Limiter) Charge(key string, n int64, now time.Time) {
 	defer l.mu.Unlock()
 	b, ok := l.buckets[key]
 	if !ok {
+		// Unlike AllowN, Charge cannot refuse a new key when the table is
+		// full (the cost has been incurred), so the table may pass maxKeys
+		// here. It stays bounded: Charge follows a request that was let
+		// through by Ready on the same key and by the per-network and
+		// per-process limits before it, and buckets that have refilled are
+		// pruned as usual.
 		if len(l.buckets) >= l.maxKeys {
 			l.pruneLocked(now)
 		}
@@ -123,12 +129,20 @@ func (l *Limiter) Refund(key string, n int64) {
 }
 
 // Ready reports whether key's bucket holds at least one token, without
-// taking any.
-func (l *Limiter) Ready(key string, now time.Time) bool {
+// taking any; if not, how long until it does (at least one second; a
+// bucket in debt waits its debt out).
+func (l *Limiter) Ready(key string, now time.Time) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b, ok := l.buckets[key]
-	return !ok || b.tokens+now.Sub(b.last).Seconds()*l.rate >= 1
+	if !ok {
+		return true, 0
+	}
+	have := math.Min(l.burst, b.tokens+math.Max(now.Sub(b.last).Seconds(), 0)*l.rate)
+	if have >= 1 {
+		return true, 0
+	}
+	return false, max(time.Duration((1-have)/l.rate*float64(time.Second)), time.Second)
 }
 
 // Burst returns the bucket size.

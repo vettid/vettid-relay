@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vettid/vettid-relay/internal/ratelimit"
 	"github.com/vettid/vettid-relay/internal/store"
 	auth "github.com/vettid/vettid-relay/relayauth"
 )
@@ -226,10 +227,9 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		s.refuseUnread(w, r, fail(CodeTokenInvalid))
 		return
 	}
-	if e := s.allowSender(da.claims.Sub); e != nil {
-		s.refuseUnread(w, r, e)
-		return
-	}
+	// The per-sender limit comes after the signature (step 7), as for
+	// deposits: the token's sub is written by the mailbox owner, so a
+	// token naming someone else's key must not spend that key's budget.
 	// The blob byte budgets. The token's sub names the sender's key, but
 	// the mailbox owner wrote the token: the sender is proved only by the
 	// request signature (step 7), after the body. So before the body only
@@ -245,9 +245,9 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// free. Only an upload refused a slot gets everything back: it held
 	// none.
 	network, charged := s.network(r), declaredLength(r, limit)
-	if !s.blobKeyLimit.Ready(da.claims.Sub, s.now()) {
+	if ok, wait := s.blobKeyLimit.Ready(da.claims.Sub, s.now()); !ok {
 		s.rl.refused.With(limBlobKeyBytes).Inc()
-		s.refuseUnread(w, r, &apiError{code: CodeRateLimited, retryAfter: 1})
+		s.refuseUnread(w, r, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)})
 		return
 	}
 	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, charged); e != nil {
@@ -307,6 +307,10 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// Step 7. The sender is authenticated but not stored with a blob:
 	// nothing reads it.
 	if _, e := s.verifySender(r, da, bodyHash); e != nil {
+		s.writeError(w, e)
+		return
+	}
+	if e := s.allowSender(da.claims.Sub); e != nil {
 		s.writeError(w, e)
 		return
 	}
@@ -389,9 +393,9 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 		l    ByteLimiter
 		key  string
 	}{{limBlobKeyBytes, s.blobKeyLimit, owner}, {limBlobBytes, s.blobByteLimit, network}} {
-		if !b.l.Ready(b.key, s.now()) {
+		if ok, wait := b.l.Ready(b.key, s.now()); !ok {
 			s.rl.refused.With(b.name).Inc()
-			s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
+			s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)})
 			return
 		}
 	}

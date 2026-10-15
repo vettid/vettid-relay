@@ -766,7 +766,7 @@ a network: the per-process and per-key limits.)
 | 1 | flood guard | network | 100/s, burst 300 | to every `/v1` request, first, before anything is parsed |
 | 2 | per key | signing key | 20/s, burst 100 | once the request is authenticated: on owner routes after the signature verified, was no replay, and the signer's mailbox exists; on registration and mailbox deletion after the signature verified; and to every ack frame of a WebSocket session (§6.4) that does not name a message sent on that session and still leased to it (a message received elsewhere, an id acked before, an ack after the lease ended, an id that names nothing): such a frame draws on the flood guard (1) and on this limit like the `DELETE /v1/mailbox/{msg_id}` it stands for, and the session is closed with 1013 `rate_limited` when either is empty. An ack frame is uncharged once for each message in the window: a duplicate ack is charged, and so is a duplicate ack after a lease ended |
 | 3 | new mailboxes | network | 1/s, burst 30 | to a registration that creates a mailbox, and to a rotation (§6.7). Registering an existing key again draws nothing (clients do that routinely, §6.1) |
-| 4 | per sender | token `sub` (an open token's `jti`, §5.6) | 5/s, burst 20 | to deposits, after §5.3 step 7; to blob uploads after step 6, before their body |
+| 4 | per sender | token `sub` (an open token's `jti`, §5.6) | 5/s, burst 20 | to deposits and blob uploads, after §5.3 step 7 (the token's `sub` is written by the mailbox owner; only the signature proves the sender) |
 | 5 | claim fetches | network | 1/s, burst 10 | to `GET /v1/claim/{id}` (§6.9), the one unauthenticated operation |
 | 6 | collectors | mailbox | 4 | to parked long-polls and WebSocket sessions together |
 | 7 | WebSocket sessions | relay process | 4,000 | to upgrades of `GET /v1/mailbox/ws`; beyond it `429` with `retry_after` 5. Long-poll is not affected |
@@ -774,7 +774,7 @@ a network: the per-process and per-key limits.)
 | 9 | WebSocket sessions per network, ceiling | network, per relay process | 2,000 | to every upgrade, a mailbox's first session included: no network holds more on a process. `429` with `retry_after` 5. At least 8 and at most 7 |
 | 10 | WebSocket window | session | 128 messages | to messages sent on a session and not yet acked there: the relay leases a further batch (32) only while it fits, so it pauses at 97 or more outstanding, until acks arrive or leases end |
 | 11 | stored bytes | network, per relay process | 256 KiB/s, burst 8 MiB | charged in bytes: to deposits after §5.3 step 6, with the declared body length (without a `Content-Length`, the largest deposit body), **before the body is read** (a refused deposit is not read); to claim creation (§6.9) once its signature verified and the signer's mailbox exists, with the claim's length. A deposit or claim that is then not stored (quota, signature, malformed body, store failure) is refunded. `429` with `retry_after` |
-| 12 | blob bytes | authenticated key, and network as a ceiling; per relay process | per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst 256 MiB | charged in bytes. Blob uploads: the key is the token's `sub`, which the mailbox owner wrote and the request signature proves only after the body (§5.3 step 7); so after limit 4 and before the body is read, the network's ceiling is charged with the declared length (without one, the largest blob) and the key's budget is only checked (an empty one is refused unread); once the signature has verified the key's budget is charged with the bytes received, unconditionally (it may go into debt). Blob downloads: after the owner's signature verified, the owner's key and the network's ceiling are charged together with the blob's size, at most a key's burst (refused by either, charged to neither). An upload that stores nothing is refunded only the part of its network charge it never sent: the bytes that reached the relay stay charged whatever refused it (body failure, signature, quota, store failure); an upload refused a transfer slot (13), which held none, is refunded entirely. A download by an owner whose budget, or whose network's, is empty is refused before the store is read. `429` with `retry_after` |
+| 12 | blob bytes | authenticated key, and network as a ceiling; per relay process | per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst 256 MiB | charged in bytes. Blob uploads: the key is the token's `sub`, which the mailbox owner wrote and the request signature proves only after the body (§5.3 step 7); so after §5.3 steps 1–6 and before the body is read, the network's ceiling is charged with the declared length (without one, the largest blob) and the key's budget is only checked (an empty one is refused unread); once the signature has verified the key's budget is charged with the bytes received, unconditionally (it may go into debt). Blob downloads: after the owner's signature verified, the owner's key and the network's ceiling are charged together with the blob's size, at most a key's burst (refused by either, charged to neither). An upload that stores nothing is refunded only the part of its network charge it never sent: the bytes that reached the relay stay charged whatever refused it (body failure, signature, quota, store failure); an upload refused a transfer slot (13), which held none, is refunded entirely. A download by an owner whose budget, or whose network's, is empty is refused before the store is read. `429` with `retry_after` |
 | 13 | blob transfers | relay process; mailbox; sender and mailbox | 8 per process; per mailbox 2 uploads and, apart, 2 downloads; 1 upload per sender key and mailbox; uploads at most 8 − 2 = 6 per process | to blob uploads once their body has begun to arrive (an upload that has sent nothing holds no slot), and to blob downloads; the mailbox is the recipient's for an upload and the owner's for a download. Uploads never take a mailbox's download slots nor the 2 process slots kept for downloads. `429` with `retry_after` 2. A transfer's body must move at least 16 KiB in every 5 s and finish within 5 minutes, or the transfer is dropped (an upload is answered `400` with `Connection: close`): an upload that trickles at the minimum pace holds its slot up to 5 minutes |
 
 Nothing else is keyed on a network. A request that is properly signed by a
@@ -790,10 +790,10 @@ can cost: every signature verification, replay record (§4.1) and store
 read happens after it, so the guard bounds them all. Then, per request:
 the body size limit; for deposits and blob uploads the header-only steps
 of §5.3 (1–6) **before the body is read**, then for deposits the byte
-budget (11) and for blob uploads the per-sender limit (4) and the blob
-byte budget's network ceiling (12, with a look at the key's), still
-before the body is read; for blob uploads the key's blob budget once the
-signature has verified; the signature; on owner
+budget (11) and for blob uploads the blob byte budget's network ceiling
+(12, with a look at the key's), still before the body is read; the
+signature; then for deposits and blob uploads the per-sender limit (4),
+and for blob uploads the key's blob budget (12); on owner
 routes the mailbox lookup **before** the replay check, so that a key
 without a mailbox writes no replay record (a deposit's mailbox was looked
 up in step 1); the per-key or per-sender limit; for claims the byte
@@ -1317,7 +1317,8 @@ The push gateway API is specified separately.
   per process, uploads and downloads counted apart per mailbox (2 each),
   one upload per sender and mailbox, 2 process slots kept for downloads,
   a slot held only while the body moves, a pace of 16 KiB per 5 s and at
-  most 5 minutes per transfer. Owner routes look the mailbox up before writing
+  most 5 minutes per transfer. The per-sender limit (4) applies to blob
+  uploads after the signature, as to deposits. Owner routes look the mailbox up before writing
   the replay record. The reference relay's mailbox cap goes from 128 MiB
   to 32 MiB; it bounds its log volume. New counters, `rate limits` fields
   and configuration variables; nothing removed or renamed.

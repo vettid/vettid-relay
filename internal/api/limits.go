@@ -36,7 +36,7 @@ import (
 //
 //	bytes       deposits (after §5.3 steps 1–6) and claims (after the
 //	            claim's signature verified).
-//	blob_bytes  blob uploads (after the per-sender limit) and downloads
+//	blob_bytes  blob uploads (after the token checks) and downloads
 //	            (after the owner's signature verified, with the blob's
 //	            size).
 //
@@ -105,7 +105,7 @@ const (
 type ByteLimiter interface {
 	AllowN(key string, n int64, now time.Time) (bool, time.Duration)
 	Refund(key string, n int64)
-	Ready(key string, now time.Time) bool
+	Ready(key string, now time.Time) (bool, time.Duration)
 	Charge(key string, n int64, now time.Time)
 	Burst() int64
 }
