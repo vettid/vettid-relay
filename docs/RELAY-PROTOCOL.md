@@ -774,7 +774,7 @@ a network: the per-process and per-key limits.)
 | 9 | WebSocket sessions per network, ceiling | network, per relay process | 2,000 | to every upgrade, a mailbox's first session included: no network holds more on a process. `429` with `retry_after` 5. At least 8 and at most 7 |
 | 10 | WebSocket window | session | 128 messages | to messages sent on a session and not yet acked there: the relay leases a further batch (32) only while it fits, so it pauses at 97 or more outstanding, until acks arrive or leases end |
 | 11 | stored bytes | network, per relay process | 256 KiB/s, burst 8 MiB | charged in bytes: to deposits after §5.3 step 6, with the declared body length (without a `Content-Length`, the largest deposit body), **before the body is read** (a refused deposit is not read); to claim creation (§6.9) once its signature verified and the signer's mailbox exists, with the claim's length. A deposit or claim that is then not stored (quota, signature, malformed body, store failure) is refunded. `429` with `retry_after` |
-| 12 | blob bytes | network, per relay process | 1 MiB/s, burst 64 MiB | charged in bytes: to blob uploads after limit 4, with the declared length (without one, the largest blob), before the body is read; to blob downloads after the owner's signature verified, with the blob's size but at most the burst. An upload that stores nothing is refunded, except for the bytes it sent when its body failed or its signature did not verify. A download from a network whose budget is empty is refused before the store is read. `429` with `retry_after` |
+| 12 | blob bytes | network, per relay process | 1 MiB/s, burst 64 MiB | charged in bytes: to blob uploads after limit 4, with the declared length (without one, the largest blob), before the body is read; to blob downloads after the owner's signature verified, with the blob's size but at most the burst. An upload that stores nothing is refunded only the part of its charge it never sent: the bytes that reached the relay stay charged whatever refused it (body failure, signature, quota, store failure); an upload refused a transfer slot (13), which held none, is refunded entirely. A download from a network whose budget is empty is refused before the store is read. `429` with `retry_after` |
 | 13 | blob transfers | relay process; mailbox; sender and mailbox | 8 per process; per mailbox 2 uploads and, apart, 2 downloads; 1 upload per sender key and mailbox; uploads at most 8 − 2 = 6 per process | to blob uploads once their body has begun to arrive (an upload that has sent nothing holds no slot), and to blob downloads; the mailbox is the recipient's for an upload and the owner's for a download. Uploads never take a mailbox's download slots nor the 2 process slots kept for downloads. `429` with `retry_after` 2. A transfer's body must move at least 16 KiB in every 5 s and finish within 5 minutes, or the transfer is dropped (an upload is answered `400` with `Connection: close`): an upload that trickles at the minimum pace holds its slot up to 5 minutes |
 
 Nothing else is keyed on a network. A request that is properly signed by a
@@ -878,11 +878,12 @@ does the same on its own mailbox.
   body stops moving, so a client that announces uploads and stalls holds
   no slot, and one that stalls part-way holds it for 5 s; one that keeps
   the minimum pace holds it up to the 5-minute maximum.
-- *Refunds.* The byte budgets bound what is stored, so a request that
-  stores nothing is given its charge back: a vault host's sender retrying
-  against a full mailbox does not drain its host's budget. A blob upload
-  keeps charged what it sent when its body failed or its signature did not
-  verify, so holding a slot with a trickle is never free.
+- *Refunds.* The byte budgets bound what is stored, so a deposit or
+  claim that stores nothing is given its charge back: a vault host's
+  sender retrying against a full mailbox does not drain its host's budget.
+  A blob upload that held a transfer slot keeps charged every byte it
+  sent, whatever then refuses it, so holding an upload slot always costs
+  the bytes trickled while holding it.
 - *New mailboxes, 1/s, burst 30.* Members enrolling on one host or behind
   one NAT are a few an hour; 30 covers a batch (a test run, a small
   migration). The burst matters only for the first seconds: the rate is
@@ -966,9 +967,16 @@ sender's budget, and an unauthorized deposit's body is not read.
   upload at the minimum pace for up to 5 minutes. That costs it the bytes
   it sends, about 960 KiB per slot per round (16 KiB every 5 s), some 6
   MiB per round of all 6, well inside its blob budget: other senders'
-  uploads on that process are answered `429` until a slot frees.
-  Downloads keep their 2 process slots and their per-mailbox slots, so
-  owners still fetch their blobs.
+  uploads on that process are answered `429` until a slot frees. Uploads
+  alone cannot keep owners from their blobs: 2 process slots and each
+  mailbox's download slots are never given to uploads.
+- **Download slots are shared by all networks on a process too.** An
+  address with its own mailboxes and blobs can download them slowly at the
+  minimum pace and hold all 8 slots of a process, each for up to 5
+  minutes (a blob of about 960 KiB lasts that long at the pace), at the
+  cost of each blob's size from its blob budget (12): about 8 MiB per
+  round of 8, well inside it. Other owners' downloads on that process are
+  then answered `429` until a slot frees.
 - **Many addresses at once:** no per-network limit helps; that is the load
   balancer's, the scaling policy's and, if ever needed, a web ACL's job.
 
@@ -1030,8 +1038,8 @@ line, which after the WebSocket refusals ends with `bytes_peak`,
 and `log_suppressed`. A relay SHOULD bound its own log volume without
 losing what an operator relies on: vettid-relay writes at most 100 info
 lines a second per process (burst 1,000; the rest are counted in
-`log_dropped`); the request lines of registration, rotation, denylist and
-mailbox deletion draw on a second budget of the same size, which other
+`log_dropped`); the request lines of successful registrations, rotations, denylist
+changes and mailbox deletions draw on a second budget of the same size, which other
 lines cannot use up; it logs refusals (`429`) at debug; it writes one warn
 or error message with the same error, route and panic at most once per
 10 s (the rest counted in `log_suppressed`); and it never drops the `rate

@@ -489,9 +489,9 @@ func TestLogBudgetReported(t *testing.T) {
 }
 
 // A charge is given back when nothing is stored: a deposit refused after
-// the charge (quota, signature, bad body), a claim the store refuses, a
-// blob upload refused for want of a slot or over quota. A sender retrying
-// against a full mailbox does not drain its network's budget.
+// the charge (quota, signature, bad body), a claim the store refuses. A
+// sender retrying against a full mailbox does not drain its network's
+// budget. A blob upload refused after its body arrived keeps what it sent.
 func TestByteChargesRefundedWhenNothingIsStored(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) {
 		c.RateIPBytesPerSec, c.RateIPBytesBurst = 0.001, 3000
@@ -513,17 +513,21 @@ func TestByteChargesRefundedWhenNothingIsStored(t *testing.T) {
 	f.expectFrom(hostA, req{method: "PUT", path: "/v1/claim", body: make([]byte, 1000), signer: &owner}, 201, "")
 	f.expectFrom(hostA, req{method: "PUT", path: "/v1/claim", body: make([]byte, 1000), signer: &owner}, 429, CodeRateLimited)
 
-	// Blobs: one stored (1,000 of 2,500), then over the mailbox quota
-	// again and again, refunded each time.
+	// Blobs: one stored (1,000 of 2,500). An upload refused after its body
+	// arrived (here over the mailbox quota) keeps the bytes it sent
+	// charged: a trickle that ends in a refusal is not free.
 	blob := func() req {
 		return req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: make([]byte, 1000), signer: &sender, token: tok}
 	}
 	f.expectFrom(hostA, blob(), 201, "")
-	for i := 0; i < 10; i++ {
-		f.expectFrom(hostA, blob(), 429, CodeQuotaExceeded)
+	f.expectFrom(hostA, blob(), 429, CodeQuotaExceeded)
+	f.expectFrom(hostA, blob(), 429, CodeRateLimited) // 500 left
+	key := rateKey(netip.MustParseAddr(hostA))
+	if ok, _ := f.s.blobByteLimit.AllowN(key, 500, f.clk.now()); !ok {
+		t.Fatal("the budget-refused upload was charged")
 	}
-	if ok, _ := f.s.blobByteLimit.AllowN(rateKey(netip.MustParseAddr(hostA)), 1500, f.clk.now()); !ok {
-		t.Fatal("refused uploads were not refunded")
+	if ok, _ := f.s.blobByteLimit.AllowN(key, 1, f.clk.now()); ok {
+		t.Fatal("the quota-refused upload's bytes were given back")
 	}
 }
 
@@ -562,8 +566,9 @@ func (c *countingBlobs) OpenBlob(ctx context.Context, mailbox, id string) (store
 	return c.BlobStore.OpenBlob(ctx, mailbox, id)
 }
 
-// Within the log budget, the lines that change a mailbox's state draw on a
-// bucket of their own: a flood of other requests does not crowd them out.
+// Within the log budget, the lines of successful requests that change a
+// mailbox's state draw on a bucket of their own: a flood of other requests,
+// failed registrations included, does not crowd them out.
 func TestAuditLinesHaveTheirOwnBudget(t *testing.T) {
 	var logs syncBuf
 	f := newFixtureFull(t, nil, &logs, nil)
@@ -573,11 +578,14 @@ func TestAuditLinesHaveTheirOwnBudget(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		f.do(req{method: "GET", path: "/v1/claim/" + strings.Repeat("a", 26)}) // 404s at info
 	}
+	for i := 0; i < 10; i++ { // failed registrations (anyone can send them) stay on the ordinary budget
+		f.do(req{method: "POST", path: "/v1/register", body: []byte("{}")})
+	}
 	for i := byte(0); i < 3; i++ {
 		f.register(newPrincipal(50 + i))
 	}
 	if n := strings.Count(logs.String(), `"route":"POST /v1/register"`); n != 4 {
-		t.Fatalf("%d registration lines written of 4", n)
+		t.Fatalf("%d registration lines written, want the 4 that succeeded", n)
 	}
 	if n := strings.Count(logs.String(), `"route":"GET /v1/claim/{claim_id}"`); n != 5 {
 		t.Fatalf("%d other lines written (budget 5)", n)

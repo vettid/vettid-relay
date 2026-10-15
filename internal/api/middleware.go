@@ -107,10 +107,11 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 				level = slog.LevelDebug
 			}
 			ctx := r.Context()
-			if auditRoutes[route] {
+			if auditRoutes[route] && status < 400 {
 				// A change to a mailbox's registration, keys or denylist:
 				// its line draws on a log budget of its own, which other
-				// traffic cannot use up.
+				// traffic cannot use up. Failed attempts (anyone can send
+				// them) stay on the ordinary budget.
 				ctx = logbudget.Audit(ctx)
 			}
 			if status == http.StatusTooManyRequests {
@@ -127,8 +128,8 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 }
 
 // auditRoutes are the requests that change a mailbox's state (spec §6.1,
-// §6.6, §6.7, §6.10): their access lines are never crowded out of the log
-// by other traffic (logbudget.Audit).
+// §6.6, §6.7, §6.10): the access lines of those that succeed are never
+// crowded out of the log by other traffic (logbudget.Audit).
 var auditRoutes = map[string]bool{
 	"POST /v1/register":         true,
 	"POST /v1/mailbox/rotate":   true,

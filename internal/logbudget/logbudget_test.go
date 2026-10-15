@@ -130,3 +130,26 @@ func TestRepeatKey(t *testing.T) {
 		t.Fatalf("past the table's bound: suppressed %d more", h.Suppressed()-before)
 	}
 }
+
+// A full repeat table is pruned of entries whose window passed with
+// nothing suppressed before it falls back to the message alone: distinct
+// failures are told apart again once the old ones are quiet.
+func TestRepeatTablePruned(t *testing.T) {
+	log, h, buf, clk := newTest(1, 1)
+	for i := 0; i < maxMessages; i++ {
+		log.Warn("many", "err", fmt.Sprint(i))
+	}
+	log.Warn("many", "err", "held") // full: falls back to "many", written once
+	log.Warn("many", "err", "held") // a repeat of "many"
+	if h.Suppressed() != 1 {
+		t.Fatalf("suppressed %d", h.Suppressed())
+	}
+	clk.add(RepeatWindow)
+	before := lines(buf)
+	log.Warn("many", "err", "x") // pruned: its own key
+	log.Warn("many", "err", "y") // and this one too
+	log.Warn("many", "err", "x") // a repeat of x only
+	if n := lines(buf) - before; n != 2 || h.Suppressed() != 2 {
+		t.Fatalf("after the window: %d written, suppressed %d", n, h.Suppressed())
+	}
+}

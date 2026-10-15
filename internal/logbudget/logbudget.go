@@ -6,8 +6,8 @@
 //
 //   - info lines draw on a token bucket (rate a second, burst); a line
 //     that finds it empty is dropped and counted;
-//   - info lines logged with a context from Audit (the requests that
-//     change a mailbox's state: registration, rotation, denylist,
+//   - info lines logged with a context from Audit (successful requests
+//     that change a mailbox's state: registration, rotation, denylist,
 //     deletion) draw on a second bucket of the same size, which the other
 //     lines cannot empty;
 //   - a warn or error line whose message (with its err, route and panic
@@ -32,8 +32,9 @@ import (
 // RepeatWindow is how often one warn or error message may be written.
 const RepeatWindow = 10 * time.Second
 
-// maxMessages bounds the repeat table. Keys beyond it are checked under
-// their message alone (constant strings in the relay's code, a few dozen),
+// maxMessages bounds the repeat table. When it is full, entries whose
+// window has passed with nothing suppressed are dropped; keys beyond it
+// after that are checked under their message alone (constant strings in the relay's code, a few dozen),
 // which get a quarter more room; past that a line is written unchecked.
 const maxMessages = 1024
 
@@ -174,8 +175,20 @@ func repeatKey(r slog.Record) string {
 	return key
 }
 
+// pruneLocked drops the entries whose window has passed with nothing
+// suppressed: forgetting them changes no answer (the next such line is
+// written either way) and loses no count.
+func (s *state) pruneLocked(now time.Time) {
+	for k, r := range s.repeats {
+		if r.skipped == 0 && now.Sub(r.written) >= RepeatWindow {
+			delete(s.repeats, k)
+		}
+	}
+}
+
 // repeatOK reports whether a warn/error line with key may be written now,
 // and how many were dropped since the last one written. When the table is
+// full, entries that no longer matter are pruned first; if it is still
 // full, a new key is checked under its message alone (messages are
 // constants, so their number is bounded).
 func (s *state) repeatOK(key string) (int64, bool) {
@@ -183,6 +196,9 @@ func (s *state) repeatOK(key string) (int64, bool) {
 	defer s.mu.Unlock()
 	now := s.now()
 	r, ok := s.repeats[key]
+	if !ok && len(s.repeats) >= maxMessages {
+		s.pruneLocked(now)
+	}
 	if !ok && len(s.repeats) >= maxMessages {
 		if i := strings.IndexByte(key, 0); i >= 0 {
 			key = key[:i]

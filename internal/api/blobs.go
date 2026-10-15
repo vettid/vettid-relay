@@ -231,16 +231,24 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The network's blob byte budget, on the declared length. An upload
-	// that stores nothing gets the charge back, except for the bytes it
-	// did send when its body failed or its signature did not verify (so
-	// holding a transfer slot with a trickle is never free).
+	// that stores nothing gets back the part of the charge it never sent;
+	// every byte that reached the relay stays charged, whatever refuses
+	// the upload (body failure, signature, quota, store), so holding a
+	// transfer slot with a trickle is never free. Only an upload refused
+	// a slot gets everything back: it held none.
 	network, charged := s.network(r), declaredLength(r, limit)
 	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, charged); e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}
-	stored, kept := false, int64(0)
+	var buf bytes.Buffer // the body as received
+	var sent int64       // its length once read whole (the store drains buf)
+	stored, held := false, false
 	defer func() {
+		kept := int64(0)
+		if held {
+			kept = max(sent, int64(buf.Len()))
+		}
 		if !stored && charged > kept {
 			s.refundBytes(limBlobBytes, s.blobByteLimit, network, charged-kept)
 		}
@@ -257,7 +265,6 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	first := make([]byte, 32<<10)
 	n, err := io.ReadAtLeast(body, first, 1)
 	if e := blobReadError(w, err); e != nil {
-		kept = int64(n)
 		s.writeError(w, e)
 		return
 	}
@@ -267,7 +274,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	var buf bytes.Buffer
+	held = true
 	if r.ContentLength > 0 {
 		buf.Grow(int(r.ContentLength))
 	}
@@ -278,16 +285,15 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		_, err = io.Copy(io.MultiWriter(&buf, h), body)
 	}
 	if e := blobReadError(w, err); e != nil {
-		kept = int64(buf.Len())
 		s.writeError(w, e)
 		return
 	}
+	sent = int64(buf.Len())
 	var bodyHash [32]byte
 	h.Sum(bodyHash[:0])
 	// Step 7. The sender is authenticated but not stored with a blob:
 	// nothing reads it.
 	if _, e := s.verifySender(r, da, bodyHash); e != nil {
-		kept = int64(buf.Len())
 		s.writeError(w, e)
 		return
 	}
