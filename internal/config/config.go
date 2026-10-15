@@ -54,7 +54,7 @@ type Config struct {
 	MaxBlobBytes               int64         // RELAY_MAX_BLOB_BYTES
 	BlobTTL                    time.Duration // RELAY_BLOB_TTL
 	MaxConcurrentBlobTransfers int           // RELAY_MAX_CONCURRENT_BLOB_TRANSFERS (per process)
-	MaxBlobTransfersPerMailbox int           // RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX: of those, per mailbox
+	MaxBlobTransfersPerMailbox int           // RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX: uploads, and downloads, per mailbox
 	// RELAY_BLOB_PACE_BYTES: a blob body (up or down) must move at least
 	// this many bytes in every BlobPaceWindow, or the transfer is dropped.
 	BlobPaceBytes int64
@@ -437,20 +437,20 @@ func (c Config) Validate() error {
 	}
 	// Byte budgets: the largest single request must fit in the burst, or
 	// it could never be served.
-	if c.RateIPBytesBurst <= 0 || c.LogInfoBurst <= 0 {
-		errs = append(errs, errors.New("RELAY_RATE_IP_BYTES_BURST and RELAY_LOG_INFO_BURST must be > 0"))
+	if c.RateIPBytesBurst <= 0 || c.RateBlobBytesBurst <= 0 || c.LogInfoBurst <= 0 || c.BlobPaceBytes <= 0 {
+		errs = append(errs, errors.New("RELAY_RATE_IP_BYTES_BURST, RELAY_RATE_BLOB_BYTES_BURST, RELAY_LOG_INFO_BURST and RELAY_BLOB_PACE_BYTES must be > 0"))
 	} else if int64(c.RateIPBytesBurst) < max(c.DepositBodyLimit(), c.MaxClaimBytes) {
 		errs = append(errs, fmt.Errorf("RELAY_RATE_IP_BYTES_BURST must be at least the largest deposit body (%d bytes for RELAY_MAX_PAYLOAD_BYTES) and RELAY_MAX_CLAIM_BYTES", c.DepositBodyLimit()))
 	}
 	if c.BlobsEnabled {
-		if c.RateBlobBytesBurst <= 0 || int64(c.RateBlobBytesBurst) < c.MaxBlobBytes {
+		if int64(c.RateBlobBytesBurst) < c.MaxBlobBytes {
 			errs = append(errs, errors.New("RELAY_RATE_BLOB_BYTES_BURST must be at least RELAY_MAX_BLOB_BYTES when blobs are enabled"))
 		}
-		if c.MaxBlobTransfersPerMailbox <= 0 || c.MaxBlobTransfersPerMailbox > c.MaxConcurrentBlobTransfers {
-			errs = append(errs, errors.New("0 < RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX <= RELAY_MAX_CONCURRENT_BLOB_TRANSFERS must hold"))
-		}
-		if c.BlobPaceBytes <= 0 {
-			errs = append(errs, errors.New("RELAY_BLOB_PACE_BYTES must be > 0 when blobs are enabled"))
+		// Uploads may use the process's transfers less one mailbox's worth,
+		// which stay for downloads: so the per-mailbox number must be
+		// smaller.
+		if c.MaxBlobTransfersPerMailbox <= 0 || c.MaxBlobTransfersPerMailbox >= c.MaxConcurrentBlobTransfers {
+			errs = append(errs, errors.New("0 < RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX < RELAY_MAX_CONCURRENT_BLOB_TRANSFERS must hold"))
 		}
 	}
 	// 0 is "no cap"; a cap below one message would refuse every deposit.

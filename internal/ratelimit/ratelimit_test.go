@@ -134,3 +134,29 @@ func TestAllowN(t *testing.T) {
 		t.Fatal("refill not applied")
 	}
 }
+
+// Refund gives back a charge (up to the burst); Ready says whether any
+// token is left without taking one.
+func TestRefundAndReady(t *testing.T) {
+	l := New(1, 100, 0)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if !l.Ready("a", now) || l.Burst() != 100 {
+		t.Fatal("a fresh bucket is ready; burst 100")
+	}
+	l.AllowN("a", 100, now)
+	if l.Ready("a", now) {
+		t.Fatal("an empty bucket is ready")
+	}
+	l.Refund("a", 60)
+	if ok, _ := l.AllowN("a", 60, now); !ok {
+		t.Fatal("refund not applied")
+	}
+	l.Refund("a", 1000)
+	if ok, _ := l.AllowN("a", 101, now); ok {
+		t.Fatal("a refund raised the bucket above its burst")
+	}
+	l.Refund("unknown", 5) // no bucket: nothing to give back
+	if l.Len() != 1 {
+		t.Fatalf("refund created a bucket: %d", l.Len())
+	}
+}

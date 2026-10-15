@@ -81,6 +81,31 @@ func (l *Limiter) AllowN(key string, n int64, now time.Time) (bool, time.Duratio
 	return false, wait
 }
 
+// Refund gives back n tokens taken from key's bucket (a request charged
+// in advance that turned out to cost nothing), up to the burst.
+func (l *Limiter) Refund(key string, n int64) {
+	if n <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if b, ok := l.buckets[key]; ok {
+		b.tokens = math.Min(l.burst, b.tokens+float64(n))
+	}
+}
+
+// Ready reports whether key's bucket holds at least one token, without
+// taking any.
+func (l *Limiter) Ready(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[key]
+	return !ok || b.tokens+now.Sub(b.last).Seconds()*l.rate >= 1
+}
+
+// Burst returns the bucket size.
+func (l *Limiter) Burst() int64 { return int64(l.burst) }
+
 // pruneLocked drops buckets that have refilled completely (indistinguishable
 // from a fresh bucket).
 func (l *Limiter) pruneLocked(now time.Time) {

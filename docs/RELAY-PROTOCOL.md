@@ -773,9 +773,9 @@ a network: the per-process and per-key limits.)
 | 8 | WebSocket sessions per network | network, per relay process | 1,024 | to an upgrade for a mailbox that already has a WebSocket session on that process; the first session of a mailbox is admitted beyond it, up to 9. `429` with `retry_after` 5 |
 | 9 | WebSocket sessions per network, ceiling | network, per relay process | 2,000 | to every upgrade, a mailbox's first session included: no network holds more on a process. `429` with `retry_after` 5. At least 8 and at most 7 |
 | 10 | WebSocket window | session | 128 messages | to messages sent on a session and not yet acked there: the relay leases a further batch (32) only while it fits, so it pauses at 97 or more outstanding, until acks arrive or leases end |
-| 11 | stored bytes | network, per relay process | 256 KiB/s, burst 8 MiB | charged in bytes: to deposits after §5.3 step 6, with the declared body length, **before the body is read** (a refused deposit is not read); to claim creation (§6.9) once its signature verified and the signer's mailbox exists, with the claim's length. `429` with `retry_after` |
-| 12 | blob bytes | network, per relay process | 1 MiB/s, burst 64 MiB | charged in bytes: to blob uploads after limit 4, with the declared length, before the body is read; to blob downloads after the owner's signature verified, with the blob's size. `429` with `retry_after` |
-| 13 | blob transfers | relay process, and mailbox | 8 per process, of which 2 per mailbox | to blob uploads once their body has begun to arrive (an upload that has sent nothing holds no slot), and to blob downloads; the mailbox is the recipient's for an upload and the owner's for a download. `429` with `retry_after` 2. A transfer's body must move at least 16 KiB in every 5 s and finish within 5 minutes, or the transfer is dropped (an upload is answered `400` with `Connection: close`) |
+| 11 | stored bytes | network, per relay process | 256 KiB/s, burst 8 MiB | charged in bytes: to deposits after §5.3 step 6, with the declared body length (without a `Content-Length`, the largest deposit body), **before the body is read** (a refused deposit is not read); to claim creation (§6.9) once its signature verified and the signer's mailbox exists, with the claim's length. A deposit or claim that is then not stored (quota, signature, malformed body, store failure) is refunded. `429` with `retry_after` |
+| 12 | blob bytes | network, per relay process | 1 MiB/s, burst 64 MiB | charged in bytes: to blob uploads after limit 4, with the declared length (without one, the largest blob), before the body is read; to blob downloads after the owner's signature verified, with the blob's size but at most the burst. An upload that stores nothing is refunded, except for the bytes it sent when its body failed or its signature did not verify. A download from a network whose budget is empty is refused before the store is read. `429` with `retry_after` |
+| 13 | blob transfers | relay process; mailbox; sender and mailbox | 8 per process; per mailbox 2 uploads and, apart, 2 downloads; 1 upload per sender key and mailbox; uploads at most 8 − 2 = 6 per process | to blob uploads once their body has begun to arrive (an upload that has sent nothing holds no slot), and to blob downloads; the mailbox is the recipient's for an upload and the owner's for a download. Uploads never take a mailbox's download slots nor the 2 process slots kept for downloads. `429` with `retry_after` 2. A transfer's body must move at least 16 KiB in every 5 s and finish within 5 minutes, or the transfer is dropped (an upload is answered `400` with `Connection: close`): an upload that trickles at the minimum pace holds its slot up to 5 minutes |
 
 Nothing else is keyed on a network. A request that is properly signed by a
 key with a mailbox can be refused on account of its network only by the
@@ -795,8 +795,11 @@ byte budget (12), still before the body is read; the signature; on owner
 routes the mailbox lookup **before** the replay check, so that a key
 without a mailbox writes no replay record (a deposit's mailbox was looked
 up in step 1); the per-key or per-sender limit; for claims the byte
-budget (11), for blob downloads the transfer slot (13) and the blob byte
-budget (12). A request that
+budget (11), for blob downloads an empty blob budget (12) refuses before
+the store is read, then the transfer slot (13), the store read and the
+charge with the blob's size; for blob uploads the transfer slot (13) once
+the body begins to arrive. A charge for a request that ends up storing
+nothing is refunded as limits 11 and 12 say. A request that
 is refused before its body has been read SHOULD be answered at once with
 `Connection: close`, not after waiting for the body. A small body that
 has to be read before the request can be authenticated (registration,
@@ -866,11 +869,20 @@ does the same on its own mailbox.
   maximum size (8 MiB). A host of 900 members each sending five 1 MB
   attachments a day uploads about 52 KB/s, 5% of the budget (downloads by
   recipients behind the same address count again).
-- *Blob transfers, 8 per process, 2 per mailbox; 16 KiB per 5 s.* A blob
-  is held in memory while it moves, so transfers are bounded. The slot is
-  taken only once an upload's body arrives and is dropped when the body
-  stops moving, so a client that announces uploads and stalls holds no
-  slot, and one that stalls part-way holds it for 5 s.
+- *Blob transfers, 8 per process; per mailbox 2 uploads and 2 downloads;
+  one upload per sender and mailbox; 16 KiB per 5 s.* A blob is held in
+  memory while it moves, so transfers are bounded. Uploads and downloads
+  are counted apart so that senders cannot keep an owner from its blobs,
+  and one sender cannot take both of a mailbox's upload slots. The slot
+  is taken only once an upload's body arrives and is dropped when the
+  body stops moving, so a client that announces uploads and stalls holds
+  no slot, and one that stalls part-way holds it for 5 s; one that keeps
+  the minimum pace holds it up to the 5-minute maximum.
+- *Refunds.* The byte budgets bound what is stored, so a request that
+  stores nothing is given its charge back: a vault host's sender retrying
+  against a full mailbox does not drain its host's budget. A blob upload
+  keeps charged what it sent when its body failed or its signature did not
+  verify, so holding a slot with a trickle is never free.
 - *New mailboxes, 1/s, burst 30.* Members enrolling on one host or behind
   one NAT are a few an hour; 30 covers a batch (a test run, a small
   migration). The burst matters only for the first seconds: the rate is
@@ -948,12 +960,15 @@ sender's budget, and an unauthorized deposit's body is not read.
   until the store's expiry removes them.
 - **Mailboxes never expire.** One address can create 86,400 a day (3);
   each is small, but their number only grows (see "Later").
-- **Blob transfer slots are shared by all networks on a process.** One
-  address with four mailboxes of its own (it mints its own tokens) can
-  hold all 8 slots of a process by keeping each upload at the minimum
-  pace, each for up to 5 minutes, at a cost of 64 MiB of its blob budget
-  per round; uploads and downloads of others on that process are then
-  answered `429` until a slot frees.
+- **Upload slots are shared by all networks on a process.** One address
+  with three mailboxes of its own and two sender keys for each (it mints
+  its own tokens) can hold the 6 upload slots of a process by keeping each
+  upload at the minimum pace for up to 5 minutes. That costs it the bytes
+  it sends, about 960 KiB per slot per round (16 KiB every 5 s), some 6
+  MiB per round of all 6, well inside its blob budget: other senders'
+  uploads on that process are answered `429` until a slot frees.
+  Downloads keep their 2 process slots and their per-mailbox slots, so
+  owners still fetch their blobs.
 - **Many addresses at once:** no per-network limit helps; that is the load
   balancer's, the scaling policy's and, if ever needed, a web ACL's job.
 
@@ -1001,7 +1016,8 @@ limiter: `address`, `key`, `sender`, `register`, `claim`, `web`;
 `ws_network_refused` and `ws_network_hard_refused`; and, added in 0.9.0,
 the byte budgets `bytes` (11) and `blob_bytes` (12), and the blob
 transfers refused under 13, `blob_slots` (the process) and
-`blob_mailbox_slots` (the mailbox)),
+`blob_mailbox_slots` (the mailbox) and `blob_sender_slots` (the sender's
+upload to that mailbox)),
 `relay_ratelimit_busiest_per_minute` (`address`, `key`),
 `relay_ratelimit_busiest_bytes_per_minute` (`bytes`, `blob_bytes`: the
 bytes charged to the busiest single network),
@@ -1010,12 +1026,17 @@ bytes charged to the busiest single network),
 line, which after the WebSocket refusals ends with `bytes_peak`,
 `bytes_refused`, `bytes_busiest_per_min`, `blob_bytes_peak`,
 `blob_bytes_refused`, `blob_bytes_busiest_per_min`, `blob_slots_refused`,
-`blob_mailbox_slots_refused`, `log_dropped` and `log_suppressed`. A relay
-SHOULD bound its own log volume: vettid-relay writes at most 100 info
+`blob_mailbox_slots_refused`, `blob_sender_slots_refused`, `log_dropped`
+and `log_suppressed`. A relay SHOULD bound its own log volume without
+losing what an operator relies on: vettid-relay writes at most 100 info
 lines a second per process (burst 1,000; the rest are counted in
-`log_dropped`), logs refusals (`429`) at debug, writes one warn or error
-message at most once per 10 s (the rest counted in `log_suppressed`), and
-never drops the `rate limits` line.
+`log_dropped`); the request lines of registration, rotation, denylist and
+mailbox deletion draw on a second budget of the same size, which other
+lines cannot use up; it logs refusals (`429`) at debug; it writes one warn
+or error message with the same error, route and panic at most once per
+10 s (the rest counted in `log_suppressed`); and it never drops the `rate
+limits` line (a deployment can alarm when it goes missing) or its own
+start, drain and stop lines.
 
 **Configuration (informative).** vettid-relay reads, each as `_RPS` and
 `_BURST`: `RELAY_RATE_IP` (1), `RELAY_RATE_KEY` (2),
@@ -1031,18 +1052,20 @@ and `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` (13), and
 `RELAY_BLOB_PACE_BYTES` (per 5 s); `RELAY_MAILBOX_MAX_BYTES` (32 MiB);
 `RELAY_LOG_INFO_RPS` and `RELAY_LOG_INFO_BURST`. The relay refuses to
 start unless the burst of 11 holds the largest deposit body and the
-largest claim, the burst of 12 holds the largest blob, the per-mailbox
-transfers are at most the process's, and the mailbox cap holds at least
-one message. Every rate and burst must be greater than zero.
+largest claim, the mailbox cap holds at least one message and, with blobs
+enabled, the burst of 12 holds the largest blob and the per-mailbox
+transfers are fewer than the process's. Every rate, every burst and the
+blob pace must be greater than zero, whether blobs are enabled or not.
 
 **Clients.** Nothing changes on the wire, except for WebSocket sessions
 (0.8.0): an upgrade can be answered `429` under limits 7 to 9, and a
 session can be closed with 1013 `rate_limited` when an ack frame is refused
 by a rate limit (§6.4). Clients SHOULD retry a `429` no
 sooner than `retry_after`, with their own jitter (a deposit, claim or blob
-transfer answered `429` under 11 to 13 is retried like any other; an
-upload SHOULD send its body without pauses, since one that stops moving
-is dropped); SHOULD treat
+transfer answered `429` under 11 to 13 is retried like any other; deposits
+and blob uploads SHOULD carry a `Content-Length`, since without one they
+are charged the largest body; an upload SHOULD send its body without
+pauses, since one that stops moving is dropped with `400`); SHOULD treat
 `mailbox_unknown` on their **own** mailbox as final until they have
 registered again (stop collecting, register, resume; or stop, if the
 mailbox was deleted on purpose) instead of asking again every second; and
@@ -1247,9 +1270,11 @@ The push gateway API is specified separately.
   relay to store (deposits, claims: 11, 256 KiB/s, burst 8 MiB) and its
   blob traffic (uploads and downloads: 12, 1 MiB/s, burst 64 MiB),
   charged with the declared length before the body is read, `429` with
-  `retry_after`. Blob transfers (13): 8 per process, 2 per mailbox, a slot
-  held only while the body moves, a pace of 16 KiB per 5 s and at most 5
-  minutes per transfer. Owner routes look the mailbox up before writing
+  `retry_after`, refunded when nothing is stored. Blob transfers (13): 8
+  per process, uploads and downloads counted apart per mailbox (2 each),
+  one upload per sender and mailbox, 2 process slots kept for downloads,
+  a slot held only while the body moves, a pace of 16 KiB per 5 s and at
+  most 5 minutes per transfer. Owner routes look the mailbox up before writing
   the replay record. The reference relay's mailbox cap goes from 128 MiB
   to 32 MiB; it bounds its log volume. New counters, `rate limits` fields
   and configuration variables; nothing removed or renamed.

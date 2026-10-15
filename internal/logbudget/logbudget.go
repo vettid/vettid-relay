@@ -6,17 +6,24 @@
 //
 //   - info lines draw on a token bucket (rate a second, burst); a line
 //     that finds it empty is dropped and counted;
-//   - a warn or error line whose message was written in the last
-//     RepeatWindow is dropped and counted, and the next one written with
-//     that message carries "repeated": how many were dropped in between;
+//   - info lines logged with a context from Audit (the requests that
+//     change a mailbox's state: registration, rotation, denylist,
+//     deletion) draw on a second bucket of the same size, which the other
+//     lines cannot empty;
+//   - a warn or error line whose message (with its err, route and panic
+//     attributes) was written in the last RepeatWindow is dropped and
+//     counted, and the next one written with it carries "repeated": how
+//     many were dropped in between;
 //   - debug lines pass (they are written only at RELAY_LOG_LEVEL=debug);
-//   - a line logged with a context from Exempt always passes (the
-//     per-minute report that carries the counts).
+//   - a line logged with a context from Exempt always passes: the
+//     per-minute "rate limits" report (an alarm watches for it) and the
+//     process's start and stop lines.
 package logbudget
 
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,29 +32,55 @@ import (
 // RepeatWindow is how often one warn or error message may be written.
 const RepeatWindow = 10 * time.Second
 
-// maxMessages bounds the repeat table. Messages are constant strings in
-// the relay's code, so a few dozen exist; beyond the bound new messages
-// are written without the repeat check.
+// maxMessages bounds the repeat table. Keys beyond it are checked under
+// their message alone (constant strings in the relay's code, a few dozen),
+// which get a quarter more room; past that a line is written unchecked.
 const maxMessages = 1024
 
-type exemptKey struct{}
+type ctxKey int
+
+const (
+	exemptKey ctxKey = iota + 1
+	auditKey
+)
 
 // Exempt returns a context whose lines bypass the budget.
 func Exempt(ctx context.Context) context.Context {
-	return context.WithValue(ctx, exemptKey{}, true)
+	return context.WithValue(ctx, exemptKey, true)
+}
+
+// Audit returns a context whose info lines draw on the audit bucket.
+func Audit(ctx context.Context) context.Context {
+	return context.WithValue(ctx, auditKey, true)
 }
 
 type state struct {
-	rate, burst float64
-	now         func() time.Time
+	now func() time.Time
 
 	mu      sync.Mutex
-	tokens  float64
-	last    time.Time
+	info    bucket
+	audit   bucket
 	repeats map[string]*repeat
 
 	dropped    atomic.Int64 // info lines over the budget
 	suppressed atomic.Int64 // repeated warn/error lines
+}
+
+type bucket struct {
+	rate, burst, tokens float64
+	last                time.Time
+}
+
+func (b *bucket) take(now time.Time) bool {
+	if el := now.Sub(b.last).Seconds(); el > 0 {
+		b.tokens = min(b.burst, b.tokens+el*b.rate)
+		b.last = now
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
 }
 
 type repeat struct {
@@ -68,7 +101,8 @@ func New(inner slog.Handler, rate float64, burst int) *Handler {
 }
 
 func newWithClock(inner slog.Handler, rate float64, burst int, now func() time.Time) *Handler {
-	return &Handler{inner: inner, st: &state{rate: rate, burst: float64(burst), tokens: float64(burst), now: now, last: now(), repeats: map[string]*repeat{}}}
+	b := bucket{rate: rate, burst: float64(burst), tokens: float64(burst), last: now()}
+	return &Handler{inner: inner, st: &state{info: b, audit: b, now: now, repeats: map[string]*repeat{}}}
 }
 
 // Enabled implements slog.Handler.
@@ -76,12 +110,12 @@ func (h *Handler) Enabled(ctx context.Context, l slog.Level) bool { return h.inn
 
 // Handle implements slog.Handler.
 func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
-	if exempt, _ := ctx.Value(exemptKey{}).(bool); exempt {
+	if exempt, _ := ctx.Value(exemptKey).(bool); exempt {
 		return h.inner.Handle(ctx, r)
 	}
 	switch {
 	case r.Level >= slog.LevelWarn:
-		n, ok := h.st.repeatOK(r.Message)
+		n, ok := h.st.repeatOK(repeatKey(r))
 		if !ok {
 			h.st.suppressed.Add(1)
 			return nil
@@ -91,7 +125,8 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 			r.AddAttrs(slog.Int64("repeated", n))
 		}
 	case r.Level >= slog.LevelInfo:
-		if !h.st.take() {
+		audit, _ := ctx.Value(auditKey).(bool)
+		if !h.st.take(audit) {
 			h.st.dropped.Add(1)
 			return nil
 		}
@@ -115,33 +150,50 @@ func (h *Handler) Dropped() int64 { return h.st.dropped.Load() }
 // Suppressed returns the warn and error lines dropped so far as repeats.
 func (h *Handler) Suppressed() int64 { return h.st.suppressed.Load() }
 
-func (s *state) take() bool {
+func (s *state) take(audit bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.now()
-	if el := now.Sub(s.last).Seconds(); el > 0 {
-		s.tokens = min(s.burst, s.tokens+el*s.rate)
-		s.last = now
+	if audit {
+		return s.audit.take(s.now())
 	}
-	if s.tokens < 1 {
-		return false
-	}
-	s.tokens--
-	return true
+	return s.info.take(s.now())
 }
 
-// repeatOK reports whether a warn/error line with message msg may be
-// written now, and how many were dropped since the last one written.
-func (s *state) repeatOK(msg string) (int64, bool) {
+// repeatKey identifies a warn/error line for the repeat check: its message
+// and the values of its err, route and panic attributes, so that different
+// failures under one message are not hidden behind each other.
+func repeatKey(r slog.Record) string {
+	key := r.Message
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "err", "route", "panic":
+			key += "\x00" + a.Key + "=" + a.Value.String()
+		}
+		return true
+	})
+	return key
+}
+
+// repeatOK reports whether a warn/error line with key may be written now,
+// and how many were dropped since the last one written. When the table is
+// full, a new key is checked under its message alone (messages are
+// constants, so their number is bounded).
+func (s *state) repeatOK(key string) (int64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	r, ok := s.repeats[msg]
+	r, ok := s.repeats[key]
+	if !ok && len(s.repeats) >= maxMessages {
+		if i := strings.IndexByte(key, 0); i >= 0 {
+			key = key[:i]
+		}
+		r, ok = s.repeats[key]
+	}
 	if !ok {
-		if len(s.repeats) >= maxMessages {
+		if len(s.repeats) >= maxMessages+maxMessages/4 {
 			return 0, true
 		}
-		s.repeats[msg] = &repeat{written: now}
+		s.repeats[key] = &repeat{written: now}
 		return 0, true
 	}
 	if d := now.Sub(r.written); d >= 0 && d < RepeatWindow {

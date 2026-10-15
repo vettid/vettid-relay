@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/vettid/vettid-relay/internal/store"
@@ -17,51 +18,112 @@ import (
 // never logged. Only ids and sizes reach logs and metrics.
 
 // Transfer slots. A blob body is held in memory while it moves (up to
-// max_blob_bytes), so transfers are bounded: cfg.MaxConcurrentBlobTransfers
-// per process, of which cfg.MaxBlobTransfersPerMailbox per mailbox (the
-// recipient's for an upload, the owner's for a download). A slot is held
-// only while the body moves: an upload takes one when its first bytes have
-// arrived, and every transfer must keep a pace of cfg.BlobPaceBytes in
-// every config.BlobPaceWindow (s.blobPaceWindow), or it is dropped and its
-// slot freed; and no transfer takes longer than blobTransferMax.
+// max_blob_bytes), so transfers are bounded per process
+// (cfg.MaxConcurrentBlobTransfers, P) and per mailbox
+// (cfg.MaxBlobTransfersPerMailbox, M), with uploads and downloads counted
+// apart so that senders can never keep an owner from its blobs:
+//
+//   - uploads: at most M to one mailbox, at most one per (mailbox, sender
+//     key), and at most P − M in the process, so M process slots are
+//     always left for downloads;
+//   - downloads: at most M per mailbox (the owner's), and the process's
+//     P in all.
+//
+// A slot is held only while the body moves: an upload takes one when its
+// first bytes have arrived, and every transfer must keep a pace of
+// cfg.BlobPaceBytes in every config.BlobPaceWindow (s.blobPaceWindow), or
+// it is dropped and its slot freed; and no transfer takes longer than
+// blobTransferMax.
 
 // blobTransferMax bounds one blob body's transfer, either way (the
 // server's read timeout, which the pace's deadlines replace). An 8 MiB
 // blob needs 28 KiB/s to make it.
 const blobTransferMax = 5 * time.Minute
 
-// acquireBlobSlot takes a slot of mailbox and one of the process, or
-// returns the 429 (and takes neither).
-func (s *Server) acquireBlobSlot(mailbox string) *apiError {
-	s.blobMu.Lock()
-	if s.blobMbx[mailbox] >= s.cfg.MaxBlobTransfersPerMailbox {
-		s.blobMu.Unlock()
-		s.rl.refused.With(limBlobMailboxSlots).Inc()
-		return &apiError{code: CodeRateLimited, retryAfter: 2}
-	}
-	s.blobMbx[mailbox]++
-	s.blobMu.Unlock()
-	select {
-	case s.blobSlots <- struct{}{}:
-		return nil
-	default:
-		s.dropMailboxSlot(mailbox)
-		s.rl.refused.With(limBlobSlots).Inc()
-		return &apiError{code: CodeRateLimited, retryAfter: 2}
+// blobTransfers counts the transfers in progress in this process.
+type blobTransfers struct {
+	mu       sync.Mutex
+	up, down int
+	upMbx    map[string]int // uploads, by recipient mailbox
+	downMbx  map[string]int // downloads, by owner mailbox
+	upSender map[string]int // uploads, by recipient mailbox and sender key
+}
+
+func newBlobTransfers() *blobTransfers {
+	return &blobTransfers{upMbx: map[string]int{}, downMbx: map[string]int{}, upSender: map[string]int{}}
+}
+
+func (b *blobTransfers) inFlight() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.up + b.down
+}
+
+func (b *blobTransfers) empty() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.up+b.down == 0 && len(b.upMbx)+len(b.downMbx)+len(b.upSender) == 0
+}
+
+func decr(m map[string]int, k string) {
+	if m[k]--; m[k] <= 0 {
+		delete(m, k)
 	}
 }
 
-func (s *Server) releaseBlobSlot(mailbox string) {
-	<-s.blobSlots
-	s.dropMailboxSlot(mailbox)
+// slotBusy is the answer to a transfer refused for want of a slot.
+func (s *Server) slotBusy(limiter string) *apiError {
+	s.rl.refused.With(limiter).Inc()
+	return &apiError{code: CodeRateLimited, retryAfter: 2}
 }
 
-func (s *Server) dropMailboxSlot(mailbox string) {
-	s.blobMu.Lock()
-	if s.blobMbx[mailbox]--; s.blobMbx[mailbox] <= 0 {
-		delete(s.blobMbx, mailbox)
+// acquireUpload takes an upload slot for sender's blob to mailbox, or
+// returns the 429. release frees it.
+func (s *Server) acquireUpload(mailbox, sender string) (release func(), e *apiError) {
+	b, per, all := s.xfers, s.cfg.MaxBlobTransfersPerMailbox, s.cfg.MaxConcurrentBlobTransfers
+	ks := mailbox + "\x00" + sender
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch {
+	case b.upSender[ks] >= 1:
+		return nil, s.slotBusy(limBlobSenderSlots)
+	case b.upMbx[mailbox] >= per:
+		return nil, s.slotBusy(limBlobMailboxSlots)
+	case b.up >= all-per || b.up+b.down >= all:
+		return nil, s.slotBusy(limBlobSlots)
 	}
-	s.blobMu.Unlock()
+	b.up++
+	b.upMbx[mailbox]++
+	b.upSender[ks]++
+	return func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.up--
+		decr(b.upMbx, mailbox)
+		decr(b.upSender, ks)
+	}, nil
+}
+
+// acquireDownload takes a download slot of mailbox (the owner's), or
+// returns the 429. release frees it.
+func (s *Server) acquireDownload(mailbox string) (release func(), e *apiError) {
+	b := s.xfers
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch {
+	case b.downMbx[mailbox] >= s.cfg.MaxBlobTransfersPerMailbox:
+		return nil, s.slotBusy(limBlobMailboxSlots)
+	case b.up+b.down >= s.cfg.MaxConcurrentBlobTransfers:
+		return nil, s.slotBusy(limBlobSlots)
+	}
+	b.down++
+	b.downMbx[mailbox]++
+	return func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.down--
+		decr(b.downMbx, mailbox)
+	}, nil
 }
 
 // pacedBody reads a request body that must keep up a pace: the read
@@ -168,11 +230,21 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		s.refuseUnread(w, r, e)
 		return
 	}
-	// The network's blob byte budget, on the declared length.
-	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, s.network(r), declaredLength(r, limit)); e != nil {
+	// The network's blob byte budget, on the declared length. An upload
+	// that stores nothing gets the charge back, except for the bytes it
+	// did send when its body failed or its signature did not verify (so
+	// holding a transfer slot with a trickle is never free).
+	network, charged := s.network(r), declaredLength(r, limit)
+	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, charged); e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}
+	stored, kept := false, int64(0)
+	defer func() {
+		if !stored && charged > kept {
+			s.refundBytes(limBlobBytes, s.blobByteLimit, network, charged-kept)
+		}
+	}()
 
 	// Stream the body, hashing as we go; MaxBytesReader stops after
 	// limit+1 bytes, so at most limit bytes are ever buffered. The body
@@ -185,14 +257,16 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	first := make([]byte, 32<<10)
 	n, err := io.ReadAtLeast(body, first, 1)
 	if e := blobReadError(w, err); e != nil {
+		kept = int64(n)
 		s.writeError(w, e)
 		return
 	}
-	if e := s.acquireBlobSlot(mailboxID); e != nil {
+	release, e := s.acquireUpload(mailboxID, da.claims.Sub)
+	if e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}
-	defer s.releaseBlobSlot(mailboxID)
+	defer release()
 	var buf bytes.Buffer
 	if r.ContentLength > 0 {
 		buf.Grow(int(r.ContentLength))
@@ -204,6 +278,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		_, err = io.Copy(io.MultiWriter(&buf, h), body)
 	}
 	if e := blobReadError(w, err); e != nil {
+		kept = int64(buf.Len())
 		s.writeError(w, e)
 		return
 	}
@@ -212,6 +287,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// Step 7. The sender is authenticated but not stored with a blob:
 	// nothing reads it.
 	if _, e := s.verifySender(r, da, bodyHash); e != nil {
+		kept = int64(buf.Len())
 		s.writeError(w, e)
 		return
 	}
@@ -237,6 +313,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeInternal))
 		return
 	}
+	stored = true
 	s.m.blobPuts.Inc()
 	s.m.blobBytes.Add(size)
 	setLog(w, "blob_id", info.ID)
@@ -280,11 +357,21 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeBlobUnknown))
 		return
 	}
-	if e := s.acquireBlobSlot(mb.ID); e != nil {
+	// A network whose blob budget is empty is refused before the store
+	// is read (its exact charge needs the blob's size, which the read
+	// gives).
+	network := s.network(r)
+	if !s.blobByteLimit.Ready(network, s.now()) {
+		s.rl.refused.With(limBlobBytes).Inc()
+		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
+		return
+	}
+	release, e := s.acquireDownload(mb.ID)
+	if e != nil {
 		s.writeError(w, e)
 		return
 	}
-	defer s.releaseBlobSlot(mb.ID)
+	defer release()
 	info, rc, err := s.blobs.OpenBlob(r.Context(), mb.ID, id)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -297,9 +384,11 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rc.Close()
-	// The network's blob byte budget, with the blob's size. Only the owner
-	// gets this far, so the answer tells nobody else anything.
-	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, s.network(r), info.Size); e != nil {
+	// The network's blob byte budget, with the blob's size (at most the
+	// burst: a blob stored under a larger budget can still be fetched).
+	// Only the owner gets this far, so the answer tells nobody else
+	// anything.
+	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, min(info.Size, s.blobByteLimit.Burst())); e != nil {
 		s.writeError(w, e)
 		return
 	}

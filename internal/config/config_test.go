@@ -252,9 +252,10 @@ func TestResourceLimitConfig(t *testing.T) {
 		{"RELAY_RATE_IP_BYTES_BURST": "0"},
 		// ... and the largest blob.
 		{"RELAY_RATE_BLOB_BYTES_BURST": "8388607"},
-		// Per-mailbox slots: at least 1, at most the process's.
+		// Per-mailbox slots: at least 1, fewer than the process's.
 		{"RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "0"},
 		{"RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "9"},
+		{"RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "8"}, // nothing left for downloads
 		{"RELAY_BLOB_PACE_BYTES": "0"},
 		// A mailbox cap below one message.
 		{"RELAY_MAILBOX_MAX_BYTES": "1000"},
@@ -263,9 +264,15 @@ func TestResourceLimitConfig(t *testing.T) {
 			t.Errorf("%v: expected an error", bad)
 		}
 	}
-	// With blobs off, the blob limits are not checked.
+	// With blobs off, how the blob limits relate is not checked; every
+	// rate, burst and pace must still be greater than zero.
 	if _, err := Load(env(map[string]string{"RELAY_BLOBS_ENABLED": "false", "RELAY_RATE_BLOB_BYTES_BURST": "1", "RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX": "0"})); err != nil {
 		t.Fatalf("blobs off: %v", err)
+	}
+	for _, k := range []string{"RELAY_RATE_BLOB_BYTES_BURST", "RELAY_BLOB_PACE_BYTES"} {
+		if _, err := Load(env(map[string]string{"RELAY_BLOBS_ENABLED": "false", k: "0"})); err == nil {
+			t.Errorf("blobs off, %s=0: expected an error", k)
+		}
 	}
 	if got := Defaults().DepositBodyLimit(); got != 4*((262144+2)/3)+1024 {
 		t.Fatalf("deposit body limit %d", got)

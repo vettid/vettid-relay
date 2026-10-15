@@ -9,6 +9,8 @@ import (
 	"net/netip"
 	"strings"
 	"time"
+
+	"github.com/vettid/vettid-relay/internal/logbudget"
 )
 
 // recorder captures status, error code and bytes for the access log. It
@@ -104,6 +106,13 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 				// collectors re-polling every 25 s.
 				level = slog.LevelDebug
 			}
+			ctx := r.Context()
+			if auditRoutes[route] {
+				// A change to a mailbox's registration, keys or denylist:
+				// its line draws on a log budget of its own, which other
+				// traffic cannot use up.
+				ctx = logbudget.Audit(ctx)
+			}
 			if status == http.StatusTooManyRequests {
 				// Refusals (rate limits, quotas) are counted per minute
 				// (relay_ratelimit_refused_total, relay_errors_total and
@@ -111,10 +120,20 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 				// be a flood of log lines, paid for by the relay.
 				level = slog.LevelDebug
 			}
-			s.log.LogAttrs(r.Context(), level, "request", attrs...)
+			s.log.LogAttrs(ctx, level, "request", attrs...)
 		}()
 		next.ServeHTTP(rec, r)
 	})
+}
+
+// auditRoutes are the requests that change a mailbox's state (spec §6.1,
+// §6.6, §6.7, §6.10): their access lines are never crowded out of the log
+// by other traffic (logbudget.Audit).
+var auditRoutes = map[string]bool{
+	"POST /v1/register":         true,
+	"POST /v1/mailbox/rotate":   true,
+	"POST /v1/mailbox/denylist": true,
+	"DELETE /v1/mailbox":        true,
 }
 
 // withSecurityHeaders sets conservative response headers. The web

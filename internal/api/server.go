@@ -57,17 +57,15 @@ type Server struct {
 	web  *webDocs // /connect, /.well-known/assetlinks.json, /robots.txt (§6.11)
 	hsts bool     // public base URL is https: send Strict-Transport-Security
 
-	hub       *hub
-	wsOpen    atomic.Int64  // WebSocket sessions holding a slot (cfg.MaxWebSocketSessions)
-	health    storeHealth   // /healthz: the last store ping
-	healthTO  time.Duration // how long that ping may take (healthPingTimeout; tests shorten it)
-	bus       WakeBus       // cross-process wake-on-deposit (nil: single process)
-	hints     EmptyHints    // known-empty mailboxes (nil: always query)
-	forceGen  atomic.Uint64 // bumped by WakeAll: collectors then query for real
-	blobSlots chan struct{} // bounds concurrent blob transfers
-	blobMu    sync.Mutex
-	blobMbx   map[string]int // blob transfers in progress, by mailbox (cfg.MaxBlobTransfersPerMailbox)
-	mux       *http.ServeMux
+	hub      *hub
+	wsOpen   atomic.Int64   // WebSocket sessions holding a slot (cfg.MaxWebSocketSessions)
+	health   storeHealth    // /healthz: the last store ping
+	healthTO time.Duration  // how long that ping may take (healthPingTimeout; tests shorten it)
+	bus      WakeBus        // cross-process wake-on-deposit (nil: single process)
+	hints    EmptyHints     // known-empty mailboxes (nil: always query)
+	forceGen atomic.Uint64  // bumped by WakeAll: collectors then query for real
+	xfers    *blobTransfers // blob transfers in progress (slots, blobs.go)
+	mux      *http.ServeMux
 }
 
 type serverMetrics struct {
@@ -146,8 +144,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		mux:   http.NewServeMux(),
 		hub:   newHub(),
 
-		blobSlots: make(chan struct{}, cfg.MaxConcurrentBlobTransfers),
-		blobMbx:   map[string]int{},
+		xfers: newBlobTransfers(),
 
 		byteLimit:     ratelimit.New(cfg.RateIPBytesPerSec, cfg.RateIPBytesBurst, 200_000),
 		blobByteLimit: ratelimit.New(cfg.RateBlobBytesPerSec, cfg.RateBlobBytesBurst, 200_000),

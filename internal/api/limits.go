@@ -87,15 +87,24 @@ var byteLimiters = []string{limBytes, limBlobBytes}
 // limBlobSlots and limBlobMailboxSlots label blob transfers refused
 // because the process (cfg.MaxConcurrentBlobTransfers) or the mailbox
 // (cfg.MaxBlobTransfersPerMailbox) has no transfer slot free. Counts.
+// limBlobSenderSlots labels uploads refused because the same sender
+// already has an upload to that mailbox in progress.
 const (
 	limBlobSlots        = "blob_slots"
 	limBlobMailboxSlots = "blob_mailbox_slots"
+	limBlobSenderSlots  = "blob_sender_slots"
 )
 
 // ByteLimiter is a keyed byte budget: AllowN consumes n tokens (bytes), or
-// none and reports how long until n are available.
+// none and reports how long until n are available. Refund gives back a
+// charge for a request that stored or moved nothing; Ready reports whether
+// any token is left; Burst is the bucket size (the most one request can
+// be charged).
 type ByteLimiter interface {
 	AllowN(key string, n int64, now time.Time) (bool, time.Duration)
+	Refund(key string, n int64)
+	Ready(key string, now time.Time) bool
+	Burst() int64
 }
 
 // maxCounted bounds the per-minute tally of requests per network and per
@@ -145,6 +154,7 @@ func newLimiterMetrics(reg *metrics.Registry) *limiterMetrics {
 	}
 	m.refused.With(limBlobSlots)
 	m.refused.With(limBlobMailboxSlots)
+	m.refused.With(limBlobSenderSlots)
 	return m
 }
 
@@ -155,7 +165,7 @@ func (m *limiterMetrics) tally(limiter, key string, n int, refused bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c := m.count[limiter]
-	if _, ok := c[key]; ok || len(c) < maxCounted {
+	if _, ok := c[key]; ok || (n > 0 && len(c) < maxCounted) {
 		c[key] += n
 	}
 	if refused && limiter == limAddress && len(m.hit) < maxCounted {
@@ -189,6 +199,13 @@ func (s *Server) takeBytes(name string, l ByteLimiter, network string, n int64) 
 	s.rl.allowed.With(name).Inc()
 	s.rl.tally(name, network, int(n), false)
 	return nil
+}
+
+// refundBytes gives back n bytes charged by takeBytes for a request that
+// stored or moved nothing (refused later, failed, or not stored).
+func (s *Server) refundBytes(name string, l ByteLimiter, network string, n int64) {
+	l.Refund(network, n)
+	s.rl.tally(name, network, -int(n), false)
 }
 
 // declaredLength is what a byte budget charges for a body before it is
@@ -287,7 +304,7 @@ func (s *Server) reportLimits() {
 		attrs = append(attrs, name+"_peak", pm, name+"_refused", total-s.rl.lastRef[name], name+"_busiest_per_min", most)
 		s.rl.lastRef[name] = total
 	}
-	for _, name := range []string{limBlobSlots, limBlobMailboxSlots} {
+	for _, name := range []string{limBlobSlots, limBlobMailboxSlots, limBlobSenderSlots} {
 		total := s.rl.refused.With(name).Value()
 		attrs = append(attrs, name+"_refused", total-s.rl.lastRef[name])
 		s.rl.lastRef[name] = total

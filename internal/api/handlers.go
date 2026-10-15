@@ -201,10 +201,19 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	// The network's byte budget, on the declared length: a deposit it
 	// refuses is not read. (After steps 1–6, so an unauthorized deposit
 	// costs the network nothing.)
-	if e := s.takeBytes(limBytes, s.byteLimit, s.network(r), declaredLength(r, s.depositBodyLimit())); e != nil {
+	network, charged := s.network(r), declaredLength(r, s.depositBodyLimit())
+	if e := s.takeBytes(limBytes, s.byteLimit, network, charged); e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}
+	// Whatever refuses the deposit from here on, nothing is stored: the
+	// charge is given back.
+	stored := false
+	defer func() {
+		if !stored {
+			s.refundBytes(limBytes, s.byteLimit, network, charged)
+		}
+	}()
 	body, e := s.readBody(w, r, s.depositBodyLimit())
 	if e != nil {
 		s.writeError(w, e)
@@ -261,6 +270,7 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeInternal))
 		return
 	}
+	stored = true
 	s.notifyDeposit(r.Context(), mailboxID) // wake-on-deposit (§6.2), here and on other relay processes
 	s.m.deposits.Inc()
 	s.m.depositBytes.Add(int64(len(payload)))

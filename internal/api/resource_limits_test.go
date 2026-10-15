@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -215,7 +216,7 @@ func dial(t *testing.T, f *fixture) net.Conn {
 // slot, and one that stalls is dropped within the pace window, its
 // connection closed.
 func TestBlobSlotTakenOnlyOnceTheBodyArrives(t *testing.T) {
-	f := newFixtureWith(t, func(c *config.Config) { c.MaxConcurrentBlobTransfers, c.MaxBlobTransfersPerMailbox = 1, 1 },
+	f := newFixtureWith(t, func(c *config.Config) { c.MaxConcurrentBlobTransfers, c.MaxBlobTransfersPerMailbox = 2, 1 }, // one upload
 		func(*fixture) []Option { return []Option{WithBlobPaceWindow(400 * time.Millisecond)} })
 	owner, sender := newPrincipal(1), newPrincipal(2)
 	f.register(owner)
@@ -241,14 +242,14 @@ func TestBlobSlotTakenOnlyOnceTheBodyArrives(t *testing.T) {
 	// window ends, then is dropped and frees it.
 	c := dial(t, f)
 	rawBlobPut(t, f, c, owner, sender, tok, data, 1000)
-	waitFor(t, func() bool { return len(f.s.blobSlots) == 1 })
+	waitFor(t, func() bool { return f.s.xfers.inFlight() == 1 })
 	c.SetReadDeadline(time.Now().Add(3 * time.Second))
 	began := time.Now()
 	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
 	if err != nil || resp.StatusCode != 400 || !resp.Close || time.Since(began) > 2*time.Second {
 		t.Fatalf("stalled upload: %v %v after %v", resp, err, time.Since(began))
 	}
-	waitFor(t, func() bool { return len(f.s.blobSlots) == 0 })
+	waitFor(t, func() bool { return f.s.xfers.inFlight() == 0 })
 	f.mustPutBlob(owner, sender, tok, []byte("slot free again"))
 }
 
@@ -276,53 +277,94 @@ func TestBlobPaceKeptIsServed(t *testing.T) {
 	}
 }
 
-// At most RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX transfers per mailbox and
-// RELAY_MAX_CONCURRENT_BLOB_TRANSFERS per process; beyond either, 429
-// rate_limited with retry_after 2, counted.
-func TestBlobSlotsPerMailboxAndProcess(t *testing.T) {
-	f := newFixtureWith(t, func(c *config.Config) { c.MaxConcurrentBlobTransfers, c.MaxBlobTransfersPerMailbox = 3, 2 },
+// Upload slots: one per (mailbox, sender), RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX
+// per mailbox, and the process's RELAY_MAX_CONCURRENT_BLOB_TRANSFERS less
+// one mailbox's worth, which uploads never take: senders holding every
+// upload slot cannot keep the owner from its blobs. Beyond any of them,
+// 429 rate_limited with retry_after 2, counted.
+func TestBlobUploadSlots(t *testing.T) {
+	f := newFixtureWith(t, func(c *config.Config) { c.MaxConcurrentBlobTransfers, c.MaxBlobTransfersPerMailbox = 4, 2 },
 		func(*fixture) []Option { return []Option{WithBlobPaceWindow(3 * time.Second)} })
-	a, b, sender := newPrincipal(1), newPrincipal(2), newPrincipal(3)
+	a, b := newPrincipal(1), newPrincipal(2)
+	s1, s2, s3 := newPrincipal(11), newPrincipal(12), newPrincipal(13)
 	f.register(a)
 	f.register(b)
-	ta, tb := f.mint(a, sender, nil), f.mint(b, sender, nil)
+	stored := f.mustPutBlob(a, s3, f.mint(a, s3, nil), []byte("for the owner"))
 	data := make([]byte, 64<<10)
 	var held []net.Conn
-	hold := func(owner principal, tok string) {
+	hold := func(owner, sender principal) {
 		c := dial(t, f)
-		rawBlobPut(t, f, c, owner, sender, tok, data, 1000)
+		rawBlobPut(t, f, c, owner, sender, f.mint(owner, sender, nil), data, 1000)
 		held = append(held, c)
 	}
-	hold(a, ta)
-	hold(a, ta)
-	waitFor(t, func() bool { return len(f.s.blobSlots) == 2 })
-	e := f.expectCode(req{method: "PUT", path: "/v1/blob/" + a.mbx, body: []byte("third"), signer: &sender, token: ta}, 429, CodeRateLimited)
-	if e := string(e); !strings.Contains(e, `"retry_after":2`) {
-		t.Fatalf("mailbox full: %s", e)
+	put := func(owner, sender principal) req {
+		return req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: []byte("x"), signer: &sender, token: f.mint(owner, sender, nil)}
 	}
-	f.mustPutBlob(b, sender, tb, []byte("another mailbox")) // 3 of 3 for a moment
-	hold(b, tb)
-	waitFor(t, func() bool { return len(f.s.blobSlots) == 3 })
-	f.expectCode(req{method: "PUT", path: "/v1/blob/" + b.mbx, body: []byte("full"), signer: &sender, token: tb}, 429, CodeRateLimited)
-	// A download takes a slot of its owner's mailbox too.
-	f.expectCode(req{method: "GET", path: "/v1/blob/" + strings.Repeat("0", 26), signer: &a}, 429, CodeRateLimited)
-	if m, p := f.counter(`relay_ratelimit_refused_total{limiter="blob_mailbox_slots"}`), f.counter(`relay_ratelimit_refused_total{limiter="blob_slots"}`); m != 2 || p != 1 {
-		t.Fatalf("refusals: %d mailbox, %d process", m, p)
+	hold(a, s1)
+	waitFor(t, func() bool { return f.s.xfers.inFlight() == 1 })
+	e := f.expectCode(put(a, s1), 429, CodeRateLimited) // s1 already uploads to a
+	if !strings.Contains(string(e), `"retry_after":2`) {
+		t.Fatalf("sender busy: %s", e)
+	}
+	hold(a, s2)
+	waitFor(t, func() bool { return f.s.xfers.inFlight() == 2 })
+	f.expectCode(put(a, s3), 429, CodeRateLimited) // a has its 2 uploads
+	f.expectCode(put(b, s3), 429, CodeRateLimited) // the process has its 4 − 2 uploads
+	// The owner still gets its blob: downloads have slots uploads cannot take.
+	if code, got := f.do(req{method: "GET", path: "/v1/blob/" + stored, signer: &a}); code != 200 || string(got) != "for the owner" {
+		t.Fatalf("owner's download while uploads hold every upload slot: %d %q", code, got)
+	}
+	for limiter, want := range map[string]int64{"blob_sender_slots": 1, "blob_mailbox_slots": 1, "blob_slots": 1} {
+		if n := f.counter(`relay_ratelimit_refused_total{limiter="` + limiter + `"}`); n != want {
+			t.Errorf("%s refused %d, want %d", limiter, n, want)
+		}
 	}
 	for _, c := range held {
 		c.Close()
 	}
-	waitFor(t, func() bool { return len(f.s.blobSlots) == 0 })
-	f.blobMailboxesEmpty(t)
+	waitFor(t, f.s.xfers.empty)
 }
 
-func (f *fixture) blobMailboxesEmpty(t *testing.T) {
-	t.Helper()
-	waitFor(t, func() bool {
-		f.s.blobMu.Lock()
-		defer f.s.blobMu.Unlock()
-		return len(f.s.blobMbx) == 0
-	})
+// The slot accounting: downloads per mailbox and in the process; uploads
+// never take the slots kept for downloads; releases give everything back.
+func TestBlobTransferAccounting(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) { c.MaxConcurrentBlobTransfers, c.MaxBlobTransfersPerMailbox = 4, 2 })
+	s := f.s
+	var rel []func()
+	ok := func(r func(), e *apiError) {
+		t.Helper()
+		if e != nil {
+			t.Fatalf("refused: %v", e.code)
+		}
+		rel = append(rel, r)
+	}
+	busy := func(_ func(), e *apiError) {
+		t.Helper()
+		if e == nil {
+			t.Fatal("admitted beyond a limit")
+		}
+	}
+	ok(s.acquireDownload("a"))
+	ok(s.acquireDownload("a"))
+	busy(s.acquireDownload("a")) // 2 per mailbox
+	ok(s.acquireUpload("b", "x"))
+	ok(s.acquireUpload("c", "x")) // one per (mailbox, sender), not per sender
+	busy(s.acquireDownload("b"))  // 4 in the process
+	for _, r := range rel {
+		r()
+	}
+	rel = nil
+	ok(s.acquireUpload("b", "x"))
+	ok(s.acquireUpload("b", "y"))
+	busy(s.acquireUpload("c", "z")) // uploads: at most 4 − 2
+	ok(s.acquireDownload("b"))
+	ok(s.acquireDownload("c"))
+	for _, r := range rel {
+		r()
+	}
+	if !s.xfers.empty() {
+		t.Fatal("slots not given back")
+	}
 }
 
 // deadlineRecorder records the write deadlines a pacedWriter sets.
@@ -377,7 +419,7 @@ func TestResourceLimitsReport(t *testing.T) {
 	f.s.reportLimits()
 	line := lastLine(t, logs.String(), `"msg":"rate limits"`)
 	dep := len(depositBody([]byte("hello")))
-	want := fmt.Sprintf(`"ws_sessions_refused":0,"ws_network_refused":0,"ws_network_hard_refused":0,"bytes_peak":0,"bytes_refused":0,"bytes_busiest_per_min":%d,"blob_bytes_peak":0,"blob_bytes_refused":0,"blob_bytes_busiest_per_min":700,"blob_slots_refused":0,"blob_mailbox_slots_refused":0}`, dep)
+	want := fmt.Sprintf(`"ws_sessions_refused":0,"ws_network_refused":0,"ws_network_hard_refused":0,"bytes_peak":0,"bytes_refused":0,"bytes_busiest_per_min":%d,"blob_bytes_peak":0,"blob_bytes_refused":0,"blob_bytes_busiest_per_min":700,"blob_slots_refused":0,"blob_mailbox_slots_refused":0,"blob_sender_slots_refused":0}`, dep)
 	if !strings.Contains(line, want) {
 		t.Fatalf("rate limits line:\n%s\nwant it to end with\n%s", line, want)
 	}
@@ -397,6 +439,7 @@ func TestResourceLimitsReport(t *testing.T) {
 		`relay_ratelimit_peak_permille{limiter="bytes"} 0`,
 		`relay_ratelimit_refused_total{limiter="blob_slots"} 0`,
 		`relay_ratelimit_refused_total{limiter="blob_mailbox_slots"} 0`,
+		`relay_ratelimit_refused_total{limiter="blob_sender_slots"} 0`,
 		`relay_ratelimit_busiest_per_minute{limiter="address"}`,
 	} {
 		if !strings.Contains(out.String(), w) {
@@ -442,5 +485,125 @@ func TestLogBudgetReported(t *testing.T) {
 	s.reportLimits() // per minute
 	if line := lastLine(t, logs.String(), `"msg":"rate limits"`); !strings.Contains(line, `"log_dropped":0,"log_suppressed":0}`) {
 		t.Fatalf("second minute: %s", line)
+	}
+}
+
+// A charge is given back when nothing is stored: a deposit refused after
+// the charge (quota, signature, bad body), a claim the store refuses, a
+// blob upload refused for want of a slot or over quota. A sender retrying
+// against a full mailbox does not drain its network's budget.
+func TestByteChargesRefundedWhenNothingIsStored(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		c.RateIPBytesPerSec, c.RateIPBytesBurst = 0.001, 3000
+		c.RateBlobBytesPerSec, c.RateBlobBytesBurst = 0.001, 2500
+		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 2000 // the claim below counts too
+		c.MailboxMaxMessages = 1
+	})
+	owner, sender, thief := newPrincipal(1), newPrincipal(2), newPrincipal(3)
+	f.register(owner)
+	tok := f.mint(owner, sender, nil)
+	payload := strings.Repeat("x", 1000) // a body of 1,349 bytes
+	f.expectFrom(hostA, depositReq(owner, sender, tok, payload), 201, "")
+	for i := 0; i < 20; i++ { // the mailbox is full: refused, refunded
+		f.expectFrom(hostA, depositReq(owner, sender, tok, payload), 429, CodeQuotaExceeded)
+		f.expectFrom(hostA, depositReq(owner, thief, tok, payload), 401, CodeSignatureInvalid)
+		f.expectFrom(hostA, req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: []byte("not json"), signer: &sender, token: tok}, 400, CodeBadRequest)
+	}
+	// 1,651 bytes left of 3,000: a 1,000-byte claim fits, then nothing more.
+	f.expectFrom(hostA, req{method: "PUT", path: "/v1/claim", body: make([]byte, 1000), signer: &owner}, 201, "")
+	f.expectFrom(hostA, req{method: "PUT", path: "/v1/claim", body: make([]byte, 1000), signer: &owner}, 429, CodeRateLimited)
+
+	// Blobs: one stored (1,000 of 2,500), then over the mailbox quota
+	// again and again, refunded each time.
+	blob := func() req {
+		return req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: make([]byte, 1000), signer: &sender, token: tok}
+	}
+	f.expectFrom(hostA, blob(), 201, "")
+	for i := 0; i < 10; i++ {
+		f.expectFrom(hostA, blob(), 429, CodeQuotaExceeded)
+	}
+	if ok, _ := f.s.blobByteLimit.AllowN(rateKey(netip.MustParseAddr(hostA)), 1500, f.clk.now()); !ok {
+		t.Fatal("refused uploads were not refunded")
+	}
+}
+
+// A download is charged at most the burst (a blob stored under a larger
+// budget can still be fetched), and a network whose blob budget is empty
+// is refused before the store is read.
+func TestBlobDownloadCharge(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		c.MaxBlobBytes = 3000
+		c.RateBlobBytesPerSec, c.RateBlobBytesBurst = 0.001, 1<<30
+	})
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	id := f.mustPutBlob(owner, sender, f.mint(owner, sender, nil), make([]byte, 3000))
+	f.cfg.RateBlobBytesBurst = 2000 // lowered below the blob's size
+	f.restart()
+	get := req{method: "GET", path: "/v1/blob/" + id, signer: &owner}
+	if code, _, _ := f.from(hostA, get); code != 200 {
+		t.Fatalf("a blob larger than the burst: %d", code)
+	}
+	opens := &countingBlobs{BlobStore: f.s.blobs}
+	f.s.blobs = opens
+	f.expectFrom(hostA, get, 429, CodeRateLimited)
+	if opens.n != 0 {
+		t.Fatalf("an empty budget still read the store %d times", opens.n)
+	}
+}
+
+type countingBlobs struct {
+	store.BlobStore
+	n int
+}
+
+func (c *countingBlobs) OpenBlob(ctx context.Context, mailbox, id string) (store.BlobInfo, io.ReadCloser, error) {
+	c.n++
+	return c.BlobStore.OpenBlob(ctx, mailbox, id)
+}
+
+// Within the log budget, the lines that change a mailbox's state draw on a
+// bucket of their own: a flood of other requests does not crowd them out.
+func TestAuditLinesHaveTheirOwnBudget(t *testing.T) {
+	var logs syncBuf
+	f := newFixtureFull(t, nil, &logs, nil)
+	f.s.log = slog.New(logbudget.New(slog.NewJSONHandler(&logs, nil), 0.001, 5))
+	owner := newPrincipal(1)
+	f.register(owner) // audit
+	for i := 0; i < 20; i++ {
+		f.do(req{method: "GET", path: "/v1/claim/" + strings.Repeat("a", 26)}) // 404s at info
+	}
+	for i := byte(0); i < 3; i++ {
+		f.register(newPrincipal(50 + i))
+	}
+	if n := strings.Count(logs.String(), `"route":"POST /v1/register"`); n != 4 {
+		t.Fatalf("%d registration lines written of 4", n)
+	}
+	if n := strings.Count(logs.String(), `"route":"GET /v1/claim/{claim_id}"`); n != 5 {
+		t.Fatalf("%d other lines written (budget 5)", n)
+	}
+}
+
+// An upload whose body stalls keeps charged the bytes it sent (holding a
+// slot with a trickle is not free); the rest of its declared length is
+// given back.
+func TestStalledUploadKeepsWhatItSent(t *testing.T) {
+	f := newFixtureWith(t, func(c *config.Config) { c.RateBlobBytesPerSec, c.RateBlobBytesBurst = 0.001, 100_000 },
+		func(*fixture) []Option { return []Option{WithBlobPaceWindow(300 * time.Millisecond)} })
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	c := dial(t, f)
+	rawBlobPut(t, f, c, owner, sender, f.mint(owner, sender, nil), make([]byte, 64<<10), 1000)
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if resp, err := http.ReadResponse(bufio.NewReader(c), nil); err != nil || resp.StatusCode != 400 {
+		t.Fatalf("stalled upload: %v %v", resp, err)
+	}
+	waitFor(t, f.s.xfers.empty)
+	key := rateKey(netip.MustParseAddr("127.0.0.1"))
+	if ok, _ := f.s.blobByteLimit.AllowN(key, 99_000, f.clk.now()); !ok {
+		t.Fatal("the unsent part was not given back")
+	}
+	if ok, _ := f.s.blobByteLimit.AllowN(key, 1, f.clk.now()); ok {
+		t.Fatal("the 1,000 bytes sent were given back too")
 	}
 }

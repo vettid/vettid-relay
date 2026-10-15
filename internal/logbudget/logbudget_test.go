@@ -3,6 +3,7 @@ package logbudget
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -69,7 +70,7 @@ func TestRepeatedWarnings(t *testing.T) {
 		t.Fatalf("written %d, suppressed %d", n, h.Suppressed())
 	}
 	clk.add(RepeatWindow)
-	log.Warn("replay cache full")
+	log.Warn("replay cache full", "err", "x")
 	last := buf.String()[strings.LastIndex(strings.TrimSpace(buf.String()), "\n")+1:]
 	if !strings.Contains(last, `"repeated":49`) {
 		t.Fatalf("repeat count missing: %s", last)
@@ -82,5 +83,50 @@ func TestRepeatedWarnings(t *testing.T) {
 	log.Info("two")
 	if h.Dropped() != 1 {
 		t.Fatalf("info budget: dropped %d", h.Dropped())
+	}
+}
+
+// Audit lines draw on their own bucket: other lines cannot empty it, and
+// they do not empty the other.
+func TestAuditBucket(t *testing.T) {
+	log, h, buf, _ := newTest(0.001, 3)
+	audit := Audit(context.Background())
+	for i := 0; i < 10; i++ {
+		log.Info("request")
+	}
+	for i := 0; i < 5; i++ {
+		log.InfoContext(audit, "request", "route", "POST /v1/register")
+	}
+	if n := strings.Count(buf.String(), "POST /v1/register"); n != 3 {
+		t.Fatalf("%d audit lines written (own budget 3)", n)
+	}
+	if n := lines(buf); n != 6 || h.Dropped() != 9 {
+		t.Fatalf("written %d, dropped %d", n, h.Dropped())
+	}
+}
+
+// The repeat check tells failures apart by their err, route and panic
+// attributes, not by the message alone.
+func TestRepeatKey(t *testing.T) {
+	log, h, buf, _ := newTest(1, 1)
+	log.Error("panic in handler", "route", "POST /v1/register", "panic", "a")
+	log.Error("panic in handler", "route", "GET /v1/mailbox", "panic", "a")
+	log.Error("panic in handler", "route", "GET /v1/mailbox", "panic", "b")
+	log.Error("deposit failed", "err", "throttled")
+	log.Error("deposit failed", "err", "conditional check failed")
+	log.Error("deposit failed", "err", "throttled", "other", "x") // a repeat
+	if n := lines(buf); n != 5 || h.Suppressed() != 1 {
+		t.Fatalf("written %d, suppressed %d", n, h.Suppressed())
+	}
+	// A full table falls back to the message alone: new keys past the
+	// bound are repeats of "many", which was written in this window.
+	for i := 0; i < maxMessages; i++ {
+		log.Warn("many", "err", fmt.Sprint(i))
+	}
+	before := h.Suppressed()
+	log.Warn("many", "err", "new")
+	log.Warn("many", "err", "newer")
+	if h.Suppressed() != before+2 {
+		t.Fatalf("past the table's bound: suppressed %d more", h.Suppressed()-before)
 	}
 }
