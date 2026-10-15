@@ -116,7 +116,7 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_BLOB_TTL` | `168h` (7 d) | Blob lifetime (`blob_ttl_seconds`). |
 | `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` | `8` | Concurrent blob uploads plus downloads, per relay process. Each can hold up to `max_blob_bytes` in memory. Uploads may use all but `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` of them (6 by default): the rest are kept for downloads. An upload takes its slot only once its body has begun to arrive. Beyond it, `429 rate_limited` with `retry_after` 2. |
 | `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` | `2` | Uploads to one mailbox, and separately downloads by its owner, at a time per process; besides, one sender key has at most one upload to a mailbox at a time. Senders therefore can't keep an owner from its blobs. At least 1 and less than `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS`. Beyond it, `429 rate_limited` with `retry_after` 2. |
-| `RELAY_BLOB_EVICT_MIN_AGE` | `30s` | When a new upload finds no upload slot free (in the process, or in its mailbox), the slowest upload by bytes received per second that has run at least this long is cut off: it is answered `429 rate_limited` with `retry_after` 2 and the connection closed (its sent bytes stay charged), and the new upload takes its slot. If none has run this long, the new upload is refused as before. Counted as `blob_evicted`. |
+| `RELAY_BLOB_EVICT_MIN_AGE` | `30s` | When a new upload finds no upload slot free (in the process, or in its mailbox), one upload is cut off and the new one takes its slot. It must be *evictable*: it has run at least this long, or its client network has held an upload slot without a break for this long (so replacing uploads doesn't reset the clock). Of those, the one with the fewest bytes received over the last 10 s goes. It is answered `429 rate_limited` with `retry_after` 2 and the connection closed, and its sent bytes stay charged. If none is evictable, the new upload is refused as before. Counted as `blob_evicted`. |
 | `RELAY_BLOB_PACE_BYTES` | `16384` | A blob body, up or down, must move at least this many bytes in every 5 s, or the transfer is dropped (an upload is answered `400` with the connection closed) and its slot freed. No transfer takes longer than 5 minutes (an 8 MiB blob needs 28 KiB/s). |
 | `RELAY_MAILBOX_MAX_MESSAGES` | `10000` | Per-mailbox cap on stored messages (`quota_exceeded`). |
 | `RELAY_MAILBOX_MAX_BYTES` | `33554432` (32 MiB) | Per-mailbox cap on stored payload bytes (`quota_exceeded`); `0` means no cap. At least `RELAY_MAX_PAYLOAD_BYTES`. A mailbox that already holds more (the default was 128 MiB) keeps its messages and is collected as before; deposits to it are refused until acks or expiry bring it under the cap. |
@@ -189,10 +189,13 @@ version does not protect against. In short:
   and every transfer must keep a pace of 16 KiB per 5 s
   (`RELAY_BLOB_PACE_BYTES`) and finish within 5 minutes, or it is dropped
   and its slot freed. When a new upload finds no slot free, the slowest
-  upload (by bytes received per second) that has run at least 30 s
-  (`RELAY_BLOB_EVICT_MIN_AGE`) is cut off with `429` and `retry_after` 2,
-  and the new one takes its slot, so a trickle can't hold a slot against
-  real uploads. There is no per-address upload limit: vault hosts upload
+  evictable upload (fewest bytes over the last 10 s) is cut off with
+  `429` and `retry_after` 2, and the new one takes its slot. Evictable
+  means it has run 30 s (`RELAY_BLOB_EVICT_MIN_AGE`), or its network has
+  held an upload slot without a break for that long. So one address keeps
+  newcomers out for at most 30 s, and after that only by sending faster
+  than the uploads it displaces. Several networks taking turns can still
+  keep newcomers out (spec §7.2, "What does not hold"). There is no per-address upload limit: vault hosts upload
   for hundreds of members. Refusals are counted as `blob_slots`,
   `blob_mailbox_slots` and `blob_sender_slots`, cut-off uploads as
   `blob_evicted`.
