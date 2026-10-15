@@ -206,11 +206,18 @@ version does not protect against. In short:
 - **Blob storage per mailbox** (0.9.2, §6.8): an upload is checked
   before its body is read, on its declared length, against the mailbox's
   cap less the room kept for the owner's devices, the sender's share
-  (16 MiB in at most 16 blobs) and the token's byte quota, counting the
-  uploads of the process still in progress; refused with
-  `quota_exceeded` (its `quota` member says which) and `Connection:
-  close`, holding no slot and charged nothing. The commit checks again,
-  atomically, what was stored.
+  (16 MiB in at most 16 blobs) and the token's byte quota. Over what is
+  stored, it is refused with `quota_exceeded` (its `quota` member says
+  which) and `Connection: close`, holding no slot and charged nothing.
+  Uploads in progress on the process count too, but only those holding
+  a transfer slot: an upload reserves its declared length when it takes
+  its slot (re-checked then) and gives it back when it ends, so an
+  upload announced and never sent reserves nothing. One that fits what
+  is stored but not with others' reservations is answered `429
+  rate_limited` with `retry_after` 2 (they may yet fail). The commit
+  checks again, atomically, what was stored; it runs to its end (30 s at
+  most) even if the client has gone, and one that fails without a
+  definite refusal is undone by deleting the blob by its id.
 - **Refunds.** A deposit or claim charged to a byte budget and then not
   stored gets its charge back, so a sender retrying against a full
   mailbox doesn't drain its network's budget. A blob upload that held a
@@ -624,7 +631,9 @@ implementation chooses as follows:
   separate table behind the `BlobStore` interface) rather than as files on
   disk, which §6.8 says SHOULD be used. This is deliberate: one file is the
   entire state for replication. An upload's body is staged in a temporary
-  file next to the database while it arrives and read into the database
+  file in the process's own folder next to the database
+  (`.relay-blob-staging-*`, locked while the process runs; folders whose
+  lock is free are removed at start) while it arrives and read into the database
   at the commit (one body at a time: the store has one writer); a blob is
   loaded whole to be served, as §6.8 allows. With DynamoDB, blob bodies are
   S3 objects, outside the message store as §6.8 recommends, streamed both
@@ -640,8 +649,9 @@ implementation chooses as follows:
   quotas are exceeded the answer names, in this order, `mailbox_blobs`,
   `sender_blobs`, `token` (for deposits `mailbox`, then `token`): the
   storage that only the owner can free before a token the sender may
-  renew. Uploads still in progress on the same process count with their
-  declared length. A full denylist's `quota_exceeded` carries no `quota`
+  renew. Uploads in progress on the same process that hold a transfer
+  slot count with their declared length; a refusal due only to them is
+  `rate_limited` (retry_after 2), not `quota_exceeded`. A full denylist's `quota_exceeded` carries no `quota`
   member (none of the four fits).
 - **The owner's list** (`POST /v1/blobs`). An empty body is `{}`; `max` is
   an integer from 1 to 500 written in canonical decimal and `after` a

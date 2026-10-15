@@ -492,14 +492,14 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	}
 	// Step 8 before the body (0.9.2, §6.8): the mailbox's blob storage
 	// (less the owner's devices' room), the sender's share and the token's
-	// byte quota, on the declared length; reserved until the upload ends.
-	// The store checks again at the commit, after the signature.
-	unreserve, e := s.reserveBlob(r.Context(), da, size)
+	// byte quota, on the declared length. Checked only: the length is
+	// reserved once the upload holds a transfer slot (blobquota.go). The
+	// store checks again at the commit, after the signature.
+	check, e := s.checkBlob(r.Context(), da, size)
 	if e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}
-	defer unreserve()
 	// The per-sender limit comes after the signature (step 7), as for
 	// deposits: the token's sub is written by the mailbox owner, so a
 	// token naming someone else's key must not spend that key's budget.
@@ -529,7 +529,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	}
 	body := &bodyReader{h: sha256.New()} // the body as received
 	var staged store.StagedBlob
-	stored, held := false, false
+	stored, held, firstN := false, false, 0
 	defer func() {
 		if staged != nil && !stored {
 			// Nothing may stay behind: the staged body goes.
@@ -538,8 +538,8 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		kept := int64(0)
-		if held {
-			kept = body.n
+		if held { // every byte received stays charged, the first read's included
+			kept = max(body.n, int64(firstN))
 		}
 		if !stored && charged > kept {
 			s.refundBytes(limBlobBytes, s.blobByteLimit, network, charged-kept)
@@ -563,6 +563,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	if size > 0 {
 		var err error
 		n, err = io.ReadAtLeast(paced, first, 1)
+		firstN = n
 		if e := blobReadError(w, err); e != nil {
 			s.writeError(w, e)
 			return
@@ -575,6 +576,14 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	held = true
+	// Its declared length is reserved while it holds the slot, re-checked
+	// against the uploads that reserved meanwhile.
+	unreserve, e := s.reserve(check)
+	if e != nil {
+		s.refuseUnread(w, r, e)
+		return
+	}
+	defer unreserve()
 	body.r = io.MultiReader(bytes.NewReader(first[:n]), paced)
 	st, err := s.blobs.StageBlob(r.Context(), mailboxID, size, body)
 	if err == nil {
@@ -619,7 +628,21 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// whatever the store then says (into debt if need be; never refused
 	// here).
 	s.chargeBlobKey(sender, size)
-	info, err := staged.Commit(r.Context(), s.blobPut(da, sender, size)) // step 8, again, atomically
+	// Step 8, again, atomically. The commit is not cut short by the client
+	// going away: one cancelled mid-write could leave a counted blob whose
+	// body the deferred discard then deletes.
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), blobCommitTimeout)
+	defer cancel()
+	info, err := staged.Commit(cctx, s.blobPut(da, sender, size))
+	if err != nil && !errors.Is(err, store.ErrQuota) && !errors.Is(err, store.ErrRevoked) && !errors.Is(err, store.ErrNotFound) {
+		// Not a definite refusal: the commit may have been applied after
+		// all. Deleting the blob by its id undoes it if so (idempotent).
+		if id := staged.ID(); id != "" {
+			if derr := s.blobs.DeleteBlob(cctx, mailboxID, id); derr != nil {
+				s.log.Error("blob cleanup after a failed commit failed", "err", derr)
+			}
+		}
+	}
 	switch {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, quotaFail(err))
@@ -645,6 +668,10 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		"expires_at": info.ExpiresAt.UTC().Format(timeFormat),
 	})
 }
+
+// blobCommitTimeout bounds an upload's commit, which runs on after its
+// client has gone.
+const blobCommitTimeout = 30 * time.Second
 
 // blobFirstRead bounds the first read of an upload's body, which is made
 // before the transfer slot is taken.

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -70,6 +69,11 @@ type StagedBlob interface {
 	// still staged: the caller discards it.
 	Commit(ctx context.Context, p BlobPut) (BlobInfo, error)
 	Discard(ctx context.Context) error
+	// ID is the id the blob gets if committed, when it is known before
+	// the commit ("" otherwise). After a commit that failed other than by
+	// a definite refusal (quota, ErrRevoked, ErrNotFound) the commit may
+	// have been applied: DeleteBlob with this id undoes it.
+	ID() string
 }
 
 // BlobStore stores opaque blob ciphertext (spec §6.8). The SQLite
@@ -107,19 +111,6 @@ var _ BlobStore = (*Store)(nil)
 // ErrBlobSize is returned by StageBlob when the body is not exactly the
 // announced size.
 var ErrBlobSize = errors.New("store: blob size mismatch")
-
-// stagePrefix names the SQLite store's staged bodies: temporary files next
-// to the database file, removed at commit or discard, and at Open (left by
-// a process that stopped mid-upload).
-const stagePrefix = ".relay-blob-staged-"
-
-// removeStaged removes staged bodies left in dir by an earlier process.
-func removeStaged(dir string) {
-	names, _ := filepath.Glob(filepath.Join(dir, stagePrefix+"*"))
-	for _, n := range names {
-		os.Remove(n)
-	}
-}
 
 // ExactReader reads exactly size bytes from r: it fails with ErrBlobSize
 // if r ends early or holds more. (The more is detected by reading one
@@ -193,6 +184,10 @@ func (s *Store) StageBlob(ctx context.Context, mailbox string, size int64, r io.
 	}
 	return &sqliteStaged{s: s, mailbox: mailbox, size: size, path: f.Name()}, nil
 }
+
+// ID implements StagedBlob: the SQLite store assigns the id in the
+// commit's transaction, which either commits or does not.
+func (b *sqliteStaged) ID() string { return "" }
 
 // Discard implements StagedBlob.
 func (b *sqliteStaged) Discard(context.Context) error {
@@ -316,6 +311,9 @@ func PutStaged(ctx context.Context, bs BlobStore, p BlobPut, r io.Reader) (BlobI
 	}
 	info, err := st.Commit(ctx, p)
 	if err != nil {
+		if id := st.ID(); id != "" && !errors.Is(err, ErrQuota) && !errors.Is(err, ErrRevoked) && !errors.Is(err, ErrNotFound) {
+			bs.DeleteBlob(context.WithoutCancel(ctx), p.Mailbox, id) // it may have been applied
+		}
 		st.Discard(context.WithoutCancel(ctx))
 	}
 	return info, err

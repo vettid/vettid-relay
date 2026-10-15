@@ -32,7 +32,7 @@ func TestConformanceSQLite(t *testing.T) {
 			mu.Lock()
 			dir := dirs[s]
 			mu.Unlock()
-			n, _ := filepath.Glob(filepath.Join(dir, ".relay-blob-staged-*"))
+			n, _ := filepath.Glob(filepath.Join(dir, ".relay-blob-staging-*", ".relay-blob-staged-*"))
 			return len(n)
 		},
 	})

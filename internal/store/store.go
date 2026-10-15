@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -53,7 +54,8 @@ type Store struct {
 
 	tomb TombstonePolicy
 
-	stageDir string // where blob bodies are staged (StageBlob): the database file's directory
+	stageDir  string   // where blob bodies are staged (StageBlob): this process's folder next to the database file (staging.go)
+	stageLock *os.File // held locked until Close
 }
 
 // Option configures a Store.
@@ -112,8 +114,12 @@ func Open(ctx context.Context, path string, opts ...Option) (*Store, error) {
 		return nil, err
 	}
 	r.SetMaxOpenConns(8)
-	s := &Store{w: w, r: r, now: time.Now, entropy: ulid.Monotonic(rand.Reader, 0), stageDir: filepath.Dir(path)}
-	removeStaged(s.stageDir)
+	s := &Store{w: w, r: r, now: time.Now, entropy: ulid.Monotonic(rand.Reader, 0)}
+	if s.stageDir, s.stageLock, err = openStaging(filepath.Dir(path)); err != nil {
+		w.Close()
+		r.Close()
+		return nil, fmt.Errorf("open %s: blob staging folder: %w", path, err)
+	}
 	for _, o := range opts {
 		o(s)
 	}
@@ -126,6 +132,7 @@ func Open(ctx context.Context, path string, opts ...Option) (*Store, error) {
 
 // Close closes both pools. Call only after all request handlers have finished.
 func (s *Store) Close() error {
+	closeStaging(s.stageDir, s.stageLock)
 	return errors.Join(s.r.Close(), s.w.Close())
 }
 

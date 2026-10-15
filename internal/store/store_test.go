@@ -493,8 +493,14 @@ func TestMigrateFromV4BlobSenders(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
-	left := filepath.Join(dir, stagePrefix+"left-behind")
-	if err := os.WriteFile(left, []byte("partial"), 0o600); err != nil {
+	// A staging folder left by a process that stopped mid-upload: its
+	// lock is free.
+	left := filepath.Join(dir, stagingPrefix+"stale")
+	if err := os.MkdirAll(left, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(left, stagingLock), nil, 0o600)
+	if err := os.WriteFile(filepath.Join(left, stagePrefix+"left-behind"), []byte("partial"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s, err := Open(ctx, path)
@@ -519,6 +525,37 @@ func TestMigrateFromV4BlobSenders(t *testing.T) {
 	bs, _, used, err := s.ListBlobs(ctx, "a", "", 10)
 	if err != nil || len(bs) != 2 || bs[0].Sender != "" || bs[1].Sender != "s1" || used != 300 {
 		t.Fatalf("list %+v %d %v", bs, used, err)
+	}
+}
+
+// Two stores on one folder (two databases, or a second process): each
+// stages in its own folder, and neither removes the other's while it is
+// open; the folder goes at Close.
+func TestStagingFoldersPerProcess(t *testing.T) {
+	dir := t.TempDir()
+	a, err := Open(ctx, filepath.Join(dir, "a.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := a.StageBlob(ctx, "m", 3, bytes.NewReader([]byte("abc")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Open(ctx, filepath.Join(dir, "b.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.stageDir == b.stageDir {
+		t.Fatal("one staging folder for two stores")
+	}
+	if n, _ := filepath.Glob(filepath.Join(a.stageDir, stagePrefix+"*")); len(n) != 1 {
+		t.Fatalf("the other store removed a live staged body: %v", n)
+	}
+	st.Discard(ctx)
+	a.Close()
+	b.Close()
+	if n, _ := filepath.Glob(filepath.Join(dir, stagingPrefix+"*")); len(n) != 0 {
+		t.Fatalf("staging folders left at Close: %v", n)
 	}
 }
 

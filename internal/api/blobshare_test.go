@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,7 +44,7 @@ func shareFixture(t *testing.T, mut func(*config.Config)) *fixture {
 func (f *fixture) leftovers(mailboxes ...principal) int {
 	f.t.Helper()
 	if f.s3 == nil {
-		n, _ := filepath.Glob(filepath.Join(filepath.Dir(f.dbPath), ".relay-blob-staged-*"))
+		n, _ := filepath.Glob(filepath.Join(filepath.Dir(f.dbPath), ".relay-blob-staging-*", ".relay-blob-staged-*"))
 		return len(n)
 	}
 	committed := 0
@@ -255,9 +256,11 @@ func TestBlobQuotaRefusedBeforeTheBody(t *testing.T) {
 	}
 }
 
-// An upload in progress holds its declared length against the mailbox, its
-// sender's share and its token until it ends: two uploads that would
-// together exceed the cap are not both let through to their bodies.
+// An upload that holds a transfer slot holds its declared length against
+// the mailbox, its sender's share and its token until it ends: two uploads
+// that would together exceed the cap are not both let through to their
+// bodies. One refused only for another's reservation is told to retry
+// (rate_limited), not that the mailbox is full.
 func TestBlobReservationHeldWhileTheBodyMoves(t *testing.T) {
 	f := newFixtureWith(t, func(c *config.Config) {
 		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 100_000, 300_000 // peers: 200,000
@@ -269,7 +272,9 @@ func TestBlobReservationHeldWhileTheBodyMoves(t *testing.T) {
 	rawBlobPut(t, f, c, owner, s2, f.mint(owner, s2, nil), make([]byte, 100_000), 20_000) // 150,000 with the reservation
 	waitFor(t, func() bool { return f.s.xfers.inFlight() == 1 })
 	t3 := f.mint(owner, newPrincipal(4), nil)
-	f.expectQuota(blobReq(owner, newPrincipal(4), t3, 60_000), "mailbox_blobs")
+	if b := f.expectCode(blobReq(owner, newPrincipal(4), t3, 60_000), 429, CodeRateLimited); !strings.Contains(string(b), `"retry_after":2`) {
+		t.Fatalf("refused for a reservation: %s", b)
+	}
 	f.mustPutBlob(owner, newPrincipal(4), t3, make([]byte, 50_000)) // exactly 200,000
 	// The stalled upload ends (dropped), its reservation with it.
 	if resp, _ := readAnswer(t, c); resp.StatusCode != 400 {
@@ -279,6 +284,119 @@ func TestBlobReservationHeldWhileTheBodyMoves(t *testing.T) {
 	f.mustPutBlob(owner, newPrincipal(5), f.mint(owner, newPrincipal(5), nil), make([]byte, 100_000))
 	if n := f.leftovers(owner); n != 0 {
 		t.Fatalf("%d bodies left", n)
+	}
+	f.expectQuota(blobReq(owner, newPrincipal(6), f.mint(owner, newPrincipal(6), nil), 1), "mailbox_blobs") // what is stored: final
+}
+
+// An upload announced and never sent reserves nothing (it holds no slot):
+// however many are announced, under however many keys, others' uploads
+// go through.
+func TestAnnouncedUploadsReserveNothing(t *testing.T) {
+	f := shareFixture(t, nil) // peers may fill 3,000
+	owner := newPrincipal(1)
+	f.register(owner)
+	for i := 0; i < 8; i++ {
+		s := newPrincipal(byte(50 + i))
+		c := dial(t, f)
+		rawBlobPut(t, f, c, owner, s, f.mint(owner, s, nil), make([]byte, 1000), 0) // headers only
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !f.s.blobRes.empty() {
+		t.Fatal("an announced upload reserved")
+	}
+	for i := 0; i < 3; i++ {
+		s := newPrincipal(byte(70 + i))
+		f.mustPutBlob(owner, s, f.mint(owner, s, nil), make([]byte, 1000))
+	}
+}
+
+// An upload that passed the check before its body, and finds when it
+// takes its slot that another upload has reserved meanwhile, is re-checked
+// then: refused rate_limited, its connection closed, nothing kept.
+func TestBlobReservationRecheckedAtTheSlot(t *testing.T) {
+	f := newFixtureWith(t, func(c *config.Config) {
+		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 100_000, 300_000 // peers: 200,000
+	}, func(*fixture) []Option { return []Option{WithBlobPaceWindow(3 * time.Second)} })
+	owner, s1, s2, s3 := newPrincipal(1), newPrincipal(2), newPrincipal(3), newPrincipal(4)
+	f.register(owner)
+	f.mustPutBlob(owner, s1, f.mint(owner, s1, nil), make([]byte, 50_000))
+	late := dial(t, f)
+	data := make([]byte, 100_000)
+	rawBlobPut(t, f, late, owner, s3, f.mint(owner, s3, nil), data, 0) // checked: 150,000 fits
+	time.Sleep(50 * time.Millisecond)
+	early := dial(t, f)
+	rawBlobPut(t, f, early, owner, s2, f.mint(owner, s2, nil), data, 20_000) // reserves: 150,000
+	waitFor(t, func() bool { return f.s.xfers.inFlight() == 1 })
+	if _, err := late.Write(data[:20_000]); err != nil { // 250,000 with the reservation
+		t.Fatal(err)
+	}
+	resp, e := readAnswer(t, late)
+	if resp.StatusCode != 429 || e.Code != CodeRateLimited || e.RetryAfter != 2 || !resp.Close {
+		t.Fatalf("re-check: %d %+v close=%v", resp.StatusCode, e, resp.Close)
+	}
+	if _, err := early.Write(data[20_000:]); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := readAnswer(t, early); resp.StatusCode != 201 {
+		t.Fatalf("early: %d", resp.StatusCode)
+	}
+	waitFor(t, func() bool { return f.s.xfers.empty() && f.s.blobRes.empty() })
+	if n := f.leftovers(owner); n != 0 {
+		t.Fatalf("%d bodies left", n)
+	}
+}
+
+// The commit is not cut short by the client going away after its last
+// byte: the blob is stored whole (no counted blob without a body).
+func TestBlobCommitOutlivesTheClient(t *testing.T) {
+	f := newFixture(t, nil)
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	hooks := &hookedBlobs{BlobStore: f.s.blobs, commitGate: make(chan struct{}), commitIn: make(chan struct{}, 1)}
+	f.s.blobs = hooks
+	data := bytes.Repeat([]byte{9}, 50_000)
+	c := dial(t, f)
+	rawBlobPut(t, f, c, owner, sender, f.mint(owner, sender, nil), data, len(data))
+	<-hooks.commitIn
+	c.Close()
+	time.Sleep(200 * time.Millisecond) // the request's context is cancelled
+	close(hooks.commitGate)
+	waitFor(t, func() bool { return f.s.xfers.empty() && f.s.blobRes.empty() })
+	if err := hooks.commitCtxErr.Load(); err != nil {
+		t.Fatalf("the commit ran on a cancelled context: %v", err)
+	}
+	bs := f.listBlobs(owner, `{}`).Blobs
+	if len(bs) != 1 {
+		t.Fatalf("%d blobs", len(bs))
+	}
+	code, got, _ := f.send(f.build(req{method: "GET", path: "/v1/blob/" + bs[0].BlobID, signer: &owner}))
+	if code != 200 || !bytes.Equal(got, data) {
+		t.Fatalf("get: %d, %d bytes", code, len(got))
+	}
+}
+
+// A commit that failed without a definite refusal (a timeout, say) may
+// have been applied: the blob is deleted by its id, so no counted blob
+// stays without a body. (Only a store that knows the id before the commit
+// can be asked; the SQLite store's commit is one local transaction.)
+func TestBlobAmbiguousCommitCleanedUp(t *testing.T) {
+	f := newFixture(t, nil)
+	if f.s3 == nil {
+		t.Skip("the SQLite store's commit either happens or not")
+	}
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	hooks := &hookedBlobs{BlobStore: f.s.blobs, applyThenFail: errors.New("timeout after the write")}
+	f.s.blobs = hooks
+	f.expectCode(blobReq(owner, sender, f.mint(owner, sender, nil), 5000), 500, CodeInternal)
+	f.s.blobs = hooks.BlobStore
+	waitFor(t, func() bool { return f.s.xfers.empty() && f.s.blobRes.empty() })
+	out := f.listBlobs(owner, `{}`)
+	if len(out.Blobs) != 0 || out.UsedBytes != 0 || f.leftovers(owner) != 0 {
+		t.Fatalf("left: %+v, %d bodies", out, f.leftovers(owner))
+	}
+	if u, _ := f.st.BlobUsage(context.Background(), owner.mbx, sender.b64, "", true); u.SenderBlobs != 0 || u.SenderBytes != 0 {
+		t.Fatalf("share left: %+v", u)
 	}
 }
 
@@ -369,6 +487,10 @@ func TestBlobStreamFailuresLeaveNothing(t *testing.T) {
 type hookedBlobs struct {
 	store.BlobStore
 	stageErr, commitErr error
+	applyThenFail       error // the commit is applied, then fails with this
+	commitIn            chan struct{}
+	commitGate          chan struct{} // the commit waits for it to close
+	commitCtxErr        atomic.Value
 	discards            atomicInt
 }
 
@@ -401,7 +523,18 @@ func (s *hookedStaged) Commit(ctx context.Context, p store.BlobPut) (store.BlobI
 	if s.h.commitErr != nil {
 		return store.BlobInfo{}, s.h.commitErr
 	}
-	return s.StagedBlob.Commit(ctx, p)
+	if s.h.commitGate != nil {
+		s.h.commitIn <- struct{}{}
+		<-s.h.commitGate
+		if err := ctx.Err(); err != nil {
+			s.h.commitCtxErr.Store(err)
+		}
+	}
+	info, err := s.StagedBlob.Commit(ctx, p)
+	if err == nil && s.h.applyThenFail != nil {
+		return store.BlobInfo{}, s.h.applyThenFail
+	}
+	return info, err
 }
 
 func (s *hookedStaged) Discard(ctx context.Context) error {

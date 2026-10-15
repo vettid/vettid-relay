@@ -18,23 +18,35 @@ import (
 //     token's upload may use the whole cap;
 //   - the sender's share: at most cfg.SenderBlobBytes() in at most
 //     cfg.MaxSenderBlobs blobs per sender key and mailbox;
-//   - the token's byte quota;
+//   - the token's byte quota.
 //
-// counting, besides what the store holds, the uploads of this process
-// still in progress, whose declared lengths are reserved until they end.
-// The store checks again, atomically with the commit, what was actually
+// What the store holds decides: over it, the upload is refused
+// quota_exceeded (final until something is deleted or expires, or a
+// token renewed). Uploads in progress on this process count too, with
+// their declared lengths, but only those that hold a transfer slot (13):
+// an upload reserves its length when it takes its slot, after its body
+// has begun to arrive, re-checked then, and gives it back when it ends.
+// So reservations are bounded by the slots and their pace, and an upload
+// announced but never sent reserves nothing. An upload that fits what is
+// stored but not with the reservations of others is told to retry
+// (rate_limited, retry_after), since those uploads may yet fail. The
+// store checks again, atomically with the commit, what was actually
 // stored (and is what holds across processes).
 //
 // Before the body the sender is the token's sub: the mailbox owner wrote
 // it, and only the request signature (step 7, after the body) proves the
 // uploader holds that key. A token naming another key can therefore make
-// this check look at that key's share (refusing itself) and hold a
-// reservation on it while its body is read, as it holds that key's
-// transfer slot (13), but it can never store a blob under that key: the
-// commit is made only after step 7, under the key that signed.
+// this check look at that key's share (refusing itself) and, while its
+// body moves, hold a reservation on it, as it holds that key's transfer
+// slot (13); it can never store a blob under that key: the commit is made
+// only after step 7, under the key that signed.
 
-// blobReservations are the uploads of this process between their pre-body
-// check and their end.
+// blobRetryAfter is the retry_after of an upload refused for other
+// uploads' reservations (as for want of a transfer slot).
+const blobRetryAfter = 2
+
+// blobReservations are the uploads of this process that hold a transfer
+// slot.
 type blobReservations struct {
 	mu      sync.Mutex
 	mailbox map[string]int64    // bytes, by mailbox
@@ -62,56 +74,90 @@ func (s *Server) blobRoom(da *depositAuth) int64 {
 	return s.cfg.MailboxMaxBlobBytes - s.cfg.MaxBlobBytes
 }
 
-// overBlobQuota is the quota an upload of size would exceed, given u and
-// the reservations (b.mu held); "" if none. The order is the store's.
-func (s *Server) overBlobQuotaLocked(da *depositAuth, u store.BlobUsage, size int64) store.QuotaKind {
-	b := s.blobRes
-	mbx, sk, tk := da.mailbox.ID, da.mailbox.ID+"\x00"+da.claims.Sub, da.mailbox.ID+"\x00"+da.claims.Jti
-	sr := b.sender[sk]
+// blobCheck is an upload's pre-body check: what the store held when it was
+// made, for the re-check when the upload reserves.
+type blobCheck struct {
+	da    *depositAuth
+	size  int64
+	usage store.BlobUsage
+	jti   string // the token's jti if it has a byte quota, else ""
+}
+
+// overLocked is the quota an upload of c.size would exceed given the
+// stored usage and, with res, the reservations (b.mu held); "" if none.
+// The order is the store's.
+func (s *Server) overLocked(c *blobCheck, res bool) store.QuotaKind {
+	b, da, u := s.blobRes, c.da, c.usage
+	var rm, rt int64
+	var rs [2]int64
+	if res {
+		rm, rs, rt = b.mailbox[da.mailbox.ID], b.sender[da.mailbox.ID+"\x00"+da.claims.Sub], b.token[da.mailbox.ID+"\x00"+da.claims.Jti]
+	}
 	switch {
-	case u.MailboxBytes+b.mailbox[mbx]+size > s.blobRoom(da):
+	case u.MailboxBytes+rm+c.size > s.blobRoom(da):
 		return store.QuotaMailboxBlobs
-	case u.SenderBytes+sr[1]+size > s.cfg.SenderBlobBytes() || u.SenderBlobs+sr[0]+1 > s.cfg.MaxSenderBlobs:
+	case u.SenderBytes+rs[1]+c.size > s.cfg.SenderBlobBytes() || u.SenderBlobs+rs[0]+1 > s.cfg.MaxSenderBlobs:
 		return store.QuotaSenderBlobs
-	case da.claims.Quota != nil && da.claims.Quota.Bytes != nil && u.TokenBytes+b.token[tk]+size > *da.claims.Quota.Bytes:
+	case c.jti != "" && u.TokenBytes+rt+c.size > *da.claims.Quota.Bytes:
 		return store.QuotaToken
 	}
 	return ""
 }
 
-// reserveBlob is §5.3 step 8 for a blob upload before its body is read
-// (see above). On success the upload's declared size is reserved until
-// release is called; otherwise the answer is quota_exceeded with its
-// quota member (or internal).
-func (s *Server) reserveBlob(ctx context.Context, da *depositAuth, size int64) (release func(), e *apiError) {
-	jti := ""
-	if da.claims.Quota != nil && da.claims.Quota.Bytes != nil {
-		jti = da.claims.Jti
+// judgeLocked is the answer to c given the reservations (b.mu held): nil
+// if it fits; quota_exceeded if what is stored refuses it; rate_limited
+// if only other uploads' reservations do.
+func (s *Server) judgeLocked(c *blobCheck) *apiError {
+	if kind := s.overLocked(c, false); kind != "" {
+		return &apiError{code: CodeQuotaExceeded, quota: kind}
 	}
-	b := s.blobRes
-	var kind store.QuotaKind
+	if s.overLocked(c, true) != "" {
+		return &apiError{code: CodeRateLimited, retryAfter: blobRetryAfter}
+	}
+	return nil
+}
+
+// checkBlob is §5.3 step 8 for a blob upload before its body is read (see
+// above): nothing is reserved yet.
+func (s *Server) checkBlob(ctx context.Context, da *depositAuth, size int64) (*blobCheck, *apiError) {
+	c := &blobCheck{da: da, size: size}
+	if da.claims.Quota != nil && da.claims.Quota.Bytes != nil {
+		c.jti = da.claims.Jti
+	}
+	var e *apiError
 	for _, fresh := range []bool{false, true} { // a counter that runs high is recomputed once
-		u, err := s.blobs.BlobUsage(ctx, da.mailbox.ID, da.claims.Sub, jti, fresh)
+		u, err := s.blobs.BlobUsage(ctx, da.mailbox.ID, da.claims.Sub, c.jti, fresh)
 		if err != nil {
 			s.log.Error("blob usage lookup failed", "err", err)
 			return nil, fail(CodeInternal)
 		}
-		b.mu.Lock()
-		if kind = s.overBlobQuotaLocked(da, u, size); kind == "" {
-			break // b.mu still held
+		c.usage = u
+		s.blobRes.mu.Lock()
+		e = s.judgeLocked(c)
+		s.blobRes.mu.Unlock()
+		if e == nil || e.code != CodeQuotaExceeded {
+			break
 		}
-		b.mu.Unlock()
 	}
-	if kind != "" {
-		return nil, &apiError{code: CodeQuotaExceeded, quota: kind}
+	return c, e
+}
+
+// reserve re-checks c against the reservations and reserves its size, once
+// the upload holds its transfer slot; release gives it back.
+func (s *Server) reserve(c *blobCheck) (release func(), e *apiError) {
+	b := s.blobRes
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if e := s.judgeLocked(c); e != nil {
+		return nil, e
 	}
-	mbx, sk, tk := da.mailbox.ID, da.mailbox.ID+"\x00"+da.claims.Sub, da.mailbox.ID+"\x00"+da.claims.Jti
+	mbx, sk, tk := c.da.mailbox.ID, c.da.mailbox.ID+"\x00"+c.da.claims.Sub, c.da.mailbox.ID+"\x00"+c.da.claims.Jti
+	size, jti := c.size, c.jti
 	b.mailbox[mbx] += size
 	b.sender[sk] = [2]int64{b.sender[sk][0] + 1, b.sender[sk][1] + size}
 	if jti != "" {
 		b.token[tk] += size
 	}
-	b.mu.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {

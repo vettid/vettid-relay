@@ -14,7 +14,8 @@
 //	MB#<mailbox>  D#<kind>#<value> denylist entry: exp
 //	MB#<mailbox>  T#<jti>          token quota usage: msgs, bytes, exp
 //	MB#<mailbox>  X#<jti>          consumed one-shot open token: exp
-//	MB#<mailbox>  B#<ulid>         blob metadata: sz, exp, sender (body in S3)
+//	MB#<mailbox>  B#<ulid>         blob metadata: sz, cr, exp, snd (the uploading key; absent before 0.9.2); body in S3 at blobs/<mailbox>/<ulid>
+//	MB#<mailbox>  BS#<sender>      a sender's share of the mailbox's blobs (0.9.2): e_<ulid> = {s: size, e: exp} per blob, b (bytes), n (blobs), v; no TTL
 //	MB#<mailbox>  C#<claim id>     claim marker (counts toward the storage cap)
 //	CL#<claim id> CL               claim: mb, sz, exp, body
 //

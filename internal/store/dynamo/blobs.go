@@ -149,15 +149,25 @@ func liveShare(it item, now time.Time) (n, bytes int64) {
 
 // reconcileSender recomputes a sender's share of mailbox from its entries,
 // dropping those whose blob has expired or is gone (deleted without its
-// entry, or removed by TTL), and commits only if the item did not change
-// meanwhile (v). It reports whether it changed anything.
+// entry, or removed by TTL), and deleting the item once it lists none. It
+// commits only if the item did not change meanwhile (v), and recounts once
+// more if it did. It reports whether it changed anything.
 func (s *Store) reconcileSender(ctx context.Context, mailbox, sender string) (bool, error) {
+	for attempt := 0; ; attempt++ {
+		changed, raced, err := s.reconcileSenderOnce(ctx, mailbox, sender)
+		if !raced || attempt >= 1 {
+			return changed, err
+		}
+	}
+}
+
+func (s *Store) reconcileSenderOnce(ctx context.Context, mailbox, sender string) (changed, raced bool, err error) {
 	now := s.now()
 	out, err := s.cfg.DB.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: &s.cfg.Table, Key: key(mbPK(mailbox), senderSK(sender)), ConsistentRead: aws.Bool(true),
 	})
 	if err != nil || len(out.Item) == 0 {
-		return false, err
+		return false, false, err
 	}
 	entries := senderEntries(out.Item)
 	var keys []item
@@ -171,7 +181,7 @@ func (s *Store) reconcileSender(ctx context.Context, mailbox, sender string) (bo
 		n := min(100, len(keys))
 		got, err := s.batchGet(ctx, keys[:n])
 		if err != nil {
-			return false, err
+			return false, false, err
 		}
 		for sk, exp := range got {
 			exists[sk] = exp
@@ -188,8 +198,8 @@ func (s *Store) reconcileSender(ctx context.Context, mailbox, sender string) (bo
 		}
 		drop = append(drop, id)
 	}
-	if len(drop) == 0 && n == getN0(out.Item, "n") && sum == getN0(out.Item, "b") {
-		return false, nil
+	if len(drop) == 0 && n == getN0(out.Item, "n") && sum == getN0(out.Item, "b") && n > 0 {
+		return false, false, nil
 	}
 	cond := "attribute_not_exists(v)"
 	vals := item{}
@@ -225,9 +235,9 @@ func (s *Store) reconcileSender(ctx context.Context, mailbox, sender string) (bo
 		_, err = s.cfg.DB.UpdateItem(ctx, in)
 	}
 	if isCCF(err) {
-		return false, nil // changed meanwhile: leave it
+		return false, true, nil // changed meanwhile
 	}
-	return err == nil, err
+	return err == nil, false, err
 }
 
 func nilIfEmpty(v item) item {
@@ -293,6 +303,10 @@ func (s *Store) StageBlob(ctx context.Context, mailbox string, size int64, r io.
 	return &s3Staged{s: s, mailbox: mailbox, id: id, size: size}, nil
 }
 
+// ID implements store.StagedBlob: the id is the S3 key's, chosen at
+// staging.
+func (b *s3Staged) ID() string { return b.id }
+
 // Discard implements store.StagedBlob.
 func (b *s3Staged) Discard(ctx context.Context) error {
 	b.mu.Lock()
@@ -344,7 +358,7 @@ func (b *s3Staged) Commit(ctx context.Context, p store.BlobPut) (store.BlobInfo,
 		var cond []string
 		vals := item{
 			":ent": &types.AttributeValueMemberM{Value: item{"s": avN(p.Size), "e": avN(ms(info.ExpiresAt))}},
-			":t":   avN(ttlSec(info.ExpiresAt)), ":sz": avN(p.Size), ":one": avN(1),
+			":sz":  avN(p.Size), ":one": avN(1),
 		}
 		if p.SenderMaxBytes > 0 {
 			cond = append(cond, "(attribute_not_exists(b) OR b <= :qb)")
@@ -355,9 +369,12 @@ func (b *s3Staged) Commit(ctx context.Context, p store.BlobPut) (store.BlobInfo,
 			vals[":qn"] = avN(p.SenderMaxBlobs - 1)
 		}
 		u := &types.Update{
-			TableName:                 &s.cfg.Table,
-			Key:                       key(mbPK(p.Mailbox), senderSK(p.Sender)),
-			UpdateExpression:          aws.String("SET #e = :ent, ttl_s = :t ADD b :sz, n :one, v :one"),
+			TableName: &s.cfg.Table,
+			Key:       key(mbPK(p.Mailbox), senderSK(p.Sender)),
+			// No TTL: entries expire at different times, and a TTL could
+			// remove the item before its last blob. An item that lists no
+			// blob is deleted (DeleteBlob, reconcileSender).
+			UpdateExpression:          aws.String("SET #e = :ent ADD b :sz, n :one, v :one"),
 			ExpressionAttributeNames:  map[string]string{"#e": senderEntryPrefix + info.ID},
 			ExpressionAttributeValues: vals,
 		}
@@ -548,16 +565,30 @@ func (s *Store) DeleteBlob(ctx context.Context, mailbox, blobID string) error {
 	}
 	size := getN0(out.Attributes, "sz")
 	if snd := getS(out.Attributes, "snd"); snd != "" {
-		_, shareErr = s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		var up *dynamodb.UpdateItemOutput
+		up, shareErr = s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName:                 &s.cfg.Table,
 			Key:                       key(mbPK(mailbox), senderSK(snd)),
 			UpdateExpression:          aws.String("REMOVE #e ADD b :nb, n :nn, v :one"),
 			ConditionExpression:       aws.String("attribute_exists(#e)"),
 			ExpressionAttributeNames:  map[string]string{"#e": senderEntryPrefix + blobID},
 			ExpressionAttributeValues: item{":nb": avN(-size), ":nn": avN(-1), ":one": avN(1)},
+			ReturnValues:              types.ReturnValueUpdatedNew,
 		})
-		if isCCF(shareErr) {
+		switch {
+		case isCCF(shareErr):
 			shareErr = nil
+		case shareErr == nil && getN0(up.Attributes, "n") <= 0:
+			// It lists no blob any more: it goes (unless one was added
+			// meanwhile).
+			_, shareErr = s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+				TableName: &s.cfg.Table, Key: key(mbPK(mailbox), senderSK(snd)),
+				ConditionExpression:       aws.String("n <= :z"),
+				ExpressionAttributeValues: item{":z": avN(0)},
+			})
+			if isCCF(shareErr) {
+				shareErr = nil
+			}
 		}
 	}
 	return errors.Join(s3err, shareErr, s.adjust(ctx, mailbox, map[string]int64{"blob_bytes": -size}))
