@@ -66,7 +66,12 @@ type Config struct {
 	MailboxMaxMessages  int64 // RELAY_MAILBOX_MAX_MESSAGES
 	MailboxMaxBytes     int64 // RELAY_MAILBOX_MAX_BYTES
 	MailboxMaxBlobBytes int64 // RELAY_MAILBOX_MAX_BLOB_BYTES
-	MailboxMaxDenylist  int64 // RELAY_MAILBOX_MAX_DENYLIST
+	// RELAY_MAX_SENDER_BLOB_BYTES (0.9.2, §6.8): one sender key's share
+	// of a mailbox's blob storage, at most 2 × MaxBlobBytes; 0 (the
+	// default) is 2 × MaxBlobBytes (SenderBlobBytes).
+	MaxSenderBlobBytes int64
+	MaxSenderBlobs     int64 // RELAY_MAX_SENDER_BLOBS: how many blobs one sender key may hold in one mailbox
+	MailboxMaxDenylist int64 // RELAY_MAILBOX_MAX_DENYLIST
 
 	RotationGrace        time.Duration // RELAY_ROTATION_GRACE
 	MaxTokenLifetime     time.Duration // RELAY_MAX_TOKEN_LIFETIME
@@ -144,6 +149,16 @@ const MaxDynamoPayloadBytes = 380_000
 // BlobPaceWindow is the period of RELAY_BLOB_PACE_BYTES.
 const BlobPaceWindow = 5 * time.Second
 
+// SenderBlobBytes is one sender key's share of a mailbox's blob storage
+// (max_sender_blob_bytes, §6.8): MaxSenderBlobBytes, or 2 ×
+// MaxBlobBytes when that is 0.
+func (c Config) SenderBlobBytes() int64 {
+	if c.MaxSenderBlobBytes > 0 {
+		return c.MaxSenderBlobBytes
+	}
+	return 2 * c.MaxBlobBytes
+}
+
 // DepositBodyLimit is the most a deposit's JSON body may be: base64 of
 // the maximum payload plus headroom for {"payload":""} and whitespace.
 func (c Config) DepositBodyLimit() int64 {
@@ -194,6 +209,7 @@ func Defaults() Config {
 		MailboxMaxMessages:  10000,
 		MailboxMaxBytes:     32 << 20,
 		MailboxMaxBlobBytes: 64 << 20,
+		MaxSenderBlobs:      16,
 		MailboxMaxDenylist:  10000,
 
 		RotationGrace:        7 * 24 * time.Hour,
@@ -343,6 +359,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	i64("RELAY_MAILBOX_MAX_MESSAGES", &c.MailboxMaxMessages)
 	i64("RELAY_MAILBOX_MAX_BYTES", &c.MailboxMaxBytes)
 	i64("RELAY_MAILBOX_MAX_BLOB_BYTES", &c.MailboxMaxBlobBytes)
+	i64("RELAY_MAX_SENDER_BLOB_BYTES", &c.MaxSenderBlobBytes)
+	i64("RELAY_MAX_SENDER_BLOBS", &c.MaxSenderBlobs)
 	i64("RELAY_MAILBOX_MAX_DENYLIST", &c.MailboxMaxDenylist)
 
 	dur("RELAY_ROTATION_GRACE", &c.RotationGrace)
@@ -478,6 +496,16 @@ func (c Config) Validate() error {
 		// smaller.
 		if c.MaxBlobTransfersPerMailbox <= 0 || c.MaxBlobTransfersPerMailbox >= c.MaxConcurrentBlobTransfers {
 			errs = append(errs, errors.New("0 < RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX < RELAY_MAX_CONCURRENT_BLOB_TRANSFERS must hold"))
+		}
+		// A mailbox keeps one maximum blob's room for its owner's devices
+		// (§6.8): the cap must leave at least as much for everyone else.
+		if c.MailboxMaxBlobBytes < 2*c.MaxBlobBytes {
+			errs = append(errs, errors.New("RELAY_MAILBOX_MAX_BLOB_BYTES must be at least 2 × RELAY_MAX_BLOB_BYTES when blobs are enabled (one blob's room is kept for the owner's devices)"))
+		}
+		// A sender's share holds at least one blob of the maximum size and
+		// at most two (§6.8), in at least one blob.
+		if sb := c.SenderBlobBytes(); c.MaxSenderBlobBytes < 0 || sb < c.MaxBlobBytes || sb > 2*c.MaxBlobBytes || c.MaxSenderBlobs < 1 {
+			errs = append(errs, errors.New("RELAY_MAX_BLOB_BYTES <= RELAY_MAX_SENDER_BLOB_BYTES <= 2 × RELAY_MAX_BLOB_BYTES (0: 2 × RELAY_MAX_BLOB_BYTES) and RELAY_MAX_SENDER_BLOBS >= 1 must hold when blobs are enabled"))
 		}
 	}
 	// 0 is "no cap"; a cap below one message would refuse every deposit.

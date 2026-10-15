@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -51,6 +52,8 @@ type Store struct {
 	entropy io.Reader
 
 	tomb TombstonePolicy
+
+	stageDir string // where blob bodies are staged (StageBlob): the database file's directory
 }
 
 // Option configures a Store.
@@ -109,7 +112,8 @@ func Open(ctx context.Context, path string, opts ...Option) (*Store, error) {
 		return nil, err
 	}
 	r.SetMaxOpenConns(8)
-	s := &Store{w: w, r: r, now: time.Now, entropy: ulid.Monotonic(rand.Reader, 0)}
+	s := &Store{w: w, r: r, now: time.Now, entropy: ulid.Monotonic(rand.Reader, 0), stageDir: filepath.Dir(path)}
+	removeStaged(s.stageDir)
 	for _, o := range opts {
 		o(s)
 	}
@@ -463,7 +467,7 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 		}
 		if (lim.MailboxMaxMsgs > 0 && count+1 > lim.MailboxMaxMsgs) ||
 			(lim.MailboxMaxBytes > 0 && bytes+size > lim.MailboxMaxBytes) {
-			return Message{}, ErrQuota
+			return Message{}, ErrQuotaMailbox
 		}
 	}
 	if err := chargeToken(ctx, tx, mailbox, lim, 1, size); err != nil {
@@ -479,8 +483,9 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 	return m, tx.Commit()
 }
 
-// chargeToken adds usage to the token's counters and fails with ErrQuota if
-// its quota would be exceeded. Without a token quota it is a no-op.
+// chargeToken adds usage to the token's counters and fails with
+// ErrQuotaToken if its quota would be exceeded. Without a token quota it is
+// a no-op.
 func chargeToken(ctx context.Context, tx *sql.Tx, mailbox string, lim Limits, msgs, bytes int64) error {
 	if lim.TokenQuotaMsgs == nil && lim.TokenQuotaBytes == nil {
 		return nil
@@ -494,7 +499,7 @@ func chargeToken(ctx context.Context, tx *sql.Tx, mailbox string, lim Limits, ms
 	}
 	if (lim.TokenQuotaMsgs != nil && usedMsgs+msgs > *lim.TokenQuotaMsgs) ||
 		(lim.TokenQuotaBytes != nil && usedBytes+bytes > *lim.TokenQuotaBytes) {
-		return ErrQuota
+		return ErrQuotaToken
 	}
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO token_usage(mailbox_id, jti, msgs, bytes, expires_at) VALUES(?,?,?,?,?)

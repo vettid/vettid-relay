@@ -85,7 +85,8 @@ func TestRegister(t *testing.T) {
 	}
 	want := `{"mailbox_id":"` + p.mbx + `","limits":{"max_payload_bytes":262144,"message_ttl_seconds":1209600,"visibility_timeout_seconds":60,` +
 		`"max_token_lifetime_seconds":2592000,"open_token_max_lifetime_seconds":600,"max_claim_bytes":16384,"claim_ttl_seconds":900,` +
-		`"max_blob_bytes":8388608,"blob_ttl_seconds":604800}}` + "\n"
+		`"max_blob_bytes":8388608,"blob_ttl_seconds":604800,` +
+		`"max_mailbox_blob_bytes":67108864,"max_sender_blob_bytes":16777216,"max_sender_blobs":16}}` + "\n"
 	if string(b) != want {
 		t.Fatalf("register body:\n got %s\nwant %s", b, want)
 	}

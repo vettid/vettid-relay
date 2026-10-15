@@ -14,9 +14,9 @@ import (
 // together with blobs, against the creating mailbox's storage cap.
 
 // storedBytes is the live blob + claim storage attributed to a mailbox.
-func storedBytes(ctx context.Context, tx *sql.Tx, mailbox string, now time.Time) (int64, error) {
+func storedBytes(ctx context.Context, q querier, mailbox string, now time.Time) (int64, error) {
 	var used int64
-	err := tx.QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT (SELECT COALESCE(SUM(size),0) FROM blobs  WHERE mailbox_id=?1 AND expires_at>?2)
 		      + (SELECT COALESCE(SUM(size),0) FROM claims WHERE mailbox_id=?1 AND expires_at>?2)`,
 		mailbox, ms(now)).Scan(&used)
@@ -24,7 +24,7 @@ func storedBytes(ctx context.Context, tx *sql.Tx, mailbox string, now time.Time)
 }
 
 // PutClaim stores data for creator mailbox under a fresh random claim id,
-// failing with ErrQuota if the mailbox storage cap (maxStored > 0) would be
+// failing with ErrQuotaMailboxBlobs if the mailbox storage cap (maxStored > 0) would be
 // exceeded.
 func (s *Store) PutClaim(ctx context.Context, mailbox string, data []byte, ttl time.Duration, maxStored int64) (string, time.Time, error) {
 	tx, err := s.w.BeginTx(ctx, nil)
@@ -42,7 +42,7 @@ func (s *Store) PutClaim(ctx context.Context, mailbox string, data []byte, ttl t
 			return "", time.Time{}, err
 		}
 		if used+int64(len(data)) > maxStored {
-			return "", time.Time{}, ErrQuota
+			return "", time.Time{}, ErrQuotaMailboxBlobs
 		}
 	}
 	id := auth.NewClaimID()

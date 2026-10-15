@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -470,6 +471,54 @@ func TestMigrateFromV1(t *testing.T) {
 	}
 	if got, err := s.Lease(ctx, "old", 10, time.Minute); err != nil || len(got) != 1 || got[0].ID != m.ID || got[0].TokenJTI != "j1" {
 		t.Fatalf("v3 token_jti: %+v %v", got, err)
+	}
+}
+
+// A database of a 0.9.1 relay (schema v4), whose blob rows have an empty
+// sender (and older ones a real one), upgrades in place: rows without a
+// sender count against the mailbox's cap and no sender's share, and are
+// listed without one; staged bodies left by a stopped process go at Open.
+func TestMigrateFromV4BlobSenders(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "relay.db")
+	db, err := sql.Open("sqlite", dsn(path, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	far := time.Now().Add(time.Hour).UnixMilli()
+	if _, err := db.Exec(migrations[0] + migrations[1] + migrations[2] + migrations[3] + fmt.Sprintf(`; PRAGMA user_version=4;
+		INSERT INTO mailboxes(mailbox_id,pubkey,created_at) VALUES('a',x'00',0);
+		INSERT INTO blobs(blob_id,mailbox_id,size,created_at,expires_at,sender_sub,data) VALUES('01J00000000000000000000001','a',100,0,%d,'',x'00');
+		INSERT INTO blobs(blob_id,mailbox_id,size,created_at,expires_at,sender_sub,data) VALUES('01J00000000000000000000002','a',200,0,%d,'s1',x'00');`, far, far)); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	left := filepath.Join(dir, stagePrefix+"left-behind")
+	if err := os.WriteFile(left, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := os.Stat(left); !os.IsNotExist(err) {
+		t.Fatalf("staged body left behind: %v", err)
+	}
+	var v int
+	s.r.QueryRow("PRAGMA user_version").Scan(&v)
+	if v != schemaVersion {
+		t.Fatalf("user_version %d", v)
+	}
+	if u, err := s.BlobUsage(ctx, "a", "s1", "", false); err != nil || u != (BlobUsage{MailboxBytes: 300, SenderBytes: 200, SenderBlobs: 1}) {
+		t.Fatalf("usage %+v %v", u, err)
+	}
+	if u, _ := s.BlobUsage(ctx, "a", "s2", "", false); u.SenderBlobs != 0 {
+		t.Fatalf("an empty sender counted: %+v", u)
+	}
+	bs, _, used, err := s.ListBlobs(ctx, "a", "", 10)
+	if err != nil || len(bs) != 2 || bs[0].Sender != "" || bs[1].Sender != "s1" || used != 300 {
+		t.Fatalf("list %+v %d %v", bs, used, err)
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+
+	"github.com/vettid/vettid-relay/internal/store"
 )
 
 // Canonical error codes (spec §7.1, §6.8).
@@ -79,17 +81,27 @@ type errorBody struct {
 	Code       string `json:"code"`
 	Message    string `json:"message"`
 	RetryAfter int    `json:"retry_after,omitempty"`
+	// Quota (0.9.2, §7.1) says which quota a quota_exceeded answers:
+	// token, mailbox, mailbox_blobs or sender_blobs.
+	Quota string `json:"quota,omitempty"`
 }
 
 // apiError is returned by handler helpers and rendered by writeError.
 type apiError struct {
 	code       string
 	retryAfter int
+	quota      store.QuotaKind // with CodeQuotaExceeded
 }
 
 func (e *apiError) Error() string { return e.code }
 
 func fail(code string) *apiError { return &apiError{code: code} }
+
+// quotaFail is the quota_exceeded answer to a store quota error: its
+// quota member says which quota (none for a plain store.ErrQuota).
+func quotaFail(err error) *apiError {
+	return &apiError{code: CodeQuotaExceeded, quota: store.QuotaOf(err)}
+}
 
 // writeError renders the error body. Messages are fixed strings per code —
 // they never echo request content (no ids, keys, tokens or payloads).
@@ -101,7 +113,7 @@ func (s *Server) writeError(w http.ResponseWriter, e *apiError) {
 	if e.retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(e.retryAfter))
 	}
-	writeJSON(w, statusFor(e.code), errorBody{Code: e.code, Message: defaultMessages[e.code], RetryAfter: e.retryAfter})
+	writeJSON(w, statusFor(e.code), errorBody{Code: e.code, Message: defaultMessages[e.code], RetryAfter: e.retryAfter, Quota: string(e.quota)})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

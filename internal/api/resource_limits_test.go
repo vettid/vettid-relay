@@ -153,6 +153,7 @@ func TestOwnerRouteReplayRecordAfterMailboxLookup(t *testing.T) {
 func TestBlobByteBudget(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) {
 		c.MaxBlobBytes = 1000
+		c.MaxSenderBlobBytes = 1 << 20 // the byte budget, not the share (§6.8)
 		c.RateBlobBytesPerSec, c.RateBlobBytesBurst = 1, 2500
 	})
 	owner, sender := newPrincipal(1), newPrincipal(2)
@@ -497,7 +498,7 @@ func TestByteChargesRefundedWhenNothingIsStored(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) {
 		c.RateIPBytesPerSec, c.RateIPBytesBurst = 0.001, 3000
 		c.RateBlobBytesPerSec, c.RateBlobBytesBurst = 0.001, 2500
-		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 2000 // the claim below counts too
+		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 3000 // the claim below counts too; 1,000 kept for the owner's devices
 		c.MailboxMaxMessages = 1
 	})
 	owner, sender, thief := newPrincipal(1), newPrincipal(2), newPrincipal(3)
@@ -514,15 +515,27 @@ func TestByteChargesRefundedWhenNothingIsStored(t *testing.T) {
 	f.expectFrom(hostA, req{method: "PUT", path: "/v1/claim", body: make([]byte, 1000), signer: &owner}, 201, "")
 	f.expectFrom(hostA, req{method: "PUT", path: "/v1/claim", body: make([]byte, 1000), signer: &owner}, 429, CodeRateLimited)
 
-	// Blobs: one stored (1,000 of 2,500). An upload refused after its body
-	// arrived (here over the mailbox quota) keeps the bytes it sent
-	// charged: a trickle that ends in a refusal is not free.
-	blob := func() req {
-		return req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: make([]byte, 1000), signer: &sender, token: tok}
+	// Blobs: one stored (1,000 of 2,500). An upload refused over the
+	// mailbox's blob storage is refused before its body (0.9.2, §6.8) and
+	// charged nothing. An upload refused after its body arrived (here its
+	// signature) keeps the bytes it sent charged: a trickle that ends in a
+	// refusal is not free.
+	blob := func(signer principal) req {
+		return req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: make([]byte, 1000), signer: &signer, token: tok}
 	}
-	f.expectFrom(hostA, blob(), 201, "")
-	f.expectFrom(hostA, blob(), 429, CodeQuotaExceeded)
-	f.expectFrom(hostA, blob(), 429, CodeRateLimited) // 500 left
+	f.expectFrom(hostA, blob(sender), 201, "")
+	for i := 0; i < 5; i++ {
+		if e := f.expectFrom(hostA, blob(sender), 429, CodeQuotaExceeded); e.Quota != "mailbox_blobs" {
+			t.Fatalf("quota %q", e.Quota)
+		}
+	}
+	other := newPrincipal(4) // a mailbox with room
+	f.register(other)
+	toOther := func(signer principal) req {
+		return req{method: "PUT", path: "/v1/blob/" + other.mbx, body: make([]byte, 1000), signer: &signer, token: f.mint(other, sender, nil)}
+	}
+	f.expectFrom(hostA, toOther(thief), 401, CodeSignatureInvalid)
+	f.expectFrom(hostA, toOther(sender), 429, CodeRateLimited) // 500 left
 	key := rateKey(netip.MustParseAddr(hostA))
 	if ok, _ := f.s.blobByteLimit.AllowN(key, 500, f.clk.now()); !ok {
 		t.Fatal("the budget-refused upload was charged")
@@ -624,6 +637,7 @@ func TestStalledUploadKeepsWhatItSent(t *testing.T) {
 func TestBlobKeyBudget(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) {
 		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 1<<20
+		c.MaxSenderBlobBytes = 1 << 20 // these uploads test the byte budgets, not the share (§6.8)
 		c.RateBlobKeyBytesPerSec, c.RateBlobKeyBytesBurst = 0.001, 2000
 		c.RateBlobBytesPerSec, c.RateBlobBytesBurst = 0.001, 5000
 	})
@@ -672,6 +686,7 @@ func TestBlobKeyBudget(t *testing.T) {
 func TestForgedSubCannotDrainAKeyBudget(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) {
 		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 1<<20
+		c.MaxSenderBlobBytes = 1 << 20 // these uploads test the byte budgets, not the share (§6.8)
 		c.RateBlobKeyBytesPerSec, c.RateBlobKeyBytesBurst = 0.001, 2000
 	})
 	mallory, victim, friend := newPrincipal(1), newPrincipal(2), newPrincipal(3)
@@ -710,6 +725,7 @@ func TestForgedSubCannotDrainASenderBudget(t *testing.T) {
 func TestBlobKeyDebtRetryAfter(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) {
 		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 1<<20
+		c.MaxSenderBlobBytes = 1 << 20 // these uploads test the byte budgets, not the share (§6.8)
 		c.RateBlobKeyBytesPerSec, c.RateBlobKeyBytesBurst = 100, 1500
 	})
 	owner, sender := newPrincipal(1), newPrincipal(2)

@@ -7,7 +7,7 @@ import (
 )
 
 // schemaVersion is bumped with every migration appended to migrations.
-const schemaVersion = 4
+const schemaVersion = 5
 
 // migrations[i] upgrades the schema from version i to i+1.
 //
@@ -109,6 +109,15 @@ CREATE TABLE tombstones (
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX idx_tombstones_expiry ON tombstones(expires_at);
+`,
+	// v5 (protocol 0.9.2): each blob's sender key is kept again
+	// (sender_sub, written '' by the relay of protocol 0.9.0 and 0.9.1;
+	// such rows count against the mailbox's cap and no sender's share),
+	// for the per-sender share of a mailbox's blob storage (§6.8); and
+	// the owner's list of its blobs, in id order (POST /v1/blobs).
+	`
+CREATE INDEX idx_blobs_sender ON blobs(mailbox_id, sender_sub);
+CREATE INDEX idx_blobs_list   ON blobs(mailbox_id, blob_id);
 `,
 }
 

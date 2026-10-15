@@ -107,6 +107,11 @@ type Claims struct {
 	Jti   string
 	Scope string
 	Quota *Quota
+	// OwnerDevice (0.9.2, §5.2) is the owner_device claim: the issuing
+	// mailbox's owner minted the token for one of its own devices, whose
+	// blob uploads may use the room the relay keeps for them (§6.8). It
+	// is trusted because only the mailbox's own key signs its tokens.
+	OwnerDevice bool
 
 	SubKey ed25519.PublicKey // decoded Sub (nil for open tokens)
 }
@@ -123,6 +128,9 @@ type wireClaims struct {
 	Jti   *string `json:"jti"`
 	Scope *string `json:"scope"`
 	Quota *Quota  `json:"quota,omitempty"`
+	// OwnerDevice is kept raw so that any value but the literal true,
+	// null included, is told from an absent claim and refused.
+	OwnerDevice json.RawMessage `json:"owner_device,omitempty"`
 }
 
 // MaxJTILen bounds the jti claim (and denylist values).
@@ -145,6 +153,13 @@ func ParseClaims(m []byte) (Claims, error) {
 		return Claims{}, ErrTokenInvalid
 	}
 	c := Claims{Iss: *w.Iss, Sub: *w.Sub, Aud: *w.Aud, Jti: *w.Jti, Scope: *w.Scope, Quota: w.Quota}
+	switch string(w.OwnerDevice) {
+	case "": // absent
+	case "true":
+		c.OwnerDevice = true
+	default: // only true is valid (§5.2)
+		return Claims{}, ErrTokenInvalid
+	}
 	var err error
 	if c.Iat, err = time.Parse(time.RFC3339, *w.Iat); err != nil {
 		return Claims{}, ErrTokenInvalid
@@ -220,7 +235,8 @@ func ParseToken(token string, issuerPub ed25519.PublicKey) (Claims, error) {
 }
 
 // MintToken builds and signs claims as compact JSON in spec key order
-// (iss, sub, aud, iat, exp, jti, scope[, quota]); used by clients/tests.
+// (iss, sub, aud, iat, exp, jti, scope[, quota][, owner_device]); used by
+// clients/tests.
 func MintToken(priv ed25519.PrivateKey, c Claims) (string, error) {
 	iat, exp := c.Iat.UTC().Format(time.RFC3339), c.Exp.UTC().Format(time.RFC3339)
 	scope := c.Scope
@@ -228,6 +244,9 @@ func MintToken(priv ed25519.PrivateKey, c Claims) (string, error) {
 		scope = ScopeDeposit
 	}
 	w := wireClaims{Iss: &c.Iss, Sub: &c.Sub, Aud: &c.Aud, Iat: &iat, Exp: &exp, Jti: &c.Jti, Scope: &scope, Quota: c.Quota}
+	if c.OwnerDevice {
+		w.OwnerDevice = json.RawMessage("true")
+	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)

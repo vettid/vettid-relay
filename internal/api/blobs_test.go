@@ -90,24 +90,23 @@ func TestBlobLimitsAndAuth(t *testing.T) {
 	f.mustPutBlob(owner, sender, tok, make([]byte, 1000))
 	f.expectCode(req{method: "PUT", path: path, body: make([]byte, 1001), signer: &sender, token: tok}, 413, CodePayloadTooLarge)
 
-	// Chunked (no Content-Length): enforced while streaming.
-	hr := f.build(req{method: "PUT", path: path, signer: &sender, token: tok})
-	hr.Body = io.NopCloser(struct{ io.Reader }{bytes.NewReader(make([]byte, 5000))})
-	hr.ContentLength = -1
-	if code, b, _ := f.send(hr); code != 413 || !strings.Contains(string(b), CodePayloadTooLarge) {
-		t.Fatalf("chunked oversize: %d %s", code, b)
+	// Chunked (no Content-Length): refused unread (0.9.2: an upload must
+	// declare its length, §6.8), whatever its size.
+	for _, n := range []int{10, 5000} {
+		hr := f.build(req{method: "PUT", path: path, signer: &sender, token: tok})
+		hr.Body = io.NopCloser(struct{ io.Reader }{bytes.NewReader(make([]byte, n))})
+		hr.ContentLength = -1
+		if code, b, _ := f.send(hr); code != 400 || !strings.Contains(string(b), CodeBadRequest) {
+			t.Fatalf("chunked: %d %s", code, b)
+		}
 	}
 
 	// Authorization happens before the body is read: a revoked token gets
-	// token_revoked even when the (chunked) body is oversized.
+	// token_revoked even when the body is over the limit... of what the
+	// mailbox may still take.
 	rt := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "revoked-blob" })
 	f.revoke(owner, "jti", "revoked-blob")
-	hr = f.build(req{method: "PUT", path: path, signer: &sender, token: rt})
-	hr.Body = io.NopCloser(struct{ io.Reader }{bytes.NewReader(make([]byte, 5000))})
-	hr.ContentLength = -1
-	if code, b, _ := f.send(hr); code != 403 || !strings.Contains(string(b), CodeTokenRevoked) {
-		t.Fatalf("revoked chunked: %d %s", code, b)
-	}
+	f.expectCode(req{method: "PUT", path: path, body: make([]byte, 1000), signer: &sender, token: rt}, 403, CodeTokenRevoked)
 
 	// Tampered body: signature computed over different bytes.
 	signed := f.build(req{method: "PUT", path: path, body: []byte("original"), signer: &sender, token: tok})
@@ -122,15 +121,24 @@ func TestBlobLimitsAndAuth(t *testing.T) {
 	ghost := newPrincipal(9)
 	f.expectCode(req{method: "PUT", path: "/v1/blob/" + ghost.mbx, body: []byte("x"), signer: &sender, token: tok}, 404, CodeMailboxUnknown)
 
-	// Mailbox blob storage cap: 1000 stored; +1000 ok; +1000 over 2500.
-	f.mustPutBlob(owner, sender, tok, make([]byte, 1000))
-	f.expectCode(req{method: "PUT", path: path, body: make([]byte, 1000), signer: &sender, token: tok}, 429, CodeQuotaExceeded)
+	// Mailbox blob storage cap (2,500, of which 1,000 are kept for the
+	// owner's devices): 1,000 stored; +500 fits; one byte more does not.
+	s2 := newPrincipal(4)
+	t2 := f.mint(owner, s2, nil)
+	f.mustPutBlob(owner, s2, t2, make([]byte, 500))
+	if e := f.expectCode(req{method: "PUT", path: path, body: []byte("x"), signer: &s2, token: t2}, 429, CodeQuotaExceeded); !strings.Contains(string(e), `"quota":"mailbox_blobs"`) {
+		t.Fatalf("cap: %s", e)
+	}
 
-	// Token byte quota counts blob bytes.
+	// Token byte quota counts blob bytes (in a mailbox with room).
+	owner2 := newPrincipal(5)
+	f.register(owner2)
 	q := int64(600)
-	qt := f.mint(owner, sender, func(c *auth.Claims) { c.Jti = "bytes-quota"; c.Quota = &auth.Quota{Bytes: &q} })
-	f.mustPutBlob(owner, sender, qt, make([]byte, 400))
-	f.expectCode(req{method: "PUT", path: path, body: make([]byte, 300), signer: &sender, token: qt}, 429, CodeQuotaExceeded)
+	qt := f.mint(owner2, sender, func(c *auth.Claims) { c.Jti = "bytes-quota"; c.Quota = &auth.Quota{Bytes: &q} })
+	f.mustPutBlob(owner2, sender, qt, make([]byte, 400))
+	if e := f.expectCode(req{method: "PUT", path: "/v1/blob/" + owner2.mbx, body: make([]byte, 300), signer: &sender, token: qt}, 429, CodeQuotaExceeded); !strings.Contains(string(e), `"quota":"token"`) {
+		t.Fatalf("token quota: %s", e)
+	}
 }
 
 func TestBlobTTL(t *testing.T) {

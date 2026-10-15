@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,6 +61,30 @@ type Error struct {
 	Code       string `json:"code"`
 	Message    string `json:"message"`
 	RetryAfter int    `json:"retry_after"`
+	// Quota (protocol ≥ 0.9.2) says which quota a quota_exceeded
+	// answers: QuotaToken, QuotaMailbox, QuotaMailboxBlobs or
+	// QuotaSenderBlobs; empty from older relays.
+	Quota string `json:"quota,omitempty"`
+}
+
+// The quota member of a quota_exceeded error (RELAY-PROTOCOL 0.9.2 §7.1).
+// Only QuotaToken may be cured by a fresh token; the others are the
+// recipient mailbox's storage, which only its owner can free.
+const (
+	QuotaToken        = "token"         // the token's quota
+	QuotaMailbox      = "mailbox"       // the mailbox's message quota
+	QuotaMailboxBlobs = "mailbox_blobs" // the mailbox's blob storage cap
+	QuotaSenderBlobs  = "sender_blobs"  // this sender key's share of it
+)
+
+// QuotaOf returns the quota member of a quota_exceeded error ("" for any
+// other error, or a relay older than 0.9.2).
+func QuotaOf(err error) string {
+	var e *Error
+	if errors.As(err, &e) && e.Code == "quota_exceeded" {
+		return e.Quota
+	}
+	return ""
 }
 
 func (e *Error) Error() string { return fmt.Sprintf("relay: %d %s: %s", e.Status, e.Code, e.Message) }
@@ -73,10 +98,16 @@ func IsCode(err error, code string) bool {
 type request struct {
 	method, path, query string
 	body                []byte
-	token               string
-	contentType         string
-	header              http.Header
-	unsigned            bool // claim GETs are unauthenticated
+	// stream, if set, is the body instead of body: size bytes from its
+	// start, whose SHA-256 is streamHash (re-read from the start for
+	// every attempt).
+	stream      io.ReadSeeker
+	size        int64
+	streamHash  [32]byte
+	token       string
+	contentType string
+	header      http.Header
+	unsigned    bool // claim GETs are unauthenticated
 }
 
 // do sends a signed request, retrying 429/5xx/transport errors with
@@ -103,8 +134,10 @@ func (c *Client) do(ctx context.Context, r request) (*http.Response, error) {
 		}
 		lastErr = err
 		var e *Error
-		if errors.As(err, &e) && e.Status != http.StatusTooManyRequests && e.Status < 500 {
-			return nil, err // client errors are not retried
+		if errors.As(err, &e) && ((e.Status != http.StatusTooManyRequests && e.Status < 500) || e.Code == "quota_exceeded") {
+			// Client errors are not retried, nor is a quota (429 too):
+			// it stays exceeded until a token is renewed or storage freed.
+			return nil, err
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -134,11 +167,20 @@ func (c *Client) once(ctx context.Context, r request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	if r.body == nil {
+	bodyHash := auth.BodyHash(r.body)
+	switch {
+	case r.stream != nil:
+		if _, err := r.stream.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		req.Body, req.ContentLength = io.NopCloser(io.LimitReader(r.stream, r.size)), r.size
+		req.GetBody = nil
+		bodyHash = r.streamHash
+	case r.body == nil:
 		req.Body, req.ContentLength = http.NoBody, 0
 	}
 	if !r.unsigned {
-		auth.SetHeaders(req.Header, c.Key, r.method, req.URL.EscapedPath(), c.Now(), auth.BodyHash(r.body))
+		auth.SetHeaders(req.Header, c.Key, r.method, req.URL.EscapedPath(), c.Now(), bodyHash)
 	}
 	for k, v := range r.header {
 		req.Header[k] = v
@@ -192,6 +234,11 @@ type Limits struct {
 	ClaimTTLSeconds             int64  `json:"claim_ttl_seconds"`
 	MaxBlobBytes                *int64 `json:"max_blob_bytes,omitempty"`
 	BlobTTLSeconds              *int64 `json:"blob_ttl_seconds,omitempty"`
+	// Protocol ≥ 0.9.2, with blobs: a mailbox's blob storage cap, one
+	// sender key's share of it, and how many blobs it may hold there.
+	MaxMailboxBlobBytes *int64 `json:"max_mailbox_blob_bytes,omitempty"`
+	MaxSenderBlobBytes  *int64 `json:"max_sender_blob_bytes,omitempty"`
+	MaxSenderBlobs      *int64 `json:"max_sender_blobs,omitempty"`
 }
 
 // Registration is the register response.
@@ -215,6 +262,11 @@ type TokenOptions struct {
 	TTL   time.Duration // default 30 days (spec: ≤ 30 d standing, ≤ 5 min one-shot)
 	JTI   string        // default: random ULID-like id
 	Quota *auth.Quota
+	// OwnerDevice marks a token the mailbox owner mints for one of its
+	// own devices (owner_device, protocol 0.9.2 §5.2): the relay keeps
+	// room in the mailbox's blob storage for uploads under such tokens.
+	// Never set it on a token for anyone else.
+	OwnerDevice bool
 }
 
 // MintToken issues a deposit token for sender (base64 pubkey) to deposit
@@ -231,6 +283,7 @@ func (c *Client) MintToken(senderB64, audience string, o TokenOptions) (string, 
 	return auth.MintToken(c.Key, auth.Claims{
 		Iss: c.MailboxID(), Sub: senderB64, Aud: audience,
 		Iat: now, Exp: now.Add(o.TTL), Jti: o.JTI, Scope: auth.ScopeDeposit, Quota: o.Quota,
+		OwnerDevice: o.OwnerDevice,
 	})
 }
 
@@ -357,6 +410,87 @@ func (c *Client) PutBlob(ctx context.Context, mailboxID, token string, ciphertex
 	}
 	expires, _ = time.Parse(time.RFC3339, out.ExpiresAt)
 	return out.BlobID, expires, nil
+}
+
+// PutBlobFrom uploads size bytes of ciphertext read from body (from its
+// start) to mailboxID without holding them in memory: body is read once to
+// hash it for the request signature, then again (from the start, for each
+// attempt) as the request body, with its Content-Length (which the relay
+// requires, protocol 0.9.2). An upload refused for a quota is not retried
+// (QuotaOf tells which).
+func (c *Client) PutBlobFrom(ctx context.Context, mailboxID, token string, body io.ReadSeeker, size int64) (blobID string, expires time.Time, err error) {
+	if _, err := body.Seek(0, io.SeekStart); err != nil {
+		return "", time.Time{}, err
+	}
+	h := sha256.New()
+	if n, err := io.Copy(h, io.LimitReader(body, size)); err != nil {
+		return "", time.Time{}, err
+	} else if n != size {
+		return "", time.Time{}, fmt.Errorf("relayclient: blob body has %d bytes, not %d", n, size)
+	}
+	r := request{method: "PUT", path: "/v1/blob/" + mailboxID, stream: body, size: size, token: token, contentType: "application/octet-stream"}
+	h.Sum(r.streamHash[:0])
+	var out struct {
+		BlobID    string `json:"blob_id"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	if _, err = c.doJSON(ctx, r, &out); err != nil {
+		return "", time.Time{}, err
+	}
+	expires, _ = time.Parse(time.RFC3339, out.ExpiresAt)
+	return out.BlobID, expires, nil
+}
+
+// BlobEntry is one blob in the owner's list of its mailbox's blobs.
+type BlobEntry struct {
+	BlobID    string `json:"blob_id"`
+	Size      int64  `json:"size"`
+	Sender    string `json:"sender,omitempty"` // the uploading relay key, if the relay returns it
+	CreatedAt string `json:"created_at"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// BlobPage is one page of the owner's list.
+type BlobPage struct {
+	Blobs     []BlobEntry `json:"blobs"`
+	Next      string      `json:"next,omitempty"` // pass as after for the next page; empty on the last
+	UsedBytes int64       `json:"used_bytes"`     // what the mailbox's blob storage holds (claims included)
+	MaxBytes  int64       `json:"max_bytes"`      // its cap
+}
+
+// ListBlobs returns one page of this principal's mailbox's blobs, oldest
+// first (protocol ≥ 0.9.2, POST /v1/blobs): up to max (1–500; 0 for the
+// relay's default of 100) with ids after after ("" from the start). The
+// paging parameters travel in the signed body.
+func (c *Client) ListBlobs(ctx context.Context, after string, max int) (BlobPage, error) {
+	q := map[string]any{}
+	if after != "" {
+		q["after"] = after
+	}
+	if max > 0 {
+		q["max"] = max
+	}
+	body, _ := json.Marshal(q)
+	var out BlobPage
+	_, err := c.doJSON(ctx, request{method: "POST", path: "/v1/blobs", body: body}, &out)
+	return out, err
+}
+
+// AllBlobs walks every page of the list.
+func (c *Client) AllBlobs(ctx context.Context) ([]BlobEntry, error) {
+	var all []BlobEntry
+	after := ""
+	for {
+		p, err := c.ListBlobs(ctx, after, 500)
+		if err != nil {
+			return all, err
+		}
+		all = append(all, p.Blobs...)
+		if p.Next == "" {
+			return all, nil
+		}
+		after = p.Next
+	}
 }
 
 // GetBlob fetches a blob deposited to this principal's mailbox.

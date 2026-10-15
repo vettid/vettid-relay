@@ -302,3 +302,35 @@ func TestBlobEvictMinAgeConfig(t *testing.T) {
 		t.Fatal("0: expected an error")
 	}
 }
+
+// 0.9.2 (§6.8): a mailbox keeps one maximum blob's room for its owner's
+// devices, and a sender's share is between one and two maximum blobs, in
+// at least one blob.
+func TestBlobShareConfig(t *testing.T) {
+	d := Defaults()
+	if d.MailboxMaxBlobBytes != 64<<20 || d.SenderBlobBytes() != 16<<20 || d.MaxSenderBlobs != 16 {
+		t.Fatalf("defaults differ from README.md: %d %d %d", d.MailboxMaxBlobBytes, d.SenderBlobBytes(), d.MaxSenderBlobs)
+	}
+	c, err := Load(env(map[string]string{"RELAY_MAX_SENDER_BLOB_BYTES": "8388608", "RELAY_MAX_SENDER_BLOBS": "4", "RELAY_MAILBOX_MAX_BLOB_BYTES": "16777216"}))
+	if err != nil || c.SenderBlobBytes() != 8<<20 || c.MaxSenderBlobs != 4 || c.MailboxMaxBlobBytes != 16<<20 {
+		t.Fatalf("%+v %v", c, err)
+	}
+	if c, err := Load(env(map[string]string{"RELAY_MAX_BLOB_BYTES": "1000000"})); err != nil || c.SenderBlobBytes() != 2_000_000 {
+		t.Fatalf("share follows the blob size: %v %v", c.SenderBlobBytes(), err)
+	}
+	for _, bad := range []map[string]string{
+		{"RELAY_MAILBOX_MAX_BLOB_BYTES": "16777215"}, // less than two maximum blobs
+		{"RELAY_MAILBOX_MAX_BLOB_BYTES": "0"},
+		{"RELAY_MAX_SENDER_BLOB_BYTES": "8388607"},  // less than one blob
+		{"RELAY_MAX_SENDER_BLOB_BYTES": "16777217"}, // more than two
+		{"RELAY_MAX_SENDER_BLOB_BYTES": "-1"},
+		{"RELAY_MAX_SENDER_BLOBS": "0"},
+	} {
+		if _, err := Load(env(bad)); err == nil {
+			t.Errorf("%v: expected an error", bad)
+		}
+	}
+	if _, err := Load(env(map[string]string{"RELAY_BLOBS_ENABLED": "false", "RELAY_MAILBOX_MAX_BLOB_BYTES": "0", "RELAY_MAX_SENDER_BLOBS": "0"})); err != nil {
+		t.Fatalf("blobs off: %v", err)
+	}
+}

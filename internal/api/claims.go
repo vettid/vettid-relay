@@ -70,8 +70,8 @@ func (s *Server) handleClaimPut(w http.ResponseWriter, r *http.Request) {
 		s.refundBytes(limBytes, s.byteLimit, network, n)
 	}
 	switch {
-	case errors.Is(err, store.ErrQuota):
-		s.writeError(w, fail(CodeQuotaExceeded))
+	case errors.Is(err, store.ErrQuota): // the mailbox's blob storage
+		s.writeError(w, quotaFail(err))
 		return
 	case errors.Is(err, store.ErrNotFound): // deleted mid-request
 		s.writeError(w, fail(CodeMailboxUnknown))

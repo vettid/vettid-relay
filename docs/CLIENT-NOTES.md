@@ -162,7 +162,7 @@ uses two 0.3 features.
 | `replay_detected` | You resent an identical signed request. Re-sign with a new timestamp. |
 | `token_expired` / `token_invalid` | Refresh the token from the recipient. Check `aud` against the relay URL. |
 | `token_revoked` | Stop sending to this mailbox. Surface the error to the user. |
-| `429 quota_exceeded` | The recipient's mailbox is full or your token's quota is spent. Back off for a long time and notify. Don't treat it like `rate_limited`. |
+| `429 quota_exceeded` | The recipient's mailbox is full or your token's quota is spent. Back off for a long time and notify. Don't treat it like `rate_limited`. From 0.9.2 the body's `quota` says which: `token` (a fresh token may help), `mailbox`, `mailbox_blobs` or `sender_blobs` (only the mailbox's owner can free those: don't upload again until asked). |
 | `409 token_used` | The one-shot open token was already used. Ask the owner for a new invitation. |
 | `claim_unknown` | The claim expired or was already fetched (single fetch). Get a fresh claim id. |
 | `payload_too_large` | Use the claim-check blob flow (§7) or split at the E2E layer. |
@@ -181,9 +181,14 @@ a claim `GET`: the first response may have consumed the claim.
    plaintext.
 3. Upload with `PUT /v1/blob/{recipient_mailbox_id}`:
    - body: raw ciphertext
-   - headers: `Content-Type: application/octet-stream`, the same deposit
-     token, and a signature over SHA-256 of the ciphertext
+   - headers: `Content-Type: application/octet-stream`, `Content-Length`
+     (required from 0.9.2), the same deposit token, and a signature over
+     SHA-256 of the ciphertext
    - response: `{blob_id, expires_at}`
+   - the mailbox's blob storage (`max_mailbox_blob_bytes`) is shared by
+     every sender; yours is at most `max_sender_blob_bytes` in at most
+     `max_sender_blobs` blobs, and one maximum blob of it is kept for the
+     owner's own devices (tokens with `owner_device`)
 4. Deposit an ordinary message whose **E2E-encrypted** payload carries
    `{blob_id, key, content_hash, filename, mime, size}`. Filename and MIME
    type must never appear anywhere the relay can see them.
@@ -194,6 +199,10 @@ a claim `GET`: the first response may have consumed the claim.
 6. Blobs expire after `blob_ttl_seconds` (default 7 days), so fetch them
    promptly. Only the recipient mailbox's owner can fetch a blob. The
    sender can't read its own upload back.
+7. An owner lists its mailbox's blobs with `POST /v1/blobs` (body
+   `{after?, max?}`, signed; `next` continues) and deletes those it does
+   not expect, rather than waiting for them to expire with its storage
+   full.
 
 ## 8. Key rotation
 

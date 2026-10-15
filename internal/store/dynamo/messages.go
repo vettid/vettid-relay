@@ -106,7 +106,8 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 	size := int64(len(payload))
 	// A delta that can never fit fails like the SQLite store would: a used
 	// open token is reported first, then quota.
-	if (lim.MailboxMaxMsgs > 0 && 1 > lim.MailboxMaxMsgs) || (lim.MailboxMaxBytes > 0 && size > lim.MailboxMaxBytes) || overTokenQuota(lim, 1, size) {
+	overMailbox := (lim.MailboxMaxMsgs > 0 && 1 > lim.MailboxMaxMsgs) || (lim.MailboxMaxBytes > 0 && size > lim.MailboxMaxBytes)
+	if overMailbox || overTokenQuota(lim, 1, size) {
 		if lim.ConsumeJTI {
 			if used, err := s.IsConsumed(ctx, mailbox, lim.TokenJTI); err != nil {
 				return store.Message{}, err
@@ -114,7 +115,10 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 				return store.Message{}, store.ErrTokenUsed
 			}
 		}
-		return store.Message{}, store.ErrQuota
+		if overMailbox {
+			return store.Message{}, store.ErrQuotaMailbox
+		}
+		return store.Message{}, store.ErrQuotaToken
 	}
 	after := ""
 	reconciled := false
@@ -177,8 +181,8 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 		switch {
 		case reasonCode(r, useIdx) == ccf:
 			return store.Message{}, store.ErrTokenUsed
-		case reasonCode(r, tokIdx) == ccf:
-			return store.Message{}, store.ErrQuota
+		case reasonCode(r, tokIdx) == ccf && reasonCode(r, 0) != ccf:
+			return store.Message{}, store.ErrQuotaToken
 		case reasonCode(r, 0) == ccf:
 			old := r[0].Item
 			if err := deadOrRevoked(old, now, lim.TokenIssuedAt); err != nil {
@@ -198,7 +202,7 @@ func (s *Store) Deposit(ctx context.Context, mailbox, senderSub string, payload 
 					continue
 				}
 			}
-			return store.Message{}, store.ErrQuota
+			return store.Message{}, store.ErrQuotaMailbox
 		case reasonCode(r, 1) == ccf:
 			after = id // ULID collision (practically impossible)
 			continue

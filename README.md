@@ -112,15 +112,17 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_MESSAGE_TTL` | `336h` (14 d) | Lifetime of an unacked message (`message_ttl_seconds`). An expired message is never delivered, but with the DynamoDB store its item stays stored until DynamoDB's TTL deletes it, typically within a few days of expiry. |
 | `RELAY_VISIBILITY_TIMEOUT` | `60s` | Lease length for collected, unacked messages (`visibility_timeout_seconds`). |
 | `RELAY_BLOBS_ENABLED` | `true` | Serve `/v1/blob` (§6.8) and advertise blob limits at registration. |
-| `RELAY_MAX_BLOB_BYTES` | `8388608` | Max blob size (`max_blob_bytes`), enforced while streaming. |
+| `RELAY_MAX_BLOB_BYTES` | `8388608` | Max blob size (`max_blob_bytes`). An upload must declare its length (`Content-Length`, else `400 bad_request`); a declared length over this is refused unread (`413`). |
 | `RELAY_BLOB_TTL` | `168h` (7 d) | Blob lifetime (`blob_ttl_seconds`). |
-| `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` | `8` | Concurrent blob uploads plus downloads, per relay process. Each can hold up to `max_blob_bytes` in memory. Uploads may use all but `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` of them (6 by default): the rest are kept for downloads. An upload takes its slot only once its body has begun to arrive. Beyond it, `429 rate_limited` with `retry_after` 2. |
+| `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS` | `8` | Concurrent blob uploads plus downloads, per relay process. An upload streams to the store and holds a buffer (tens of KiB); a download from S3 streams too, one from the SQLite store holds its blob (up to `max_blob_bytes`). Uploads may use all but `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` of them (6 by default): the rest are kept for downloads. An upload takes its slot only once its body has begun to arrive. Beyond it, `429 rate_limited` with `retry_after` 2. |
 | `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` | `2` | Uploads to one mailbox, and separately downloads by its owner, at a time per process; besides, one sender key has at most one upload to a mailbox at a time. Senders therefore can't keep an owner from its blobs. At least 1 and less than `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS`. Beyond it, `429 rate_limited` with `retry_after` 2. |
 | `RELAY_BLOB_EVICT_MIN_AGE` | `30s` | When a new upload finds no upload slot free (in the process, or in its mailbox), one upload is cut off and the new one takes its slot. It must be *evictable*: older than 5 s (one pace window), from another network than the newcomer's (IPv4 address or IPv6 /48), and older than this or from a network that has held upload slots for this long (gaps under this long with no slot don't reset the clock). Of those, the one with the fewest bytes received over the last 10 s goes; of nearly equal speeds, the one from the network holding the most slots. It is answered `429 rate_limited` with `retry_after` 2 and the connection closed, and its sent bytes stay charged. If none is evictable, the new upload is refused as before. Counted as `blob_evicted`. |
 | `RELAY_BLOB_PACE_BYTES` | `16384` | A blob body, up or down, must move at least this many bytes in every 5 s, or the transfer is dropped (an upload is answered `400` with the connection closed) and its slot freed. No transfer takes longer than 5 minutes (an 8 MiB blob needs 28 KiB/s). |
 | `RELAY_MAILBOX_MAX_MESSAGES` | `10000` | Per-mailbox cap on stored messages (`quota_exceeded`). |
 | `RELAY_MAILBOX_MAX_BYTES` | `33554432` (32 MiB) | Per-mailbox cap on stored payload bytes (`quota_exceeded`); `0` means no cap. At least `RELAY_MAX_PAYLOAD_BYTES`. A mailbox that already holds more (the default was 128 MiB) keeps its messages and is collected as before; deposits to it are refused until acks or expiry bring it under the cap. |
-| `RELAY_MAILBOX_MAX_BLOB_BYTES` | `67108864` | Per-mailbox storage cap (§8.8, §6.9). It counts blobs deposited to the mailbox plus claims the mailbox created. |
+| `RELAY_MAILBOX_MAX_BLOB_BYTES` | `67108864` | Per-mailbox storage cap (`max_mailbox_blob_bytes`, §6.8, §6.9). It counts blobs deposited to the mailbox plus claims the mailbox created. `RELAY_MAX_BLOB_BYTES` of it is kept for uploads under the owner's device tokens (`owner_device`, §5.2): any other upload is refused (`quota_exceeded`, `quota: "mailbox_blobs"`) when it would leave less free; device-token uploads and the owner's claims may use the whole cap. With blobs enabled, at least 2 × `RELAY_MAX_BLOB_BYTES`. |
+| `RELAY_MAX_SENDER_BLOB_BYTES` | `0` (2 × `RELAY_MAX_BLOB_BYTES`, 16 MiB) | One sender key's share of a mailbox's blob storage (`max_sender_blob_bytes`, §6.8): between `RELAY_MAX_BLOB_BYTES` and twice it. Over it, `quota_exceeded` with `quota: "sender_blobs"`. |
+| `RELAY_MAX_SENDER_BLOBS` | `16` | How many blobs one sender key may hold in one mailbox (`max_sender_blobs`), so that tiny blobs can't fill the mailbox's list. Over it, `quota_exceeded` with `quota: "sender_blobs"`. |
 | `RELAY_MAILBOX_MAX_DENYLIST` | `10000` | Per-mailbox cap on live denylist entries. |
 | `RELAY_ROTATION_GRACE` | `168h` (7 d) | How long a rotated-away mailbox keeps collecting before deletion (§6.7). |
 | `RELAY_MAX_TOKEN_LIFETIME` | `720h` (30 d) | `max_token_lifetime_seconds` (§5.2). Sender-bound tokens with `exp − iat` above this are `token_invalid`. It also bounds denylist retention (§5.5). Any positive duration is accepted, for example `9600h` (400 d) for long-lived, low-quota reconnect tokens. |
@@ -201,6 +203,14 @@ version does not protect against. In short:
   for hundreds of members. Refusals are counted as `blob_slots`,
   `blob_mailbox_slots` and `blob_sender_slots`, cut-off uploads as
   `blob_evicted`.
+- **Blob storage per mailbox** (0.9.2, §6.8): an upload is checked
+  before its body is read, on its declared length, against the mailbox's
+  cap less the room kept for the owner's devices, the sender's share
+  (16 MiB in at most 16 blobs) and the token's byte quota, counting the
+  uploads of the process still in progress; refused with
+  `quota_exceeded` (its `quota` member says which) and `Connection:
+  close`, holding no slot and charged nothing. The commit checks again,
+  atomically, what was stored.
 - **Refunds.** A deposit or claim charged to a byte budget and then not
   stored gets its charge back, so a sender retrying against a full
   mailbox doesn't drain its network's budget. A blob upload that held a
@@ -409,10 +419,16 @@ other process sees, refuses or is woken by.
   checked on every read; TTL only reclaims space. A message is one item
   (the payload as binary), so `RELAY_MAX_PAYLOAD_BYTES` is capped at
   380,000 with this store.
-- **Blob bodies** are S3 objects `blobs/<mailbox>/<blob id>`; metadata (size
-  and expiry; not the sender) and the storage quota are in DynamoDB. Give the bucket a lifecycle rule that
+- **Blob bodies** are S3 objects `blobs/<mailbox>/<blob id>`; metadata (size,
+  expiry and sender), the storage quota and each sender's share
+  (an item per sender and mailbox listing its blobs) are in DynamoDB. An
+  upload's body is streamed to S3 (one `PutObject` of the declared
+  length) before its metadata exists: until the commit nothing points at
+  it, and an upload that is not committed (signature, quota, failure,
+  eviction) has its object deleted. Give the bucket a lifecycle rule that
   expires objects a day after `RELAY_BLOB_TTL` (deleted or purged blobs are
-  removed directly).
+  removed directly; it also removes the object of an upload whose process
+  stopped between the body and the commit).
 - **Valkey** holds the replay cache (`SET NX PX`, 91 s), the rate-limit
   buckets (one GCRA script on Valkey's clock), and wake-on-deposit signals
   (sharded pub/sub). If Valkey is unreachable, signed requests are shed with
@@ -488,6 +504,7 @@ other process sees, refuses or is woken by.
 | `PUT /v1/blob/{mailbox_id}` | deposit token + signed by `sub` | `201 {blob_id, expires_at}` |
 | `GET /v1/blob/{blob_id}` | owner of the recipient mailbox | `200 application/octet-stream` |
 | `DELETE /v1/blob/{blob_id}` | owner | `204` (idempotent) |
+| `POST /v1/blobs` | owner; body `{after?, max?}` (signed, at most 1 KiB) | `200 {blobs:[{blob_id, size, sender, created_at, expires_at}], next?, used_bytes, max_bytes}`: the mailbox's blobs, oldest first, `max` 1–500 (default 100), continued with `after` = `next`. `sender` is absent for blobs stored before 0.9.2 |
 | `PUT /v1/claim` | signed by a registered mailbox key | `201 {claim_id, expires_at}` |
 | `GET /v1/claim/{claim_id}` | none (rate-limited) | `200 application/octet-stream`. Single fetch: the claim is deleted. |
 | `DELETE /v1/claim/{claim_id}` | the creating key | `204` (idempotent) |
@@ -496,7 +513,10 @@ other process sees, refuses or is woken by.
 | `GET /.well-known/assetlinks.json` | none (web bucket) | `200 application/json`: Android App Links statement for the VettID app |
 | `GET /robots.txt` | none (web bucket) | `200 text/plain` |
 
-Error bodies are `{"code", "message", "retry_after"?}`. HTTP statuses follow
+Error bodies are `{"code", "message", "retry_after"?}`, and a `quota_exceeded`
+body also carries `"quota"`: `token`, `mailbox` (the message quota),
+`mailbox_blobs` or `sender_blobs` (0.9.2, §7.1; a full denylist answers
+without one). HTTP statuses follow
 the spec's §7.1 table exactly, and a test parses the table from the spec to
 keep them in step:
 
@@ -544,7 +564,15 @@ keep them in step:
   route pattern only. A claim is fetched and deleted in one SQL statement,
   so concurrent fetches can't both succeed.
 - **Blobs.** Blob bytes are never parsed or logged. Storage is capped per
-  mailbox, and blob metadata (filename, type) never reaches the relay.
+  mailbox and per sender key in each mailbox, and blob metadata (filename,
+  type) never reaches the relay. An upload's body is streamed to the
+  store (a temporary file next to the SQLite database, or S3) while it is
+  hashed; the request signature is verified over that hash once the body
+  is whole, and only then is the blob committed. The share is counted by
+  the key that signed, so a token naming another key cannot store a blob
+  under it. The `owner_device` claim is trusted because a token verifies
+  only against the registered key of the mailbox it names (§5.3 step 2,
+  with `iss` equal to that mailbox).
 - **Cryptography.** Relay keys and deposit tokens stay Ed25519 / PASETO
   v4.public. Post-quantum migration of this layer is deliberately deferred
   (PQC-MIGRATION Phase 3). The relay never sees payload cryptography.
@@ -595,8 +623,33 @@ implementation chooses as follows:
 - **Blob storage.** With SQLite, blobs are kept in the database file (a
   separate table behind the `BlobStore` interface) rather than as files on
   disk, which §6.8 says SHOULD be used. This is deliberate: one file is the
-  entire state for replication. With DynamoDB, blob bodies are S3 objects,
-  outside the message store as §6.8 recommends.
+  entire state for replication. An upload's body is staged in a temporary
+  file next to the database while it arrives and read into the database
+  at the commit (one body at a time: the store has one writer); a blob is
+  loaded whole to be served, as §6.8 allows. With DynamoDB, blob bodies are
+  S3 objects, outside the message store as §6.8 recommends, streamed both
+  ways.
+- **Blob quotas before the body** (0.9.2, §6.8). §6.8 places the checks
+  "in §5.3 step 8, after the signature", but the signature covers the
+  body's hash and the checks must come before the body: so before the
+  body they are made for the token's `sub` (which the mailbox owner wrote),
+  after steps 1–6 and before the byte budgets (a refused upload is charged
+  nothing), and made again atomically at the commit, after the signature,
+  for the key that signed. A missing `Content-Length` is `bad_request`
+  before the token is looked at, like the size limit. When several
+  quotas are exceeded the answer names, in this order, `mailbox_blobs`,
+  `sender_blobs`, `token` (for deposits `mailbox`, then `token`): the
+  storage that only the owner can free before a token the sender may
+  renew. Uploads still in progress on the same process count with their
+  declared length. A full denylist's `quota_exceeded` carries no `quota`
+  member (none of the four fits).
+- **The owner's list** (`POST /v1/blobs`). An empty body is `{}`; `max` is
+  an integer from 1 to 500 written in canonical decimal and `after` a
+  blob id, anything else `bad_request` (not clamped); unknown members are
+  ignored. `created_at` is when the blob was committed (for DynamoDB
+  items from before 0.9.2, its id's time); `used_bytes` is what the cap is
+  checked against (with DynamoDB, the mailbox's counter, recomputed at
+  most once a minute on a first page).
 - **Revoked `jti` and `sub` values** are checked against the token's own
   claims. `sub` values are canonicalised (strict padded base64 of the
   32-byte key).
