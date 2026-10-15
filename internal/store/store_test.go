@@ -559,6 +559,46 @@ func TestStagingFoldersPerProcess(t *testing.T) {
 	}
 }
 
+// Stores starting at the same time in one folder never remove each
+// other's staging folders (each is locked before it can be found).
+func TestStagingFoldersConcurrentOpen(t *testing.T) {
+	dir := t.TempDir()
+	const n = 8
+	stores := make([]*Store, n)
+	staged := make([]StagedBlob, n)
+	var wg sync.WaitGroup
+	for round := 0; round < 3; round++ {
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				s, err := Open(ctx, filepath.Join(dir, fmt.Sprintf("r%d-%d.db", round, i)))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				stores[i] = s
+				if staged[i], err = s.StageBlob(ctx, "m", 1, bytes.NewReader([]byte("x"))); err != nil {
+					t.Error(err)
+				}
+			}(i)
+		}
+		wg.Wait()
+		if t.Failed() {
+			t.FailNow()
+		}
+		for i, s := range stores {
+			if n, _ := filepath.Glob(filepath.Join(s.stageDir, stagePrefix+"*")); len(n) != 1 {
+				t.Fatalf("round %d: store %d lost its staged body", round, i)
+			}
+		}
+		for i, s := range stores {
+			staged[i].Discard(ctx)
+			s.Close()
+		}
+	}
+}
+
 func TestClaims(t *testing.T) {
 	s, c := open(t)
 	mustRegister(t, s, "a", 1)

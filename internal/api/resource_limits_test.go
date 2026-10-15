@@ -348,16 +348,16 @@ func TestBlobTransferAccounting(t *testing.T) {
 	ok(s.acquireDownload("a"))
 	ok(s.acquireDownload("a"))
 	busy(s.acquireDownload("a")) // 2 per mailbox
-	ok(s.acquireUpload(f.newUpload("b", "x")))
-	ok(s.acquireUpload(f.newUpload("c", "x"))) // one per (mailbox, sender), not per sender
-	busy(s.acquireDownload("b"))               // 4 in the process
+	ok(s.acquireUpload(f.newUpload("b", "x"), nil))
+	ok(s.acquireUpload(f.newUpload("c", "x"), nil)) // one per (mailbox, sender), not per sender
+	busy(s.acquireDownload("b"))                    // 4 in the process
 	for _, r := range rel {
 		r()
 	}
 	rel = nil
-	ok(s.acquireUpload(f.newUpload("b", "x")))
-	ok(s.acquireUpload(f.newUpload("b", "y")))
-	busy(s.acquireUpload(f.newUpload("c", "z"))) // uploads: at most 4 − 2
+	ok(s.acquireUpload(f.newUpload("b", "x"), nil))
+	ok(s.acquireUpload(f.newUpload("b", "y"), nil))
+	busy(s.acquireUpload(f.newUpload("c", "z"), nil)) // uploads: at most 4 − 2
 	ok(s.acquireDownload("b"))
 	ok(s.acquireDownload("c"))
 	for _, r := range rel {

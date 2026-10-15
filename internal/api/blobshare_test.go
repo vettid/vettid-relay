@@ -1,12 +1,15 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"path/filepath"
@@ -488,6 +491,8 @@ type hookedBlobs struct {
 	store.BlobStore
 	stageErr, commitErr error
 	applyThenFail       error // the commit is applied, then fails with this
+	applyThenTimeout    bool  // the commit is applied, then runs out of time
+	deleteErr           error
 	commitIn            chan struct{}
 	commitGate          chan struct{} // the commit waits for it to close
 	commitCtxErr        atomic.Value
@@ -514,6 +519,13 @@ func (h *hookedBlobs) StageBlob(ctx context.Context, mailbox string, size int64,
 	return &hookedStaged{StagedBlob: st, h: h}, nil
 }
 
+func (h *hookedBlobs) DeleteBlob(ctx context.Context, mailbox, id string) error {
+	if h.deleteErr != nil {
+		return h.deleteErr
+	}
+	return h.BlobStore.DeleteBlob(ctx, mailbox, id)
+}
+
 type hookedStaged struct {
 	store.StagedBlob
 	h *hookedBlobs
@@ -531,6 +543,10 @@ func (s *hookedStaged) Commit(ctx context.Context, p store.BlobPut) (store.BlobI
 		}
 	}
 	info, err := s.StagedBlob.Commit(ctx, p)
+	if err == nil && s.h.applyThenTimeout {
+		<-ctx.Done()
+		return store.BlobInfo{}, ctx.Err()
+	}
 	if err == nil && s.h.applyThenFail != nil {
 		return store.BlobInfo{}, s.h.applyThenFail
 	}
@@ -688,4 +704,94 @@ func TestBlobListNeedsBlobs(t *testing.T) {
 	owner := newPrincipal(1)
 	f.register(owner)
 	f.expectCode(req{method: "POST", path: "/v1/blobs", body: []byte(`{}`), signer: &owner}, 404, CodeNotFound)
+}
+
+// Reservations do not keep honest uploads out: two trickling uploads
+// holding slots and reservations on a fullish mailbox are evictable once
+// old enough, and an honest upload from another network cuts one off,
+// takes its reservation at once and is stored. Whether the mailbox's
+// slots are full (the slot's victim frees the room) or not (an upload is
+// cut off for its reservation alone).
+func TestReservationsDoNotBlockEviction(t *testing.T) {
+	for name, perMailbox := range map[string]int{"mailbox slots full": 2, "mailbox slot free": 3} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixtureWith(t, func(c *config.Config) {
+				c.MaxConcurrentBlobTransfers, c.MaxBlobTransfersPerMailbox = 6, perMailbox
+				c.MaxBlobBytes, c.MailboxMaxBlobBytes = 100_000, 300_000 // peers: 200,000
+				c.TrustProxy = true
+			}, func(*fixture) []Option { return []Option{WithBlobPaceWindow(5 * time.Second)} })
+			owner, t1, t2, honest := newPrincipal(1), newPrincipal(11), newPrincipal(12), newPrincipal(13)
+			f.register(owner)
+			data := make([]byte, 100_000)
+			c1, c2 := dial(t, f), dial(t, f)
+			rawBlobPutVia(t, f, c1, "198.51.100.1", owner, t1, data, 20_000)
+			rawBlobPutVia(t, f, c2, "198.51.100.2", owner, t2, data, 20_000)
+			waitFor(t, func() bool { return f.s.xfers.inFlight() == 2 })
+			// Not yet evictable (younger than the grace): the honest upload
+			// is told to retry.
+			f.expectCode(blobReq(owner, honest, f.mint(owner, honest, nil), 100_000), 429, CodeRateLimited)
+			f.clk.add(40 * time.Second)
+			f.mustPutBlob(owner, honest, f.mint(owner, honest, nil), data)
+			// One trickle was cut off (429, retry_after 2); the other still holds.
+			cut := 0
+			for _, c := range []net.Conn{c1, c2} {
+				c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+				if resp, err := http.ReadResponse(bufio.NewReader(c), nil); err == nil {
+					if resp.StatusCode != 429 {
+						t.Fatalf("cut-off trickle: %d", resp.StatusCode)
+					}
+					cut++
+				}
+			}
+			if cut != 1 {
+				t.Fatalf("%d trickles cut off, want 1", cut)
+			}
+			if n := f.counter(`relay_ratelimit_refused_total{limiter="blob_evicted"}`); n != 1 {
+				t.Fatalf("evictions counted: %d", n)
+			}
+		})
+	}
+}
+
+// A commit that ran out of time after being applied is undone on a
+// context of its own; if that cleanup fails too, the body is kept, so no
+// counted blob is ever left without one.
+func TestBlobCommitTimeoutCleanup(t *testing.T) {
+	for _, deleteFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("delete fails %v", deleteFails), func(t *testing.T) {
+			f := newFixtureWith(t, nil, func(*fixture) []Option { return []Option{WithBlobCommitTimeout(300 * time.Millisecond)} })
+			if f.s3 == nil {
+				t.Skip("the SQLite store's commit either happens or not")
+			}
+			owner, sender := newPrincipal(1), newPrincipal(2)
+			f.register(owner)
+			hooks := &hookedBlobs{BlobStore: f.s.blobs, applyThenTimeout: true}
+			if deleteFails {
+				hooks.deleteErr = errors.New("table unreachable")
+			}
+			f.s.blobs = hooks
+			data := bytes.Repeat([]byte{3}, 5000)
+			f.expectCode(req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: data, signer: &sender, token: f.mint(owner, sender, nil)}, 500, CodeInternal)
+			f.s.blobs = hooks.BlobStore
+			waitFor(t, func() bool { return f.s.xfers.empty() && f.s.blobRes.empty() })
+			bs := f.listBlobs(owner, `{}`).Blobs
+			if n := f.leftovers(owner); n != 0 {
+				t.Fatalf("%d bodies without a blob", n)
+			}
+			if !deleteFails {
+				if len(bs) != 0 {
+					t.Fatalf("the applied commit was not undone: %+v", bs)
+				}
+				return
+			}
+			// The cleanup failed: the blob stands, with its body.
+			if len(bs) != 1 {
+				t.Fatalf("%d blobs", len(bs))
+			}
+			code, got, _ := f.send(f.build(req{method: "GET", path: "/v1/blob/" + bs[0].BlobID, signer: &owner}))
+			if code != 200 || !bytes.Equal(got, data) {
+				t.Fatalf("a committed blob without its body: %d", code)
+			}
+		})
+	}
 }

@@ -212,9 +212,15 @@ version does not protect against. In short:
   Uploads in progress on the process count too, but only those holding
   a transfer slot: an upload reserves its declared length when it takes
   its slot (re-checked then) and gives it back when it ends, so an
-  upload announced and never sent reserves nothing. One that fits what
-  is stored but not with others' reservations is answered `429
-  rate_limited` with `retry_after` 2 (they may yet fail). The commit
+  upload announced and never sent reserves nothing. Reservations don't
+  keep others out: one that stands in the way and belongs to an upload
+  that could be cut off (evictable, as for slots) is cut off when the
+  new upload takes its slot, and its reservation goes with it at once
+  (the fewest such, slowest first; nobody if that would not make room).
+  An upload that fits what is stored but not with the reservations of
+  uploads that cannot be cut off is answered `429 rate_limited` with
+  `retry_after` 2 (they may yet fail), holding no slot and charged
+  nothing. The commit
   checks again, atomically, what was stored; it runs to its end (30 s at
   most) even if the client has gone, and one that fails without a
   definite refusal is undone by deleting the blob by its id.
@@ -633,7 +639,9 @@ implementation chooses as follows:
   entire state for replication. An upload's body is staged in a temporary
   file in the process's own folder next to the database
   (`.relay-blob-staging-*`, locked while the process runs; folders whose
-  lock is free are removed at start) while it arrives and read into the database
+  lock is free are removed at start; this needs working file locks
+  (`flock`) on that filesystem: local disks, EFS and NFSv4 have them, and
+  without them the relay fails to start, not quietly) while it arrives and read into the database
   at the commit (one body at a time: the store has one writer); a blob is
   loaded whole to be served, as §6.8 allows. With DynamoDB, blob bodies are
   S3 objects, outside the message store as §6.8 recommends, streamed both

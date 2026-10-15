@@ -564,33 +564,7 @@ func (s *Store) DeleteBlob(ctx context.Context, mailbox, blobID string) error {
 		_, s3err = s.cfg.S3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.cfg.Bucket, Key: aws.String(blobKey(mailbox, blobID))})
 	}
 	size := getN0(out.Attributes, "sz")
-	if snd := getS(out.Attributes, "snd"); snd != "" {
-		var up *dynamodb.UpdateItemOutput
-		up, shareErr = s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-			TableName:                 &s.cfg.Table,
-			Key:                       key(mbPK(mailbox), senderSK(snd)),
-			UpdateExpression:          aws.String("REMOVE #e ADD b :nb, n :nn, v :one"),
-			ConditionExpression:       aws.String("attribute_exists(#e)"),
-			ExpressionAttributeNames:  map[string]string{"#e": senderEntryPrefix + blobID},
-			ExpressionAttributeValues: item{":nb": avN(-size), ":nn": avN(-1), ":one": avN(1)},
-			ReturnValues:              types.ReturnValueUpdatedNew,
-		})
-		switch {
-		case isCCF(shareErr):
-			shareErr = nil
-		case shareErr == nil && getN0(up.Attributes, "n") <= 0:
-			// It lists no blob any more: it goes (unless one was added
-			// meanwhile).
-			_, shareErr = s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-				TableName: &s.cfg.Table, Key: key(mbPK(mailbox), senderSK(snd)),
-				ConditionExpression:       aws.String("n <= :z"),
-				ExpressionAttributeValues: item{":z": avN(0)},
-			})
-			if isCCF(shareErr) {
-				shareErr = nil
-			}
-		}
-	}
+	shareErr = s.leaveShare(ctx, mailbox, getS(out.Attributes, "snd"), blobID, size)
 	return errors.Join(s3err, shareErr, s.adjust(ctx, mailbox, map[string]int64{"blob_bytes": -size}))
 }
 
@@ -676,4 +650,38 @@ func (s *Store) DeleteClaim(ctx context.Context, mailbox, claimID string) error 
 	}
 	s.releaseClaim(ctx, mailbox, claimID)
 	return nil
+}
+
+// leaveShare removes a deleted or expired blob from its sender's share
+// (nothing for a blob without a sender), and deletes the sender's item
+// once it lists no blob.
+func (s *Store) leaveShare(ctx context.Context, mailbox, snd, blobID string, size int64) error {
+	if snd == "" {
+		return nil
+	}
+	up, err := s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 &s.cfg.Table,
+		Key:                       key(mbPK(mailbox), senderSK(snd)),
+		UpdateExpression:          aws.String("REMOVE #e ADD b :nb, n :nn, v :one"),
+		ConditionExpression:       aws.String("attribute_exists(#e)"),
+		ExpressionAttributeNames:  map[string]string{"#e": senderEntryPrefix + blobID},
+		ExpressionAttributeValues: item{":nb": avN(-size), ":nn": avN(-1), ":one": avN(1)},
+		ReturnValues:              types.ReturnValueUpdatedNew,
+	})
+	switch {
+	case isCCF(err):
+		return nil
+	case err != nil || getN0(up.Attributes, "n") > 0:
+		return err
+	}
+	// It lists no blob any more: it goes (unless one was added meanwhile).
+	_, err = s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: &s.cfg.Table, Key: key(mbPK(mailbox), senderSK(snd)),
+		ConditionExpression:       aws.String("n <= :z"),
+		ExpressionAttributeValues: item{":z": avN(0)},
+	})
+	if isCCF(err) {
+		return nil
+	}
+	return err
 }

@@ -53,6 +53,7 @@ type Server struct {
 
 	smallBodyTimeout time.Duration // how long a small body has to arrive (handlers.go)
 	blobPaceWindow   time.Duration // period of cfg.BlobPaceBytes (blobs.go)
+	blobCommitWait   time.Duration // bound on an upload's commit, and apart on its cleanup (blobs.go)
 	claimLimit       RateLimiter   // unauthenticated claim GETs, per IPv4 / IPv6 /64
 	webLimit         RateLimiter   // everything outside /v1/ and /healthz, per IPv4 / IPv6 /64 (always in-process)
 
@@ -163,6 +164,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 
 		smallBodyTimeout: smallBodyTimeout,
 		blobPaceWindow:   config.BlobPaceWindow,
+		blobCommitWait:   blobCommitTimeout,
 		healthTO:         healthPingTimeout,
 		subLimit:         ratelimit.New(cfg.RateSenderPerSec, cfg.RateSenderBurst, 200_000),
 		claimLimit:       ratelimit.New(cfg.RateClaimPerSec, cfg.RateClaimBurst, 200_000),

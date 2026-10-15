@@ -139,8 +139,9 @@ type upload struct {
 	start                    time.Time // when its body began to be read (server clock)
 	now                      func() time.Time
 	state                    atomic.Int32
-	cut                      func() // interrupts its body read (a read deadline in the past)
-	released                 bool   // its slot is given up (under blobTransfers.mu)
+	cut                      func()       // interrupts its body read (a read deadline in the past)
+	released                 bool         // its slot is given up (under blobTransfers.mu)
+	res                      *reservation // its reserved length (blobquota.go; under blobReservations.mu), dropped with its slot
 
 	mu   sync.Mutex
 	secs [rateWindow]struct{ sec, n int64 } // bytes received, by second (a ring)
@@ -280,9 +281,16 @@ func (s *Server) victimLocked(newcomer *upload, inMailbox bool) *upload {
 // mailbox or the process has none free, the slowest evictable upload is
 // cut off and u takes its slot (it is answered 429 with retry_after; see
 // handleBlobPut). A sender's own upload to the mailbox is never cut off
-// for its next one to that mailbox. release frees the slot (nothing, if it
-// was taken away).
-func (s *Server) acquireUpload(u *upload) (release func(), e *apiError) {
+// for its next one to that mailbox.
+//
+// With c (blobquota.go), u also reserves its declared length, re-checked
+// now: if only other uploads' reservations stand in its way, the fewest
+// evictable uploads to its mailbox, slowest first, are cut off to make
+// room, their reservations dropped at once; if that cannot make room,
+// u is refused rate_limited (quota_exceeded over what is stored) and
+// nobody is cut off. release frees the slot and the reservation (nothing,
+// if they were taken away).
+func (s *Server) acquireUpload(u *upload, c *blobCheck) (release func(), e *apiError) {
 	b, per, all := s.xfers, s.cfg.MaxBlobTransfersPerMailbox, s.cfg.MaxConcurrentBlobTransfers
 	ks := u.senderKey()
 	b.mu.Lock()
@@ -290,9 +298,13 @@ func (s *Server) acquireUpload(u *upload) (release func(), e *apiError) {
 	if b.upSender[ks] >= 1 {
 		return nil, s.slotBusy(limBlobSenderSlots)
 	}
-	mailboxFull := b.upMbx[u.mailbox] >= per
-	if mailboxFull || b.up >= all-per || b.up+b.down >= all {
-		for {
+	res := s.blobRes
+	res.mu.Lock()
+	defer res.mu.Unlock()
+	for {
+		var planned []*upload
+		mailboxFull := b.upMbx[u.mailbox] >= per
+		if mailboxFull || b.up >= all-per || b.up+b.down >= all {
 			v := s.victimLocked(u, mailboxFull)
 			if v == nil {
 				if mailboxFull {
@@ -300,12 +312,25 @@ func (s *Server) acquireUpload(u *upload) (release func(), e *apiError) {
 				}
 				return nil, s.slotBusy(limBlobSlots)
 			}
-			if !v.state.CompareAndSwap(upReading, upEvicted) {
-				continue // it has just finished reading: look again
+			planned = append(planned, v)
+		}
+		if c != nil {
+			if planned, e = s.planLocked(c, planned); e != nil {
+				return nil, e
 			}
-			b.removeLocked(v) // frees a slot of the mailbox (if it was full) and of the process
+		}
+		raced := false
+		for _, v := range planned {
+			if !v.state.CompareAndSwap(upReading, upEvicted) {
+				raced = true // it has just finished reading: plan again
+				continue
+			}
+			b.removeLocked(v) // frees its slot (of the mailbox, and of the process)
+			res.dropLocked(v.res)
 			v.cut()
 			s.rl.refused.With(limBlobEvicted).Inc()
+		}
+		if !raced {
 			break
 		}
 	}
@@ -314,10 +339,16 @@ func (s *Server) acquireUpload(u *upload) (release func(), e *apiError) {
 	b.upSender[ks]++
 	b.uploads[u] = struct{}{}
 	s.takeNetLocked(u, s.now())
+	if c != nil {
+		u.res = res.addLocked(c)
+	}
 	return func() {
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		b.removeLocked(u)
+		res.mu.Lock()
+		res.dropLocked(u.res)
+		res.mu.Unlock()
 	}, nil
 }
 
@@ -495,7 +526,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// byte quota, on the declared length. Checked only: the length is
 	// reserved once the upload holds a transfer slot (blobquota.go). The
 	// store checks again at the commit, after the signature.
-	check, e := s.checkBlob(r.Context(), da, size)
+	check, e := s.checkBlob(r.Context(), da, size, evictionNetwork(clientIP(r, s.cfg.TrustProxy)))
 	if e != nil {
 		s.refuseUnread(w, r, e)
 		return
@@ -569,21 +600,15 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	release, e := s.acquireUpload(up)
-	if e != nil {
+	// The slot, and with it the reservation of its declared length,
+	// re-checked against the uploads that reserved meanwhile.
+	release, e := s.acquireUpload(up, check)
+	if e != nil { // it took no slot: charged nothing
 		s.refuseUnread(w, r, e)
 		return
 	}
 	defer release()
 	held = true
-	// Its declared length is reserved while it holds the slot, re-checked
-	// against the uploads that reserved meanwhile.
-	unreserve, e := s.reserve(check)
-	if e != nil {
-		s.refuseUnread(w, r, e)
-		return
-	}
-	defer unreserve()
 	body.r = io.MultiReader(bytes.NewReader(first[:n]), paced)
 	st, err := s.blobs.StageBlob(r.Context(), mailboxID, size, body)
 	if err == nil {
@@ -631,16 +656,23 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// Step 8, again, atomically. The commit is not cut short by the client
 	// going away: one cancelled mid-write could leave a counted blob whose
 	// body the deferred discard then deletes.
-	cctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), blobCommitTimeout)
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.blobCommitWait)
 	defer cancel()
 	info, err := staged.Commit(cctx, s.blobPut(da, sender, size))
 	if err != nil && !errors.Is(err, store.ErrQuota) && !errors.Is(err, store.ErrRevoked) && !errors.Is(err, store.ErrNotFound) {
 		// Not a definite refusal: the commit may have been applied after
-		// all. Deleting the blob by its id undoes it if so (idempotent).
+		// all (a timeout, say). Deleting the blob by its id undoes it if so
+		// (idempotent), on a context of its own: the commit's may be what
+		// ran out. If that fails too, the body is kept (no discard): it may
+		// back a committed blob, and the bucket's lifecycle rule removes it
+		// if nothing does.
 		if id := staged.ID(); id != "" {
-			if derr := s.blobs.DeleteBlob(cctx, mailboxID, id); derr != nil {
-				s.log.Error("blob cleanup after a failed commit failed", "err", derr)
+			dctx, dcancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.blobCommitWait)
+			if derr := s.blobs.DeleteBlob(dctx, mailboxID, id); derr != nil {
+				s.log.Error("blob cleanup after a failed commit failed; its body is kept", "err", derr)
+				staged = nil
 			}
+			dcancel()
 		}
 	}
 	switch {

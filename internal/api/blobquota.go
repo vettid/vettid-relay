@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"sort"
 	"sync"
 
 	"github.com/vettid/vettid-relay/internal/store"
@@ -27,9 +28,14 @@ import (
 // an upload reserves its length when it takes its slot, after its body
 // has begun to arrive, re-checked then, and gives it back when it ends.
 // So reservations are bounded by the slots and their pace, and an upload
-// announced but never sent reserves nothing. An upload that fits what is
-// stored but not with the reservations of others is told to retry
-// (rate_limited, retry_after), since those uploads may yet fail. The
+// announced but never sent reserves nothing. Reservations do not keep
+// others out either: the reservation of an upload that a newcomer could
+// cut off for its slot (evictable, blobs.go) does not refuse the newcomer
+// before its body, and when it takes its slot the fewest such uploads to
+// its mailbox, slowest first, are cut off and their reservations dropped
+// at once (nobody, if that would not make room). An upload that fits what
+// is stored but not with the reservations of uploads it cannot cut off is
+// told to retry (rate_limited, retry_after), since those may yet fail. The
 // store checks again, atomically with the commit, what was actually
 // stored (and is what holds across processes).
 //
@@ -75,23 +81,85 @@ func (s *Server) blobRoom(da *depositAuth) int64 {
 }
 
 // blobCheck is an upload's pre-body check: what the store held when it was
-// made, for the re-check when the upload reserves.
+// made, for the re-check when the upload takes its slot.
 type blobCheck struct {
-	da    *depositAuth
-	size  int64
-	usage store.BlobUsage
-	jti   string // the token's jti if it has a byte quota, else ""
+	da      *depositAuth
+	size    int64
+	usage   store.BlobUsage
+	jti     string // the token's jti if it has a byte quota, else ""
+	network string // the upload's eviction network (evictionNetwork)
+}
+
+func (c *blobCheck) keys() (mbx, sk, tk string) {
+	return c.da.mailbox.ID, c.da.mailbox.ID + "\x00" + c.da.claims.Sub, c.da.mailbox.ID + "\x00" + c.da.claims.Jti
+}
+
+// reservation is what one upload holding a slot has reserved (its
+// upload's res, under blobReservations.mu).
+type reservation struct {
+	mbx, sk, tk string
+	size        int64
+	token       bool // the token's bytes are reserved too
+	dropped     bool
+}
+
+// addLocked reserves c's size (b.mu held).
+func (b *blobReservations) addLocked(c *blobCheck) *reservation {
+	mbx, sk, tk := c.keys()
+	r := &reservation{mbx: mbx, sk: sk, tk: tk, size: c.size, token: c.jti != ""}
+	b.mailbox[mbx] += r.size
+	b.sender[sk] = [2]int64{b.sender[sk][0] + 1, b.sender[sk][1] + r.size}
+	if r.token {
+		b.token[tk] += r.size
+	}
+	return r
+}
+
+// dropLocked gives a reservation back (b.mu held); idempotent.
+func (b *blobReservations) dropLocked(r *reservation) {
+	if r == nil || r.dropped {
+		return
+	}
+	r.dropped = true
+	if b.mailbox[r.mbx] -= r.size; b.mailbox[r.mbx] <= 0 {
+		delete(b.mailbox, r.mbx)
+	}
+	if v := [2]int64{b.sender[r.sk][0] - 1, b.sender[r.sk][1] - r.size}; v[0] <= 0 {
+		delete(b.sender, r.sk)
+	} else {
+		b.sender[r.sk] = v
+	}
+	if r.token {
+		if b.token[r.tk] -= r.size; b.token[r.tk] <= 0 {
+			delete(b.token, r.tk)
+		}
+	}
 }
 
 // overLocked is the quota an upload of c.size would exceed given the
-// stored usage and, with res, the reservations (b.mu held); "" if none.
-// The order is the store's.
-func (s *Server) overLocked(c *blobCheck, res bool) store.QuotaKind {
+// stored usage and, with res, the reservations less those of the uploads
+// in without (blobReservations.mu held); "" if none. The order is the
+// store's.
+func (s *Server) overLocked(c *blobCheck, res bool, without []*upload) store.QuotaKind {
 	b, da, u := s.blobRes, c.da, c.usage
 	var rm, rt int64
 	var rs [2]int64
 	if res {
-		rm, rs, rt = b.mailbox[da.mailbox.ID], b.sender[da.mailbox.ID+"\x00"+da.claims.Sub], b.token[da.mailbox.ID+"\x00"+da.claims.Jti]
+		mbx, sk, tk := c.keys()
+		rm, rs, rt = b.mailbox[mbx], b.sender[sk], b.token[tk]
+		for _, w := range without {
+			if r := w.res; r != nil && !r.dropped {
+				if r.mbx == mbx {
+					rm -= r.size
+				}
+				if r.sk == sk {
+					rs[0], rs[1] = rs[0]-1, rs[1]-r.size
+				}
+				if r.token && r.tk == tk {
+					rt -= r.size
+				}
+			}
+		}
 	}
 	switch {
 	case u.MailboxBytes+rm+c.size > s.blobRoom(da):
@@ -104,23 +172,76 @@ func (s *Server) overLocked(c *blobCheck, res bool) store.QuotaKind {
 	return ""
 }
 
-// judgeLocked is the answer to c given the reservations (b.mu held): nil
-// if it fits; quota_exceeded if what is stored refuses it; rate_limited
-// if only other uploads' reservations do.
-func (s *Server) judgeLocked(c *blobCheck) *apiError {
-	if kind := s.overLocked(c, false); kind != "" {
+// judgeLocked is the answer to c given the reservations less those of
+// without (blobReservations.mu held): nil if it fits; quota_exceeded if
+// what is stored refuses it; rate_limited if only reservations do.
+func (s *Server) judgeLocked(c *blobCheck, without []*upload) *apiError {
+	if kind := s.overLocked(c, false, nil); kind != "" {
 		return &apiError{code: CodeQuotaExceeded, quota: kind}
 	}
-	if s.overLocked(c, true) != "" {
+	if s.overLocked(c, true, without) != "" {
 		return &apiError{code: CodeRateLimited, retryAfter: blobRetryAfter}
 	}
 	return nil
 }
 
+// reservingVictimsLocked are the uploads to c's mailbox whose reservation
+// a newcomer from c's network may take by cutting them off: evictable
+// (evictableLocked), still reading, holding a reservation, not in skip;
+// the slowest first (s.xfers.mu and s.blobRes.mu held).
+func (s *Server) reservingVictimsLocked(c *blobCheck, skip []*upload) []*upload {
+	now := s.now()
+	type cand struct {
+		u    *upload
+		rate float64
+	}
+	var cs []cand
+next:
+	for u := range s.xfers.uploads {
+		if u.mailbox != c.da.mailbox.ID || u.res == nil || u.res.dropped || u.state.Load() != upReading || !s.evictableLocked(u, c.network, now) {
+			continue
+		}
+		for _, k := range skip {
+			if k == u {
+				continue next
+			}
+		}
+		cs = append(cs, cand{u, u.rate(now)})
+	}
+	sort.Slice(cs, func(i, j int) bool { return cs[i].rate < cs[j].rate })
+	out := make([]*upload, len(cs))
+	for i, c := range cs {
+		out[i] = c.u
+	}
+	return out
+}
+
+// planLocked adds to planned (the uploads a newcomer will cut off) the
+// fewest reserving victims, slowest first, that make c fit, and returns
+// the answer with them left out (s.xfers.mu and s.blobRes.mu held).
+func (s *Server) planLocked(c *blobCheck, planned []*upload) ([]*upload, *apiError) {
+	e := s.judgeLocked(c, planned)
+	if e == nil || e.code != CodeRateLimited {
+		return planned, e
+	}
+	cands := s.reservingVictimsLocked(c, planned)
+	if s.judgeLocked(c, append(append([]*upload(nil), planned...), cands...)) != nil {
+		return planned, e // even cutting them all off would not do
+	}
+	for _, v := range cands {
+		planned = append(planned, v)
+		if s.judgeLocked(c, planned) == nil {
+			break
+		}
+	}
+	return planned, nil
+}
+
 // checkBlob is §5.3 step 8 for a blob upload before its body is read (see
-// above): nothing is reserved yet.
-func (s *Server) checkBlob(ctx context.Context, da *depositAuth, size int64) (*blobCheck, *apiError) {
-	c := &blobCheck{da: da, size: size}
+// above): nothing is reserved yet, and the reservations of uploads this
+// one could cut off when it takes its slot do not refuse it.
+func (s *Server) checkBlob(ctx context.Context, da *depositAuth, size int64, network string) (*blobCheck, *apiError) {
+	c := &blobCheck{da: da, size: size, network: network}
 	if da.claims.Quota != nil && da.claims.Quota.Bytes != nil {
 		c.jti = da.claims.Jti
 	}
@@ -132,52 +253,16 @@ func (s *Server) checkBlob(ctx context.Context, da *depositAuth, size int64) (*b
 			return nil, fail(CodeInternal)
 		}
 		c.usage = u
+		s.xfers.mu.Lock()
 		s.blobRes.mu.Lock()
-		e = s.judgeLocked(c)
+		_, e = s.planLocked(c, nil)
 		s.blobRes.mu.Unlock()
+		s.xfers.mu.Unlock()
 		if e == nil || e.code != CodeQuotaExceeded {
 			break
 		}
 	}
 	return c, e
-}
-
-// reserve re-checks c against the reservations and reserves its size, once
-// the upload holds its transfer slot; release gives it back.
-func (s *Server) reserve(c *blobCheck) (release func(), e *apiError) {
-	b := s.blobRes
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if e := s.judgeLocked(c); e != nil {
-		return nil, e
-	}
-	mbx, sk, tk := c.da.mailbox.ID, c.da.mailbox.ID+"\x00"+c.da.claims.Sub, c.da.mailbox.ID+"\x00"+c.da.claims.Jti
-	size, jti := c.size, c.jti
-	b.mailbox[mbx] += size
-	b.sender[sk] = [2]int64{b.sender[sk][0] + 1, b.sender[sk][1] + size}
-	if jti != "" {
-		b.token[tk] += size
-	}
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			b.mu.Lock()
-			defer b.mu.Unlock()
-			if b.mailbox[mbx] -= size; b.mailbox[mbx] <= 0 {
-				delete(b.mailbox, mbx)
-			}
-			if r := [2]int64{b.sender[sk][0] - 1, b.sender[sk][1] - size}; r[0] <= 0 {
-				delete(b.sender, sk)
-			} else {
-				b.sender[sk] = r
-			}
-			if jti != "" {
-				if b.token[tk] -= size; b.token[tk] <= 0 {
-					delete(b.token, tk)
-				}
-			}
-		})
-	}, nil
 }
 
 // blobPut is the commit's store.BlobPut for an upload authorized by da and

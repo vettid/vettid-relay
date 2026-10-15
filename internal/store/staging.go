@@ -1,8 +1,10 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -15,27 +17,36 @@ import (
 // removed).
 
 const (
-	stagingPrefix = ".relay-blob-staging-"
-	stagePrefix   = ".relay-blob-staged-" // the staged bodies inside it
-	stagingLock   = "lock"
+	stagingPrefix     = ".relay-blob-staging-"
+	stagingInitPrefix = ".relay-blob-init-"   // a staging folder not yet locked
+	stagePrefix       = ".relay-blob-staged-" // the staged bodies inside it
+	stagingLock       = "lock"
 )
 
 // openStaging creates this process's staging folder in dir, locks it and
-// removes stale ones.
+// removes stale ones. The folder is created under another name
+// (.relay-blob-init-*), locked, and only then renamed into view, so that
+// another process starting at the same time never finds it unlocked.
 func openStaging(dir string) (path string, lock *os.File, err error) {
-	path, err = os.MkdirTemp(dir, stagingPrefix)
+	tmp, err := os.MkdirTemp(dir, stagingInitPrefix)
 	if err != nil {
 		return "", nil, err
 	}
-	lock, err = os.OpenFile(filepath.Join(path, stagingLock), os.O_CREATE|os.O_RDWR, 0o600)
+	lock, err = os.OpenFile(filepath.Join(tmp, stagingLock), os.O_CREATE|os.O_RDWR, 0o600)
 	if err == nil && lockingSupported {
 		if ok, lerr := tryLock(lock); lerr != nil || !ok {
 			lock.Close()
-			err = os.ErrPermission
+			err = errors.Join(os.ErrPermission, lerr)
+		}
+	}
+	if err == nil {
+		path = filepath.Join(dir, stagingPrefix+strings.TrimPrefix(filepath.Base(tmp), stagingInitPrefix))
+		if err = os.Rename(tmp, path); err != nil {
+			lock.Close()
 		}
 	}
 	if err != nil {
-		os.RemoveAll(path)
+		os.RemoveAll(tmp)
 		return "", nil, err
 	}
 	others, _ := filepath.Glob(filepath.Join(dir, stagingPrefix+"*"))
@@ -44,12 +55,19 @@ func openStaging(dir string) (path string, lock *os.File, err error) {
 			removeIfStale(o)
 		}
 	}
+	// Folders a process left between creating and renaming them.
+	inits, _ := filepath.Glob(filepath.Join(dir, stagingInitPrefix+"*"))
+	for _, o := range inits {
+		if fi, err := os.Stat(o); err == nil && time.Since(fi.ModTime()) > time.Hour {
+			os.RemoveAll(o)
+		}
+	}
 	return path, lock, nil
 }
 
 // removeIfStale removes another process's staging folder if its lock is
-// free; a folder without a lock file is removed only once it is an hour
-// old (its process may be creating it).
+// free (a folder is renamed into view only once locked; one without a
+// lock file is removed once an hour old).
 func removeIfStale(dir string) {
 	f, err := os.OpenFile(filepath.Join(dir, stagingLock), os.O_RDWR, 0)
 	if err != nil {

@@ -648,11 +648,12 @@ func withZero(v item) item { v[":zero"] = avN(0); return v }
 // dropExpired deletes one expired item found while scanning a mailbox
 // (no counter change: callers recount or never counted it).
 func (s *Store) dropExpired(ctx context.Context, mailbox, sk string, now time.Time) error {
-	_, err := s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+	out, err := s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName:                 &s.cfg.Table,
 		Key:                       key(mbPK(mailbox), sk),
 		ConditionExpression:       aws.String("exp <= :now"),
 		ExpressionAttributeValues: item{":now": avN(ms(now))},
+		ReturnValues:              types.ReturnValueAllOld,
 	})
 	if err != nil && !isCCF(err) {
 		return err
@@ -660,9 +661,19 @@ func (s *Store) dropExpired(ctx context.Context, mailbox, sk string, now time.Ti
 	switch {
 	case strings.HasPrefix(sk, "M#"):
 		return s.deleteKey(ctx, mbPK(mailbox), leaseSK(strings.TrimPrefix(sk, "M#")))
-	case strings.HasPrefix(sk, "B#") && s.cfg.S3 != nil:
-		_, err := s.cfg.S3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.cfg.Bucket, Key: aws.String(blobKey(mailbox, strings.TrimPrefix(sk, "B#")))})
-		return err
+	case strings.HasPrefix(sk, "B#"):
+		id := strings.TrimPrefix(sk, "B#")
+		if out != nil && len(out.Attributes) > 0 {
+			// It leaves its sender's share with it (the counters are
+			// recounted by the caller).
+			if err := s.leaveShare(ctx, mailbox, getS(out.Attributes, "snd"), id, getN0(out.Attributes, "sz")); err != nil {
+				return err
+			}
+		}
+		if s.cfg.S3 != nil {
+			_, err := s.cfg.S3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.cfg.Bucket, Key: aws.String(blobKey(mailbox, id))})
+			return err
+		}
 	}
 	return nil
 }
