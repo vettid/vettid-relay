@@ -244,3 +244,166 @@ func TestEmptyHintsVersioning(t *testing.T) {
 		t.Fatalf("down: %v %v", left, err)
 	}
 }
+
+// The byte ceilings (§7.2 limits 11 and 12) are one bucket per network for
+// every process: two processes together cannot take more than its burst,
+// even charging concurrently.
+func TestByteLimiterShared(t *testing.T) {
+	cs := open(t, 2)
+	// 1 byte/s: nothing measurable refills while the test runs.
+	a, b := cs[0].ByteLimiter("bytes", 1, 10_000), cs[1].ByteLimiter("bytes", 1, 10_000)
+	if a.Burst() != 10_000 {
+		t.Fatal(a.Burst())
+	}
+	now := time.Now()
+	const net = "203.0.113.7"
+	if ok, _ := a.AllowN(net, 6_000, now); !ok {
+		t.Fatal("first charge")
+	}
+	ok, wait := b.AllowN(net, 6_000, now)
+	if ok || wait < 1000*time.Second { // 2,000 bytes short at 1 byte/s
+		t.Fatalf("over the shared burst on the other process: %v %v", ok, wait)
+	}
+	if ok, _ := b.AllowN(net, 4_000, now); !ok {
+		t.Fatal("the rest of the burst, on the other process")
+	}
+	if p := a.Peak(); p != 0.6 {
+		t.Fatalf("peak on a: %v", p)
+	}
+	if p := b.Peak(); p != 1 {
+		t.Fatalf("peak on b after a refusal: %v", p)
+	}
+	if ok, _ := a.AllowN("198.51.100.1", 10_000, now); !ok {
+		t.Fatal("other networks are independent")
+	}
+	if ok, wait := a.AllowN("192.0.2.9", 10_001, now); ok || wait < time.Second {
+		t.Fatalf("more than the burst: %v %v", ok, wait)
+	}
+
+	// Concurrent charges from both processes: exactly the burst.
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	took := 0
+	for i := 0; i < 40; i++ {
+		l := a
+		if i%2 == 1 {
+			l = b
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if ok, _ := l.AllowN("192.0.2.1", 500, time.Now()); ok {
+				mu.Lock()
+				took += 500
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if took != 10_000 {
+		t.Fatalf("concurrent charges over two processes took %d bytes of a 10,000 burst", took)
+	}
+}
+
+// Refunds are shared too, and never fill a bucket above its burst.
+func TestByteLimiterRefund(t *testing.T) {
+	cs := open(t, 2)
+	a, b := cs[0].ByteLimiter("bytes", 1, 10_000), cs[1].ByteLimiter("bytes", 1, 10_000)
+	now := time.Now()
+	const net = "203.0.113.8"
+	if ok, _ := a.AllowN(net, 10_000, now); !ok {
+		t.Fatal("charge")
+	}
+	b.Refund(net, 4_000) // given back on the other process
+	if ok, _ := a.AllowN(net, 4_001, now); ok {
+		t.Fatal("more than the refund")
+	}
+	if ok, _ := a.AllowN(net, 4_000, now); !ok {
+		t.Fatal("the refund, on the first process")
+	}
+	// A refund larger than what was charged, or to a fresh bucket, stops
+	// at the burst.
+	b.Refund(net, 1_000_000)
+	b.Refund("192.0.2.2", 1_000_000)
+	for _, k := range []string{net, "192.0.2.2"} {
+		if ok, _ := a.AllowN(k, 10_001, now); ok {
+			t.Fatalf("%s: a refund filled the bucket above its burst", k)
+		}
+		if ok, _ := a.AllowN(k, 10_000, now); !ok {
+			t.Fatalf("%s: the burst after a refund", k)
+		}
+		if ok, _ := b.AllowN(k, 1, now); ok {
+			t.Fatalf("%s: more than the burst after a refund", k)
+		}
+	}
+	b.Refund(net, 0)
+	b.Refund(net, -5)
+	if ok, _ := a.AllowN(net, 1, now); ok {
+		t.Fatal("a zero or negative refund gave something back")
+	}
+}
+
+// A forced charge (bytes already received) goes into debt; Ready, which
+// charges nothing, and AllowN then wait it out, on every process.
+func TestByteLimiterChargeAndReady(t *testing.T) {
+	cs := open(t, 2)
+	a, b := cs[0].ByteLimiter("bytes", 1000, 10_000), cs[1].ByteLimiter("bytes", 1000, 10_000)
+	now := time.Now()
+	const net = "203.0.113.9"
+	if ok, _ := b.Ready(net, now); !ok {
+		t.Fatal("a fresh bucket is ready")
+	}
+	if ok, _ := a.AllowN(net, 9_999, now); !ok {
+		t.Fatal("charge")
+	}
+	for i := 0; i < 3; i++ { // looking charges nothing
+		if ok, _ := b.Ready(net, now); !ok {
+			t.Fatal("one byte left: ready")
+		}
+	}
+	a.Charge(net, 15_000, now) // into debt: 15,000 - 1 bytes owed, plus the burst
+	if p := a.Peak(); p != 1 {
+		t.Fatalf("peak in debt: %v", p)
+	}
+	ok, wait := b.Ready(net, now)
+	if ok || wait < 14*time.Second || wait > 16*time.Second {
+		t.Fatalf("in debt of about 15,000 bytes at 1,000/s: %v %v", ok, wait)
+	}
+	if ok, _ := b.AllowN(net, 1, now); ok {
+		t.Fatal("a charge while in debt")
+	}
+	a.Charge(net, 0, now)
+	a.Charge(net, -1, now)
+	// A refund of a forced charge comes off the debt.
+	b.Refund(net, 15_000)
+	if ok, _ := a.Ready(net, now); !ok {
+		t.Fatal("ready again once the debt is refunded")
+	}
+}
+
+// If Valkey cannot be reached a per-process bucket of the same size
+// answers (as for the request limits): a process alone allows its burst,
+// keeps refunds and forced charges, and goes on answering.
+func TestByteLimiterFallsBackLocally(t *testing.T) {
+	c := open(t, 1)[0]
+	l := c.ByteLimiter("bytes", 1, 10_000)
+	c.Close()
+	now := time.Now()
+	if ok, _ := l.AllowN("k", 6_000, now); !ok {
+		t.Fatal("local fallback: first charge")
+	}
+	if ok, _ := l.AllowN("k", 6_000, now); ok {
+		t.Fatal("local fallback: over the burst")
+	}
+	l.Refund("k", 2_000)
+	if ok, _ := l.AllowN("k", 6_000, now); !ok {
+		t.Fatal("local fallback: refund")
+	}
+	l.Charge("k", 5_000, now)
+	if ok, _ := l.Ready("k", now); ok {
+		t.Fatal("local fallback: debt")
+	}
+	if p := l.Peak(); p != 1 {
+		t.Fatalf("local fallback: peak %v", p)
+	}
+}

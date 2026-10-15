@@ -46,8 +46,8 @@ type Server struct {
 	regLimit RateLimiter // new mailboxes per client network
 	rl       *limiterMetrics
 
-	byteLimit     ByteLimiter // bytes of deposits and claims, per client network (per process)
-	blobByteLimit ByteLimiter // bytes of blob uploads and downloads, per client network: the ceiling (per process)
+	byteLimit     ByteLimiter // bytes of deposits and claims, per client network: the ceiling (relay-wide with WithRateLimiters)
+	blobByteLimit ByteLimiter // bytes of blob uploads and downloads, per client network: the ceiling (relay-wide with WithRateLimiters)
 	blobKeyLimit  ByteLimiter // bytes of blob uploads and downloads, per authenticated key (per process)
 	keyByteLimit  ByteLimiter // bytes of deposits and claims, per authenticated key (per process); byteLimit is the network's ceiling
 

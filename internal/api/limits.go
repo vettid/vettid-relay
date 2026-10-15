@@ -32,7 +32,9 @@ import (
 // Two byte budgets per network bound what one network can make the relay
 // store and move, whatever number of keys and mailboxes it holds. They are
 // charged with a request's declared length (Content-Length) before its
-// body is read, and kept per process:
+// body is read. Shared (relay-wide, proposed for 0.9.4: with several
+// processes on one store, a per-process ceiling multiplied by the process
+// count could take the store's whole write capacity):
 //
 //	bytes       deposits (after §5.3 steps 1–6) and claims (after the
 //	            claim's signature verified).
@@ -75,8 +77,8 @@ const limWSNetworkHard = "ws_network_hard"
 
 var allLimiters = []string{limAddress, limKey, limSender, limRegister, limClaim, limWeb}
 
-// The byte budgets (per process): bytes and blob_bytes per network,
-// blob_key_bytes per authenticated key. They are reported after every
+// The byte budgets: bytes and blob_bytes per network (shared),
+// blob_key_bytes and key_bytes per authenticated key (per process). They are reported after every
 // other field of the "rate limits" line.
 const (
 	limBytes        = "bytes"

@@ -531,6 +531,84 @@ func TestMultiProcessKeyLimitShared(t *testing.T) {
 	}
 }
 
+// The byte budgets' network ceilings are relay-wide (§7.2 limits 11 and
+// 12, proposed 0.9.4): one network's deposits and blob uploads spread over
+// two processes draw on one bucket, not one per process.
+func TestMultiProcessByteCeilingsShared(t *testing.T) {
+	cl := newCluster(t,
+		// Deposits: a 3,000-byte payload is a body of about 4,0xx bytes;
+		// a 16,384-byte ceiling holds four, whichever process takes them.
+		"RELAY_MAX_PAYLOAD_BYTES=4096", "RELAY_MAX_CLAIM_BYTES=4096",
+		"RELAY_RATE_KEY_BYTES_PER_SEC=1", "RELAY_RATE_KEY_BYTES_BURST=16384",
+		"RELAY_RATE_IP_BYTES_PER_SEC=1", "RELAY_RATE_IP_BYTES_BURST=16384",
+		// Blobs: 6,000-byte uploads under a 25,000-byte ceiling: four.
+		"RELAY_MAX_BLOB_BYTES=10000",
+		"RELAY_RATE_BLOB_KEY_BYTES_PER_SEC=1", "RELAY_RATE_BLOB_KEY_BYTES_BURST=10000",
+		"RELAY_RATE_BLOB_BYTES_PER_SEC=1", "RELAY_RATE_BLOB_BYTES_BURST=25000",
+		"RELAY_RATE_SENDER_RPS=100", "RELAY_RATE_SENDER_BURST=100")
+	a, b := cl.start(), cl.start()
+	ctx := context.Background()
+	vault := principal(t, a.url)
+	vault.MaxAttempts = 1
+	if _, err := vault.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	count := func(what string, n int, try func(url string) error) int {
+		t.Helper()
+		ok := 0
+		for i := 0; i < n; i++ {
+			url := a.url
+			if i%2 == 1 {
+				url = b.url
+			}
+			switch err := try(url); {
+			case err == nil:
+				ok++
+			case client.IsCode(err, "rate_limited"):
+			default:
+				t.Fatalf("%s %d: %v", what, i, err)
+			}
+		}
+		return ok
+	}
+	payload := make([]byte, 3000)
+	deposits := count("deposit", 10, func(url string) error {
+		app := principal(t, url) // a fresh sender key each time: the network's ceiling binds
+		app.MaxAttempts = 1
+		tok, err := vault.MintToken(app.PublicKeyB64(), multiAud, client.TokenOptions{TTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = app.Deposit(ctx, vault.MailboxID(), tok, payload)
+		return err
+	})
+	if deposits != 4 {
+		t.Fatalf("16,384-byte ceiling over two processes took %d deposits of about 4,000 bytes (want 4)", deposits)
+	}
+	blob := make([]byte, 6000)
+	uploads := count("upload", 10, func(url string) error {
+		app := principal(t, url)
+		app.MaxAttempts = 1
+		tok, err := vault.MintToken(app.PublicKeyB64(), multiAud, client.TokenOptions{TTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = app.PutBlob(ctx, vault.MailboxID(), tok, blob)
+		return err
+	})
+	if uploads != 4 {
+		t.Fatalf("25,000-byte ceiling over two processes took %d uploads of 6,000 bytes (want 4)", uploads)
+	}
+	for _, p := range []*proc{a, b} {
+		if r := metric(t, p, `relay_ratelimit_refused_total{limiter="bytes"}`); r != 3 {
+			t.Fatalf("bytes refused on one process: %d (want 3 of the 6 refusals)", r)
+		}
+		if r := metric(t, p, `relay_ratelimit_refused_total{limiter="blob_bytes"}`); r != 3 {
+			t.Fatalf("blob_bytes refused on one process: %d (want 3 of the 6 refusals)", r)
+		}
+	}
+}
+
 // Mailbox deletion (protocol 0.5.0, §6.10) across processes: deleted on A,
 // the mailbox is gone on B at once — deposits and blob uploads refused even
 // though B has it cached, B's parked long-poll and WebSocket ended, B's

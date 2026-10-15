@@ -95,13 +95,15 @@ type Config struct {
 	RateWebPerSec      float64 // RELAY_RATE_WEB_RPS (everything outside /v1/ and /healthz)
 	RateWebBurst       int     // RELAY_RATE_WEB_BURST
 
-	// Byte budgets per network, per relay process. Charged with a
-	// request's declared length before its body is read.
+	// Byte budgets. Charged with a request's declared length before its
+	// body is read. The per-key budgets are per relay process; the
+	// network ceilings (RELAY_RATE_IP_BYTES_*, RELAY_RATE_BLOB_BYTES_*)
+	// are relay-wide when the processes share Valkey (proposed 0.9.4).
 	// Deposit and claim bytes, per authenticated key (the depositor's,
 	// once its signature verified; a claim's creator) ...
 	RateKeyBytesPerSec float64 // RELAY_RATE_KEY_BYTES_PER_SEC
 	RateKeyBytesBurst  int     // RELAY_RATE_KEY_BYTES_BURST
-	// ... and the ceiling over all keys of one network.
+	// ... and the ceiling over all keys of one network (relay-wide).
 	RateIPBytesPerSec float64 // RELAY_RATE_IP_BYTES_PER_SEC
 	RateIPBytesBurst  int     // RELAY_RATE_IP_BYTES_BURST
 	// Blob bytes (uploads and downloads), per authenticated key: the
@@ -109,7 +111,7 @@ type Config struct {
 	// host's vaults each have their own.
 	RateBlobKeyBytesPerSec float64 // RELAY_RATE_BLOB_KEY_BYTES_PER_SEC
 	RateBlobKeyBytesBurst  int     // RELAY_RATE_BLOB_KEY_BYTES_BURST
-	// The ceiling over all keys of one network.
+	// The ceiling over all keys of one network (relay-wide).
 	RateBlobBytesPerSec float64 // RELAY_RATE_BLOB_BYTES_PER_SEC
 	RateBlobBytesBurst  int     // RELAY_RATE_BLOB_BYTES_BURST
 
@@ -234,8 +236,8 @@ func Defaults() Config {
 
 		RateKeyBytesPerSec:     64 << 10,
 		RateKeyBytesBurst:      2 << 20,
-		RateIPBytesPerSec:      1 << 20,
-		RateIPBytesBurst:       32 << 20,
+		RateIPBytesPerSec:      768 << 10,
+		RateIPBytesBurst:       8 << 20,
 		RateBlobKeyBytesPerSec: 1 << 20,
 		RateBlobKeyBytesBurst:  32 << 20,
 		RateBlobBytesPerSec:    8 << 20,

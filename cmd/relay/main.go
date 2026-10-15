@@ -165,6 +165,11 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 				Sender:   vc.Limiter("sender", cfg.RateSenderPerSec, cfg.RateSenderBurst),
 				Register: vc.Limiter("register", cfg.RateRegisterPerSec, cfg.RateRegisterBurst),
 				Claim:    vc.Limiter("claim", cfg.RateClaimPerSec, cfg.RateClaimBurst),
+				// The network ceilings of the byte budgets (11, 12) are
+				// relay-wide: one network's budget against the shared
+				// store is the same however many processes run.
+				Bytes:     vc.ByteLimiter("bytes", cfg.RateIPBytesPerSec, cfg.RateIPBytesBurst),
+				BlobBytes: vc.ByteLimiter("blob_bytes", cfg.RateBlobBytesPerSec, cfg.RateBlobBytesBurst),
 			}),
 			api.WithWakeBus(bus),
 		)
