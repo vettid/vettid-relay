@@ -292,3 +292,13 @@ func TestResourceLimitConfig(t *testing.T) {
 		t.Fatalf("deposit body limit %d", got)
 	}
 }
+
+func TestBlobEvictMinAgeConfig(t *testing.T) {
+	c, err := Load(env(map[string]string{"RELAY_BLOB_EVICT_MIN_AGE": "45s"}))
+	if err != nil || c.BlobEvictMinAge != 45*time.Second {
+		t.Fatalf("%v %v", c.BlobEvictMinAge, err)
+	}
+	if _, err := Load(env(map[string]string{"RELAY_BLOB_EVICT_MIN_AGE": "0"})); err == nil {
+		t.Fatal("0: expected an error")
+	}
+}

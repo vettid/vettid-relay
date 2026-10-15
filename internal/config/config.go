@@ -58,6 +58,10 @@ type Config struct {
 	// RELAY_BLOB_PACE_BYTES: a blob body (up or down) must move at least
 	// this many bytes in every BlobPaceWindow, or the transfer is dropped.
 	BlobPaceBytes int64
+	// RELAY_BLOB_EVICT_MIN_AGE: when a new upload finds no upload slot
+	// free, the slowest upload that has run at least this long is cut off
+	// and the new one takes its slot.
+	BlobEvictMinAge time.Duration
 
 	MailboxMaxMessages  int64 // RELAY_MAILBOX_MAX_MESSAGES
 	MailboxMaxBytes     int64 // RELAY_MAILBOX_MAX_BYTES
@@ -185,6 +189,7 @@ func Defaults() Config {
 		MaxConcurrentBlobTransfers: 8,
 		MaxBlobTransfersPerMailbox: 2,
 		BlobPaceBytes:              16 << 10,
+		BlobEvictMinAge:            30 * time.Second,
 
 		MailboxMaxMessages:  10000,
 		MailboxMaxBytes:     32 << 20,
@@ -333,6 +338,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	integer("RELAY_MAX_CONCURRENT_BLOB_TRANSFERS", &c.MaxConcurrentBlobTransfers)
 	integer("RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX", &c.MaxBlobTransfersPerMailbox)
 	i64("RELAY_BLOB_PACE_BYTES", &c.BlobPaceBytes)
+	dur("RELAY_BLOB_EVICT_MIN_AGE", &c.BlobEvictMinAge)
 
 	i64("RELAY_MAILBOX_MAX_MESSAGES", &c.MailboxMaxMessages)
 	i64("RELAY_MAILBOX_MAX_BYTES", &c.MailboxMaxBytes)

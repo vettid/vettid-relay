@@ -98,6 +98,12 @@ const (
 	limBlobSenderSlots  = "blob_sender_slots"
 )
 
+// limBlobEvicted counts uploads cut off to give their slot to a newer one
+// (the slowest evictable upload: see evictableLocked and victimLocked in
+// blobs.go). It is a count in relay_ratelimit_refused_total, and the last
+// field of the "rate limits" line, blob_evicted.
+const limBlobEvicted = "blob_evicted"
+
 // ByteLimiter is a keyed byte budget: AllowN consumes n tokens (bytes), or
 // none and reports how long until n are available. Refund gives back a
 // charge for a request that stored or moved nothing; Ready reports whether
@@ -159,6 +165,7 @@ func newLimiterMetrics(reg *metrics.Registry) *limiterMetrics {
 	m.refused.With(limBlobSlots)
 	m.refused.With(limBlobMailboxSlots)
 	m.refused.With(limBlobSenderSlots)
+	m.refused.With(limBlobEvicted)
 	return m
 }
 
@@ -371,6 +378,9 @@ func (s *Server) reportLimits() {
 		attrs = append(attrs, "log_dropped", d-s.rl.lastLog[0], "log_suppressed", sup-s.rl.lastLog[1])
 		s.rl.lastLog = [2]int64{d, sup}
 	}
+	total := s.rl.refused.With(limBlobEvicted).Value()
+	attrs = append(attrs, "blob_evicted", total-s.rl.lastRef[limBlobEvicted])
+	s.rl.lastRef[limBlobEvicted] = total
 	// At info level every minute: this line is what the limits are sized
 	// from (how close a vault host is to the flood guard, how many
 	// collectors a process carries). One line a minute per process.
