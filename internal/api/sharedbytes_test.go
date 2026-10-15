@@ -18,6 +18,10 @@ import (
 // charges of TestByteChargesRefundedWhenNothingIsStored made across them.
 // Each instance has a store of its own; only the limits are shared.
 
+// The shared ceilings say which backend took a charge, so that a refund
+// goes back to it.
+var _ SourcedByteLimiter = (*coord.ByteLimiter)(nil)
+
 // sharedByteFixtures starts n relay instances whose byte ceilings share
 // one Valkey namespace (each through its own client, as separate
 // processes would), and returns them with their clients.

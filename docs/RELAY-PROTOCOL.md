@@ -998,22 +998,39 @@ does the same on its own mailbox.
   rate, about 17 s of that host's busiest steady traffic, and four of a
   key's bursts (a message to 300 connections each). *Proposed 0.9.4:* the
   ceiling is relay-wide, shared by every relay process, because it is
-  what one network can cost the shared store, and the deployment runs
-  several processes (2 to 8 in production) against one table capped at
-  2,000 write units a second. At about 1 KiB a write unit, 768 KiB/s is
-  about 790 write units a second, under 40% of the table, whatever the
-  number of processes, which leaves the rest to every other tenant; a
-  whole burst is about 8,200 write units once, about 4 s of the table.
-  (Counted more closely: a deposit is written in a transaction, which
-  DynamoDB bills twice, but stores the decoded payload, about three
-  quarters of the charged body, so about 1.5 units per charged KiB,
-  about 1,150 a second at the ceiling; if every message is also
-  collected and acked, the delete is billed by size once more, about
-  2.25 units per charged KiB, about 1,700 a second. Each message also
-  costs a few small writes whatever its size, bounded by the request
-  limits, not by this ceiling.) Per process, as before
-  0.9.4, the ceiling multiplied by the process count: two processes at
-  1 MiB/s already reached the table's ceiling. Charges are on the
+  part of what one network can cost the shared store, and the deployment
+  runs several processes (2 to 8 in production) against one table. Per
+  process, as before 0.9.4, it multiplied by the process count.
+
+  *What a message costs the table (informative, from the DynamoDB
+  store; a write unit is 1 KiB of item, a transaction bills twice).* A
+  deposit is one transaction of the mailbox's counters (1 unit), the
+  message item (its decoded payload plus a few attributes) and, for a
+  token with quotas, the token's usage (1 unit), each billed twice; a
+  collect writes a small lease (1 unit); an ack deletes the message
+  (billed by its size), its lease and adjusts the counters (1 unit
+  each). A 4 KB message is so about 14 units to deposit and about 21
+  with its collect and ack, about 3.8 units per charged KiB (the
+  charged body, base64, is about 5.5 KB); a 256 KiB message is about
+  520 to deposit and about 780 in all, about 2.3 per charged KiB.
+  Small messages cost mostly per request, so for them it is the request
+  limits, not this ceiling, that bound a network's use of the table:
+  at the flood guard's 100 deposits a second, messages of about 5.5 KB
+  before base64 (about 750 KiB/s charged, just under the ceiling) cost about 1,600
+  units a second to deposit and about 2,500 once collected and acked
+  (the acks may come from anywhere). At the ceiling, large messages
+  cost about 1,750 a second in all. A host of 900 vaults at three
+  messages a minute of 4 KB (90 deposits a second) costs about 1,800
+  to 1,900 units a second by itself.
+
+  So **a table capped at 2,000 write units a second (the current
+  setting of vettid.org's relay data stack) is too small for one full vault host**:
+  the cap must be raised before such a host arrives, and this ceiling,
+  like the flood guard, sized as a share of it (with a cap of 10,000,
+  for instance, one network's worst case is about a quarter, and a full
+  host a fifth). The ceiling's 768 KiB/s is kept: lowering it would not
+  protect the table from small messages (the flood guard bounds those),
+  and it would throttle that host, which needs 0.47 MiB/s. Charges are on the
   declared body length (base64 included) and are refunded for a deposit
   that is then not stored.
 - *Blob bytes, per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst
@@ -1145,7 +1162,11 @@ sender's budget, and an unauthorized deposit's body is not read.
   key can spend N times its budget, but never more than its network's
   ceiling. While the shared state cannot be reached the ceilings fall back to
   per-process buckets of the same size (see "Shared state"), and for that
-  time a network can again store up to N times the ceiling. Many
+  time a network can again store up to N times the ceiling. The ceiling
+  bounds bytes, not writes: for small messages a network's use of the
+  table is bounded by the request limits (the flood guard), and either
+  bound, like one full vault host, is about the whole of a table capped
+  at 2,000 write units a second ("Where the numbers come from"). Many
   addresses together can still fill the relay up to the deployment's
   ceiling. Per
   mailbox, vettid-relay keeps at most 10,000 messages and 32 MiB of them
@@ -1249,7 +1270,9 @@ relay.
 observable budget is the same however requests are spread; a ceiling's
 charge, forced charge and refund are each one atomic operation on the
 shared bucket, so processes charging at once cannot take more than it
-holds, and a refund never fills it above its burst); limits 6 to 9, the
+holds, and a refund never fills it above its burst; a refund goes to
+the bucket that took the charge, the shared one or the per-process
+fallback, and one the shared bucket cannot take is dropped); limits 6 to 9, the
 per-key budgets of 11 and 12, and 13 are per process (a client that
 reconnects to another process is counted there afresh), and 10, with the
 order of re-sends, is each session's own. If the shared store cannot be
@@ -1284,7 +1307,11 @@ off for a newer one, which the `rate limits` line ends with as
 `relay_ratelimit_busiest_per_minute` (`address`, `key`),
 `relay_ratelimit_busiest_bytes_per_minute` (`bytes`, `blob_bytes`,
 `blob_key_bytes`, `key_bytes`: the bytes charged to the busiest single
-network or key),
+network or key; *proposed 0.9.4:* this, like every busiest-per-minute
+figure, stays a per-process count of the requests that process served,
+also for the relay-wide ceilings, so a network's relay-wide use is the
+sum over processes, while the `bytes` and `blob_bytes` peaks are how
+full the shared bucket was when the process charged it),
 `relay_active_collectors`, `relay_parked_collectors` and
 `relay_ws_sessions`, and logs all of it once a minute in one `rate limits`
 line, which after the WebSocket refusals ends with `bytes_peak`,
@@ -1554,8 +1581,14 @@ The push gateway API is specified separately.
   other shared limits do. "Where the numbers come from", "What does not
   hold" (the per-process multiplication of these two ceilings removed,
   the outage case added), "Shared state" and the configuration note
-  follow; the "Later" entry for shared byte budgets is done. No wire
-  change: clients see only more or fewer `429`s
+  follow; the "Later" entry for shared byte budgets is done. A refund
+  goes back to the bucket that took the charge (the shared one, or the
+  per-process fallback). "Where the numbers come from" states what a
+  message costs the table, that the request limits bound small
+  messages' share of it, and that the production table's cap of 2,000
+  write units a second is too small for one full vault host; the
+  busiest-per-minute figures stay per process. No wire change: clients
+  see only more or fewer `429`s
 - **0.9.3** — errata approved by the owner 2026-10-15 (vettid-relay
   #12), to match 0.9.2 as built. §6.8: the quota checks before an
   upload's body are made for the token's `sub` (the signature covers the

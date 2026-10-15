@@ -407,3 +407,34 @@ func TestByteLimiterFallsBackLocally(t *testing.T) {
 		t.Fatalf("local fallback: peak %v", p)
 	}
 }
+
+// A refund goes back to the backend that took the charge: a charge taken
+// by Valkey and refunded while Valkey is unreachable is not credited to
+// the per-process bucket (which never had it), and stays charged in
+// Valkey; a charge the per-process bucket took goes back there.
+func TestByteLimiterRefundToItsBackend(t *testing.T) {
+	cs := open(t, 2)
+	l, other := cs[0].ByteLimiter("bytes", 1, 10_000), cs[1].ByteLimiter("bytes", 1, 10_000)
+	now := time.Now()
+	const net = "203.0.113.11"
+	ok, _, src := l.AllowNFrom(net, 10_000, now)
+	if !ok || src != coord.SrcShared {
+		t.Fatalf("charge with Valkey up: %v from %d", ok, src)
+	}
+	cs[0].Close() // Valkey unreachable for this process from here on
+	ok, _, fsrc := l.AllowNFrom(net, 4_000, now)
+	if !ok || fsrc != coord.SrcFallback {
+		t.Fatalf("charge with Valkey down: %v from %d", ok, fsrc)
+	}
+	l.RefundTo(net, 10_000, src) // cannot reach Valkey: dropped
+	if ok, _ := l.AllowN(net, 6_001, now); ok {
+		t.Fatal("a refund of a Valkey charge credited the per-process bucket")
+	}
+	l.RefundTo(net, 4_000, fsrc)
+	if ok, _ := l.AllowN(net, 10_000, now); !ok {
+		t.Fatal("a refund of a per-process charge was not given back there")
+	}
+	if ok, _ := other.AllowN(net, 1, now); ok {
+		t.Fatal("the dropped refund reached the shared bucket")
+	}
+}

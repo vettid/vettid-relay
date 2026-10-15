@@ -554,7 +554,8 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		s.refuseUnread(w, r, &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)})
 		return
 	}
-	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, charged); e != nil {
+	src, e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, charged)
+	if e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}
@@ -573,7 +574,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 			kept = max(body.n, int64(firstN))
 		}
 		if !stored && charged > kept {
-			s.refundBytes(limBlobBytes, s.blobByteLimit, network, charged-kept)
+			s.refundBytes(limBlobBytes, s.blobByteLimit, network, charged-kept, src)
 		}
 	}()
 

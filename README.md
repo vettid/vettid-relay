@@ -186,9 +186,15 @@ version does not protect against. In short:
   connections). A mass unlock (about two deposits per vault, 10 MB) is
   paced by the flood guard to at most 100 deposits a second, about
   0.5 MiB/s, under the ceiling's rate; the 8 MiB burst is for moments
-  above it. The ceiling bounds what one network can cost the shared
-  DynamoDB table however many relay tasks run: 768 KiB/s is about 790
-  write units a second at 1 KiB a unit, under 40% of a 2,000-unit table.
+  above it. The ceiling is shared by all relay tasks, so one network's
+  bytes don't multiply with the task count. It bounds bytes, not
+  writes: a 4 KB message costs the DynamoDB table about 21 write units
+  with its collect and ack, so for small messages the flood guard bounds
+  a network's table use (about 2,500 units a second at 100 deposits a
+  second of about 5.5 KB, acks included), and a full 900-vault host
+  needs about 1,800 to 1,900 by itself. A table capped at 2,000 write
+  units a second is too small for one full host: raise the cap before
+  the load, and size these limits as a share of it.
 - **Blob transfers**: at most 8 per process, of which at most 6 uploads
   (2 are kept for downloads); per mailbox at most 2 uploads and,
   separately, 2 downloads; one upload at a time per sender key and

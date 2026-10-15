@@ -193,17 +193,49 @@ func (l *ByteLimiter) run(mode, key string, n int64) ([]int64, bool) {
 	return res, true
 }
 
+// Backends of a ByteLimiter charge (api.SourcedByteLimiter).
+const (
+	SrcShared   = 1 // the bucket in Valkey
+	SrcFallback = 2 // the per-process bucket, while Valkey cannot be reached
+)
+
 // AllowN charges n bytes to key, or nothing (and the wait until n are
 // there, at least a second). More than the burst is never allowed.
 func (l *ByteLimiter) AllowN(key string, n int64, now time.Time) (bool, time.Duration) {
+	ok, wait, _ := l.AllowNFrom(key, n, now)
+	return ok, wait
+}
+
+// AllowNFrom is AllowN, and names the backend that took the charge
+// (SrcShared or SrcFallback), so that a refund goes back to it
+// (RefundTo).
+func (l *ByteLimiter) AllowNFrom(key string, n int64, now time.Time) (bool, time.Duration, int) {
 	res, ok := l.run("take", key, n)
 	if !ok {
-		return l.fallback.AllowN(key, n, now)
+		allowed, wait := l.fallback.AllowN(key, n, now)
+		return allowed, wait, SrcFallback
 	}
 	if res[0] == 1 {
-		return true, 0
+		return true, 0, SrcShared
 	}
-	return false, max(time.Duration(res[1])*time.Millisecond, time.Second)
+	return false, max(time.Duration(res[1])*time.Millisecond, time.Second), SrcShared
+}
+
+// RefundTo gives back n bytes to the backend src that charged them: a
+// Valkey flap between a charge and its refund never credits a bucket that
+// was not charged. A refund the shared bucket cannot take (Valkey
+// unreachable) is dropped: the charge stands, as if the request had
+// stored something.
+func (l *ByteLimiter) RefundTo(key string, n int64, src int) {
+	if n <= 0 {
+		return
+	}
+	switch src {
+	case SrcFallback:
+		l.fallback.Refund(key, n)
+	case SrcShared:
+		l.run("refund", key, n)
+	}
 }
 
 // Charge charges n bytes to key unconditionally (into debt if need be).
@@ -216,7 +248,9 @@ func (l *ByteLimiter) Charge(key string, n int64, now time.Time) {
 	}
 }
 
-// Refund gives back n bytes charged to key, up to the burst.
+// Refund gives back n bytes charged to key, up to the burst, to Valkey or,
+// if it cannot be reached, to the per-process bucket. (The API refunds
+// with RefundTo, to the backend that took the charge.)
 func (l *ByteLimiter) Refund(key string, n int64) {
 	if n <= 0 {
 		return

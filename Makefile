@@ -29,7 +29,7 @@ DDB_IMAGE      ?= docker.io/amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9
 VALKEY_IMAGE   ?= docker.io/valkey/valkey:8.1.10-alpine@sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
 DDB_PORT       ?= 18000
 VALKEY_PORT    ?= 16379
-SHARED_ENV      = RELAY_TEST_DYNAMODB_ENDPOINT=http://127.0.0.1:$(DDB_PORT) RELAY_TEST_VALKEY_ADDR=127.0.0.1:$(VALKEY_PORT)
+SHARED_ENV      = RELAY_TEST_DYNAMODB_ENDPOINT=http://127.0.0.1:$(DDB_PORT) RELAY_TEST_VALKEY_ADDR=127.0.0.1:$(VALKEY_PORT) RELAY_TEST_REQUIRE_SHARED=1
 GOTEST_LIGHT    = $(GO) test -p 1 -parallel 2 -count=1
 
 deps-up:
@@ -41,8 +41,12 @@ deps-down:
 	-$(CONTAINER) rm -f relay-test-ddb relay-test-valkey >/dev/null 2>&1
 
 # Tests against already-running dependencies (CI services, or deps-up).
+# With RELAY_TEST_REQUIRE_SHARED=1 a test that needs them fails instead of
+# skipping; the Valkey coordination tests run verbose, so the log lists
+# each one that ran.
 test-shared:
-	$(SHARED_ENV) $(GOTEST_LIGHT) ./internal/store/... ./internal/coord/ ./test/e2e/
+	$(SHARED_ENV) $(GOTEST_LIGHT) -v ./internal/coord/
+	$(SHARED_ENV) $(GOTEST_LIGHT) ./internal/store/... ./test/e2e/
 	$(SHARED_ENV) RELAY_TEST_API_STORE=dynamodb $(GOTEST_LIGHT) ./internal/api/
 
 test-dynamo:

@@ -221,7 +221,8 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if e := s.takeBytes(limBytes, s.byteLimit, network, charged); e != nil {
+	src, e := s.takeBytes(limBytes, s.byteLimit, network, charged)
+	if e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}
@@ -230,9 +231,9 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 	stored, keyCharged, sender := false, int64(0), ""
 	defer func() {
 		if !stored {
-			s.refundBytes(limBytes, s.byteLimit, network, charged)
+			s.refundBytes(limBytes, s.byteLimit, network, charged, src)
 			if keyCharged > 0 {
-				s.refundBytes(limKeyBytes, s.keyByteLimit, sender, keyCharged)
+				s.refundBytes(limKeyBytes, s.keyByteLimit, sender, keyCharged, 0)
 			}
 		}
 	}()
