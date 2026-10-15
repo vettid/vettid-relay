@@ -88,9 +88,15 @@ type Config struct {
 
 	// Byte budgets per network, per relay process. Charged with a
 	// request's declared length before its body is read.
-	RateIPBytesPerSec   float64 // RELAY_RATE_IP_BYTES_PER_SEC: deposits and claims
-	RateIPBytesBurst    int     // RELAY_RATE_IP_BYTES_BURST
-	RateBlobBytesPerSec float64 // RELAY_RATE_BLOB_BYTES_PER_SEC: blob uploads and downloads
+	RateIPBytesPerSec float64 // RELAY_RATE_IP_BYTES_PER_SEC: deposits and claims
+	RateIPBytesBurst  int     // RELAY_RATE_IP_BYTES_BURST
+	// Blob bytes (uploads and downloads), per authenticated key: the
+	// sender's for an upload, the mailbox owner's for a download. A vault
+	// host's vaults each have their own.
+	RateBlobKeyBytesPerSec float64 // RELAY_RATE_BLOB_KEY_BYTES_PER_SEC
+	RateBlobKeyBytesBurst  int     // RELAY_RATE_BLOB_KEY_BYTES_BURST
+	// The ceiling over all keys of one network.
+	RateBlobBytesPerSec float64 // RELAY_RATE_BLOB_BYTES_PER_SEC
 	RateBlobBytesBurst  int     // RELAY_RATE_BLOB_BYTES_BURST
 
 	// Web endpoints (spec §6.11): /.well-known/assetlinks.json names the
@@ -200,10 +206,12 @@ func Defaults() Config {
 		RateWebPerSec:      2,
 		RateWebBurst:       20,
 
-		RateIPBytesPerSec:   256 << 10,
-		RateIPBytesBurst:    8 << 20,
-		RateBlobBytesPerSec: 1 << 20,
-		RateBlobBytesBurst:  64 << 20,
+		RateIPBytesPerSec:      256 << 10,
+		RateIPBytesBurst:       8 << 20,
+		RateBlobKeyBytesPerSec: 1 << 20,
+		RateBlobKeyBytesBurst:  32 << 20,
+		RateBlobBytesPerSec:    8 << 20,
+		RateBlobBytesBurst:     256 << 20,
 
 		AndroidPackage:          DefaultAndroidPackage,
 		AndroidCertFingerprints: append([]string(nil), DefaultAndroidCertFingerprints...),
@@ -344,6 +352,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	integer("RELAY_RATE_WEB_BURST", &c.RateWebBurst)
 	f64("RELAY_RATE_IP_BYTES_PER_SEC", &c.RateIPBytesPerSec)
 	integer("RELAY_RATE_IP_BYTES_BURST", &c.RateIPBytesBurst)
+	f64("RELAY_RATE_BLOB_KEY_BYTES_PER_SEC", &c.RateBlobKeyBytesPerSec)
+	integer("RELAY_RATE_BLOB_KEY_BYTES_BURST", &c.RateBlobKeyBytesBurst)
 	f64("RELAY_RATE_BLOB_BYTES_PER_SEC", &c.RateBlobBytesPerSec)
 	integer("RELAY_RATE_BLOB_BYTES_BURST", &c.RateBlobBytesBurst)
 
@@ -437,14 +447,16 @@ func (c Config) Validate() error {
 	}
 	// Byte budgets: the largest single request must fit in the burst, or
 	// it could never be served.
-	if c.RateIPBytesBurst <= 0 || c.RateBlobBytesBurst <= 0 || c.LogInfoBurst <= 0 || c.BlobPaceBytes <= 0 {
-		errs = append(errs, errors.New("RELAY_RATE_IP_BYTES_BURST, RELAY_RATE_BLOB_BYTES_BURST, RELAY_LOG_INFO_BURST and RELAY_BLOB_PACE_BYTES must be > 0"))
+	if c.RateIPBytesBurst <= 0 || c.RateBlobKeyBytesBurst <= 0 || c.RateBlobBytesBurst <= 0 || c.LogInfoBurst <= 0 || c.BlobPaceBytes <= 0 {
+		errs = append(errs, errors.New("RELAY_RATE_IP_BYTES_BURST, RELAY_RATE_BLOB_KEY_BYTES_BURST, RELAY_RATE_BLOB_BYTES_BURST, RELAY_LOG_INFO_BURST and RELAY_BLOB_PACE_BYTES must be > 0"))
 	} else if int64(c.RateIPBytesBurst) < max(c.DepositBodyLimit(), c.MaxClaimBytes) {
 		errs = append(errs, fmt.Errorf("RELAY_RATE_IP_BYTES_BURST must be at least the largest deposit body (%d bytes for RELAY_MAX_PAYLOAD_BYTES) and RELAY_MAX_CLAIM_BYTES", c.DepositBodyLimit()))
 	}
 	if c.BlobsEnabled {
-		if int64(c.RateBlobBytesBurst) < c.MaxBlobBytes {
-			errs = append(errs, errors.New("RELAY_RATE_BLOB_BYTES_BURST must be at least RELAY_MAX_BLOB_BYTES when blobs are enabled"))
+		// A key's burst must hold the largest blob, and the network's
+		// ceiling at least one key's burst and rate.
+		if int64(c.RateBlobKeyBytesBurst) < c.MaxBlobBytes || c.RateBlobBytesBurst < c.RateBlobKeyBytesBurst || c.RateBlobBytesPerSec < c.RateBlobKeyBytesPerSec {
+			errs = append(errs, errors.New("RELAY_MAX_BLOB_BYTES <= RELAY_RATE_BLOB_KEY_BYTES_BURST <= RELAY_RATE_BLOB_BYTES_BURST and RELAY_RATE_BLOB_KEY_BYTES_PER_SEC <= RELAY_RATE_BLOB_BYTES_PER_SEC must hold when blobs are enabled"))
 		}
 		// Uploads may use the process's transfers less one mailbox's worth,
 		// which stay for downloads: so the per-mailbox number must be
@@ -467,7 +479,7 @@ func (c Config) Validate() error {
 			break
 		}
 	}
-	for _, r := range []float64{c.RateIPBytesPerSec, c.RateBlobBytesPerSec} {
+	for _, r := range []float64{c.RateIPBytesPerSec, c.RateBlobKeyBytesPerSec, c.RateBlobBytesPerSec} {
 		if !(r > 0) || r > 1e12 {
 			errs = append(errs, errors.New("every RELAY_RATE_*_BYTES_PER_SEC must be > 0"))
 			break

@@ -75,14 +75,16 @@ const limWSNetworkHard = "ws_network_hard"
 
 var allLimiters = []string{limAddress, limKey, limSender, limRegister, limClaim, limWeb}
 
-// The byte budgets per network (per process). They are reported after
-// every other field of the "rate limits" line.
+// The byte budgets (per process): bytes and blob_bytes per network,
+// blob_key_bytes per authenticated key. They are reported after every
+// other field of the "rate limits" line.
 const (
-	limBytes     = "bytes"
-	limBlobBytes = "blob_bytes"
+	limBytes        = "bytes"
+	limBlobBytes    = "blob_bytes"
+	limBlobKeyBytes = "blob_key_bytes"
 )
 
-var byteLimiters = []string{limBytes, limBlobBytes}
+var byteLimiters = []string{limBytes, limBlobBytes, limBlobKeyBytes}
 
 // limBlobSlots and limBlobMailboxSlots label blob transfers refused
 // because the process (cfg.MaxConcurrentBlobTransfers) or the mailbox
@@ -133,7 +135,7 @@ func newLimiterMetrics(reg *metrics.Registry) *limiterMetrics {
 		busiest: reg.GaugeVec("relay_ratelimit_busiest_per_minute", "Requests of the busiest single client network (limiter address) and of the busiest single key (limiter key) during the last full minute.", "limiter"),
 		bytes:   reg.GaugeVec("relay_ratelimit_busiest_bytes_per_minute", "Bytes charged to the busiest single client network during the last full minute, by byte budget (bytes: deposits and claims; blob_bytes: blob uploads and downloads).", "limiter"),
 		lastRef: map[string]int64{},
-		count:   map[string]map[string]int{limAddress: {}, limKey: {}, limBytes: {}, limBlobBytes: {}},
+		count:   map[string]map[string]int{limAddress: {}, limKey: {}, limBytes: {}, limBlobBytes: {}, limBlobKeyBytes: {}},
 		hit:     map[string]struct{}{},
 	}
 	for _, l := range allLimiters {
@@ -208,6 +210,25 @@ func (s *Server) refundBytes(name string, l ByteLimiter, network string, n int64
 	s.rl.tally(name, network, -int(n), false)
 }
 
+// takeBlobBytes charges n blob bytes to key's budget and to network's
+// ceiling, or neither (the 429 of the one that refused).
+func (s *Server) takeBlobBytes(key, network string, n int64) *apiError {
+	if e := s.takeBytes(limBlobKeyBytes, s.blobKeyLimit, key, n); e != nil {
+		return e
+	}
+	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, n); e != nil {
+		s.refundBytes(limBlobKeyBytes, s.blobKeyLimit, key, n)
+		return e
+	}
+	return nil
+}
+
+// refundBlobBytes gives back n bytes charged by takeBlobBytes.
+func (s *Server) refundBlobBytes(key, network string, n int64) {
+	s.refundBytes(limBlobKeyBytes, s.blobKeyLimit, key, n)
+	s.refundBytes(limBlobBytes, s.blobByteLimit, network, n)
+}
+
 // declaredLength is what a byte budget charges for a body before it is
 // read: its Content-Length, or limit (the most it may be) when the length
 // is not declared.
@@ -256,7 +277,7 @@ func (s *Server) reportLimits() {
 	for name, l := range map[string]any{
 		limAddress: s.ipLimit, limKey: s.keyLimit, limSender: s.subLimit,
 		limRegister: s.regLimit, limClaim: s.claimLimit, limWeb: s.webLimit,
-		limBytes: s.byteLimit, limBlobBytes: s.blobByteLimit,
+		limBytes: s.byteLimit, limBlobBytes: s.blobByteLimit, limBlobKeyBytes: s.blobKeyLimit,
 	} {
 		if p, ok := l.(interface{ Peak() float64 }); ok {
 			peaks[name] = p.Peak()

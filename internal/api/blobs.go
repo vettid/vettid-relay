@@ -237,7 +237,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// transfer slot with a trickle is never free. Only an upload refused
 	// a slot gets everything back: it held none.
 	network, charged := s.network(r), declaredLength(r, limit)
-	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, charged); e != nil {
+	if e := s.takeBlobBytes(da.claims.Sub, network, charged); e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}
@@ -250,7 +250,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 			kept = max(sent, int64(buf.Len()))
 		}
 		if !stored && charged > kept {
-			s.refundBytes(limBlobBytes, s.blobByteLimit, network, charged-kept)
+			s.refundBlobBytes(da.claims.Sub, network, charged-kept)
 		}
 	}()
 
@@ -363,14 +363,20 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(CodeBlobUnknown))
 		return
 	}
-	// A network whose blob budget is empty is refused before the store
-	// is read (its exact charge needs the blob's size, which the read
-	// gives).
-	network := s.network(r)
-	if !s.blobByteLimit.Ready(network, s.now()) {
-		s.rl.refused.With(limBlobBytes).Inc()
-		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
-		return
+	// An owner whose blob budget is empty, or whose network's is, is
+	// refused before the store is read (the exact charge needs the blob's
+	// size, which the read gives).
+	network, owner := s.network(r), auth.EncodeKey(mb.PubKey)
+	for _, b := range []struct {
+		name string
+		l    ByteLimiter
+		key  string
+	}{{limBlobKeyBytes, s.blobKeyLimit, owner}, {limBlobBytes, s.blobByteLimit, network}} {
+		if !b.l.Ready(b.key, s.now()) {
+			s.rl.refused.With(b.name).Inc()
+			s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
+			return
+		}
 	}
 	release, e := s.acquireDownload(mb.ID)
 	if e != nil {
@@ -390,11 +396,11 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rc.Close()
-	// The network's blob byte budget, with the blob's size (at most the
-	// burst: a blob stored under a larger budget can still be fetched).
-	// Only the owner gets this far, so the answer tells nobody else
-	// anything.
-	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, min(info.Size, s.blobByteLimit.Burst())); e != nil {
+	// The owner's blob byte budget and its network's ceiling, with the
+	// blob's size (at most a key's burst: a blob stored under a larger
+	// budget can still be fetched). Only the owner gets this far, so the
+	// answer tells nobody else anything.
+	if e := s.takeBlobBytes(owner, network, min(info.Size, s.blobKeyLimit.Burst(), s.blobByteLimit.Burst())); e != nil {
 		s.writeError(w, e)
 		return
 	}

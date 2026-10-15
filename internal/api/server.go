@@ -47,7 +47,8 @@ type Server struct {
 	rl       *limiterMetrics
 
 	byteLimit     ByteLimiter // bytes of deposits and claims, per client network (per process)
-	blobByteLimit ByteLimiter // bytes of blob uploads and downloads, per client network (per process)
+	blobByteLimit ByteLimiter // bytes of blob uploads and downloads, per client network: the ceiling (per process)
+	blobKeyLimit  ByteLimiter // bytes of blob uploads and downloads, per authenticated key (per process)
 
 	smallBodyTimeout time.Duration // how long a small body has to arrive (handlers.go)
 	blobPaceWindow   time.Duration // period of cfg.BlobPaceBytes (blobs.go)
@@ -148,6 +149,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 
 		byteLimit:     ratelimit.New(cfg.RateIPBytesPerSec, cfg.RateIPBytesBurst, 200_000),
 		blobByteLimit: ratelimit.New(cfg.RateBlobBytesPerSec, cfg.RateBlobBytesBurst, 200_000),
+		blobKeyLimit:  ratelimit.New(cfg.RateBlobKeyBytesPerSec, cfg.RateBlobKeyBytesBurst, 200_000),
 
 		replay:   auth.NewReplayCache(cfg.ReplayCacheMax),
 		ipLimit:  ratelimit.New(cfg.RateIPPerSec, cfg.RateIPBurst, 200_000),
@@ -193,7 +195,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
 			c.Sweep(now)
 		}
-		for _, l := range []any{s.ipLimit, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit, s.byteLimit, s.blobByteLimit} {
+		for _, l := range []any{s.ipLimit, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit, s.byteLimit, s.blobByteLimit, s.blobKeyLimit} {
 			if p, ok := l.(interface{ Prune(time.Time) }); ok {
 				p.Prune(now)
 			}

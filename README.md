@@ -132,7 +132,8 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_RATE_SENDER_RPS` / `RELAY_RATE_SENDER_BURST` | `5` / `20` | Per-sender bucket, applied to deposits after the request signature verifies (§5.3 step 7) and to blob uploads before their body is read. It's keyed by token `sub`, or by `jti` for open tokens. |
 | `RELAY_RATE_CLAIM_GET_RPS` / `RELAY_RATE_CLAIM_GET_BURST` | `1` / `10` | Extra bucket for unauthenticated claim fetches, keyed by IPv4 address or IPv6 /64. It resists guessing and scraping. |
 | `RELAY_RATE_IP_BYTES_PER_SEC` / `RELAY_RATE_IP_BYTES_BURST` | `262144` / `8388608` (256 KiB/s, 8 MiB) | Byte budget per client network for what it asks the relay to store: deposits (charged with their declared length after the token verified, before the body is read; without a `Content-Length`, the largest deposit body) and claims (charged once the claim is authenticated). A deposit or claim that is then not stored (quota, signature, malformed body, store error) gets its charge back. Over it, `429 rate_limited` with `retry_after`, the body unread. Per relay process. The burst must hold the largest deposit body and `RELAY_MAX_CLAIM_BYTES`. |
-| `RELAY_RATE_BLOB_BYTES_PER_SEC` / `RELAY_RATE_BLOB_BYTES_BURST` | `1048576` / `67108864` (1 MiB/s, 64 MiB) | Byte budget per client network for blobs: uploads (declared length, or `RELAY_MAX_BLOB_BYTES` without one, after the per-sender limit, before the body is read) and downloads (the blob's size, at most the burst, after the owner's signature verified; an empty budget refuses a download before the store is read). An upload that stores nothing gets back only the part of its charge it never sent: every byte that reached the relay stays charged, whatever refused it (body failure, signature, quota, store). One refused a transfer slot (it held none) gets everything back. Over it, `429 rate_limited` with `retry_after`. Per relay process. The burst must hold `RELAY_MAX_BLOB_BYTES` (checked with blobs enabled; it must be greater than zero regardless). |
+| `RELAY_RATE_BLOB_KEY_BYTES_PER_SEC` / `RELAY_RATE_BLOB_KEY_BYTES_BURST` | `1048576` / `33554432` (1 MiB/s, 32 MiB) | Byte budget for blobs per authenticated key: the sender's key for an upload, the mailbox owner's for a download. Each vault of a vault host has its own. The burst holds four blobs of the maximum size. Must hold `RELAY_MAX_BLOB_BYTES`. |
+| `RELAY_RATE_BLOB_BYTES_PER_SEC` / `RELAY_RATE_BLOB_BYTES_BURST` | `8388608` / `268435456` (8 MiB/s, 256 MiB) | The ceiling over all keys of one client network. Both budgets are charged for uploads (declared length, or `RELAY_MAX_BLOB_BYTES` without one, after the per-sender limit, before the body is read) and downloads (the blob's size, at most a key's burst, after the owner's signature verified; an empty budget refuses a download before the store is read); a request refused by one is charged to neither. An upload that stores nothing gets back only the part of its charge it never sent: every byte that reached the relay stays charged, whatever refused it (body failure, signature, quota, store). One refused a transfer slot (it held none) gets everything back. Over it, `429 rate_limited` with `retry_after`. Per relay process. With blobs enabled the ceiling's rate and burst must be at least a key's; every rate and burst must be greater than zero regardless. |
 | `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | Per-source-IP bucket for the web endpoints (§6.11) and every other path outside `/v1/` except `/healthz`. It's separate from the API bucket, so scanners never use up mailbox traffic's budget, and always in-process (per relay process, no Valkey round trip). |
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
 | `RELAY_ANDROID_CERT_SHA256` | the official VettID app's signing keys | Comma-separated SHA-256 certificate fingerprints for `assetlinks.json`, colon-separated or plain hex, any case (served in uppercase colon form). The built-in default (`config.DefaultAndroidCertFingerprints`: the production upload key and the two staging signers) lets a self-hosted relay open links in the official app with no configuration. Set but empty turns `assetlinks.json` off (404). |
@@ -160,10 +161,12 @@ version does not protect against. In short:
   (`RELAY_RATE_REGISTER_*`); and two **byte budgets**, which bound what one
   network can make the relay store and move however many keys and
   mailboxes it holds: 256 KiB/s (burst 8 MiB) for deposits and claims
-  (`RELAY_RATE_IP_BYTES_*`), 1 MiB/s (burst 64 MiB) for blob uploads and
-  downloads (`RELAY_RATE_BLOB_BYTES_*`). They are charged with the
-  declared length before a body is read, never look at the target, and
-  are per process. Nothing else keyed on a network can refuse a request
+  (`RELAY_RATE_IP_BYTES_*`), and for blob uploads and downloads a ceiling
+  of 8 MiB/s (burst 256 MiB, `RELAY_RATE_BLOB_BYTES_*`) on top of a budget
+  per authenticated key, 1 MiB/s (burst 32 MiB, `RELAY_RATE_BLOB_KEY_BYTES_*`),
+  so a vault host's vaults don't share one blob budget. They are charged
+  with the declared length before a body is read, never look at the
+  target, and are per process. Nothing else keyed on a network can refuse a request
   that is properly signed by a key with a mailbox. There is no penalty
   state.
 - A vault host of 900 vaults, at a message a minute each of 4 KB, stores
@@ -280,16 +283,18 @@ the busiest bucket of each limiter got in the last full minute; 1000 means
 something was refused), `relay_ratelimit_busiest_per_minute` (requests of
 the busiest single network and of the busiest single key). Limiters:
 `address`, `key`, `sender`, `register`, `claim`, `web`, and the byte
-budgets `bytes` and `blob_bytes` (for these a request allowed or refused
-is counted, and `relay_ratelimit_busiest_bytes_per_minute` has the bytes
-of the busiest single network); `relay_ratelimit_refused_total` also has
+budgets `bytes`, `blob_bytes` (per network) and `blob_key_bytes` (per
+key) (for these a request allowed or refused is counted, and
+`relay_ratelimit_busiest_bytes_per_minute` has the bytes of the busiest
+single network, or key); `relay_ratelimit_refused_total` also has
 `blob_slots`, `blob_mailbox_slots` and `blob_sender_slots`. Each process logs one `rate limits`
 line a minute with the same figures, the number of networks the flood
 guard refused, and `collectors`, `parked` and `ws_sessions`: this line is
 what the limits are to be re-sized from. After the WebSocket refusals it
 ends with `bytes_peak`, `bytes_refused`, `bytes_busiest_per_min`,
 `blob_bytes_peak`, `blob_bytes_refused`, `blob_bytes_busiest_per_min`,
-`blob_slots_refused`, `blob_mailbox_slots_refused`,
+`blob_key_bytes_peak`, `blob_key_bytes_refused`,
+`blob_key_bytes_busiest_per_min`, `blob_slots_refused`, `blob_mailbox_slots_refused`,
 `blob_sender_slots_refused`, `log_dropped` and `log_suppressed`.
 
 The simulation behind the numbers is a test:
@@ -418,7 +423,8 @@ other process sees, refuses or is woken by.
   `RELAY_MAX_WS_SESSIONS_PER_NETWORK_HARD`,
   `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS`,
   `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX`, the two byte budgets
-  (`RELAY_RATE_IP_BYTES_*`, `RELAY_RATE_BLOB_BYTES_*`), the log budget and
+  (`RELAY_RATE_IP_BYTES_*`, `RELAY_RATE_BLOB_KEY_BYTES_*`,
+  `RELAY_RATE_BLOB_BYTES_*`), the log budget and
   the replay-cache capacity bound each process's own resources. With N
   processes behind a load balancer a network's byte budgets are up to N
   times the configured ones. A client that reconnects to another

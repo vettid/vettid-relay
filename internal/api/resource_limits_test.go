@@ -419,7 +419,7 @@ func TestResourceLimitsReport(t *testing.T) {
 	f.s.reportLimits()
 	line := lastLine(t, logs.String(), `"msg":"rate limits"`)
 	dep := len(depositBody([]byte("hello")))
-	want := fmt.Sprintf(`"ws_sessions_refused":0,"ws_network_refused":0,"ws_network_hard_refused":0,"bytes_peak":0,"bytes_refused":0,"bytes_busiest_per_min":%d,"blob_bytes_peak":0,"blob_bytes_refused":0,"blob_bytes_busiest_per_min":700,"blob_slots_refused":0,"blob_mailbox_slots_refused":0,"blob_sender_slots_refused":0}`, dep)
+	want := fmt.Sprintf(`"ws_sessions_refused":0,"ws_network_refused":0,"ws_network_hard_refused":0,"bytes_peak":0,"bytes_refused":0,"bytes_busiest_per_min":%d,"blob_bytes_peak":0,"blob_bytes_refused":0,"blob_bytes_busiest_per_min":700,"blob_key_bytes_peak":0,"blob_key_bytes_refused":0,"blob_key_bytes_busiest_per_min":700,"blob_slots_refused":0,"blob_mailbox_slots_refused":0,"blob_sender_slots_refused":0}`, dep)
 	if !strings.Contains(line, want) {
 		t.Fatalf("rate limits line:\n%s\nwant it to end with\n%s", line, want)
 	}
@@ -614,4 +614,52 @@ func TestStalledUploadKeepsWhatItSent(t *testing.T) {
 	if ok, _ := f.s.blobByteLimit.AllowN(key, 1, f.clk.now()); ok {
 		t.Fatal("the 1,000 bytes sent were given back too")
 	}
+}
+
+// The blob byte budget is per authenticated key (the sender's for an
+// upload, the mailbox owner's for a download), with a ceiling per
+// network: vaults behind one address each have their own budget, and the
+// address as a whole has the ceiling.
+func TestBlobKeyBudget(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 1<<20
+		c.RateBlobKeyBytesPerSec, c.RateBlobKeyBytesBurst = 0.001, 2000
+		c.RateBlobBytesPerSec, c.RateBlobBytesBurst = 0.001, 5000
+	})
+	owner := newPrincipal(1)
+	f.register(owner)
+	s1, s2, s3 := newPrincipal(11), newPrincipal(12), newPrincipal(13)
+	put := func(sender principal) req {
+		return req{method: "PUT", path: "/v1/blob/" + owner.mbx, body: make([]byte, 1000), signer: &sender, token: f.mint(owner, sender, nil)}
+	}
+	f.expectFrom(hostA, put(s1), 201, "")
+	f.expectFrom(hostA, put(s1), 201, "")
+	f.expectFrom(hostA, put(s1), 429, CodeRateLimited) // s1's 2,000
+	f.expectFrom(hostA, put(s2), 201, "")              // another vault behind the same address
+	f.expectFrom(hostA, put(s2), 201, "")
+	f.expectFrom(hostA, put(s3), 201, "")              // 5,000: the network's ceiling
+	f.expectFrom(hostA, put(s3), 429, CodeRateLimited) // s3 has 1,000 left, the network none
+	f.expectFrom(hostB, put(s3), 201, "")              // another network: s3's last 1,000
+	if k, n := f.counter(`relay_ratelimit_refused_total{limiter="blob_key_bytes"}`), f.counter(`relay_ratelimit_refused_total{limiter="blob_bytes"}`); k != 1 || n != 1 {
+		t.Fatalf("refused: %d by the key budget, %d by the network ceiling", k, n)
+	}
+	// The ceiling's refusal gave s3's key charge back: it had 1,000 left
+	// for hostB, which it used.
+	// Downloads draw on the owner's key: it has 2,000.
+	var id string
+	{
+		code, b := f.do(put(newPrincipal(14)))
+		if code != 201 {
+			t.Fatalf("upload over loopback: %d %s", code, b)
+		}
+		var out struct {
+			BlobID string `json:"blob_id"`
+		}
+		json.Unmarshal(b, &out)
+		id = out.BlobID
+	}
+	get := req{method: "GET", path: "/v1/blob/" + id, signer: &owner}
+	f.expectFrom(hostB, get, 200, "")
+	f.expectFrom(hostB, get, 200, "")
+	f.expectFrom(hostB, get, 429, CodeRateLimited) // the owner's key is spent; hostB's ceiling is not
 }
