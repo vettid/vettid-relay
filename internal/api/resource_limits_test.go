@@ -663,3 +663,26 @@ func TestBlobKeyBudget(t *testing.T) {
 	f.expectFrom(hostB, get, 200, "")
 	f.expectFrom(hostB, get, 429, CodeRateLimited) // the owner's key is spent; hostB's ceiling is not
 }
+
+// The token's sub is written by the mailbox owner; the sender's key is
+// proved only by the signature after the body. So an upload is charged to
+// its sub's key budget only once that signature has verified: nobody can
+// drain a vault's budget by minting tokens that name its key.
+func TestForgedSubCannotDrainAKeyBudget(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		c.MaxBlobBytes, c.MailboxMaxBlobBytes = 1000, 1 << 20
+		c.RateBlobKeyBytesPerSec, c.RateBlobKeyBytesBurst = 0.001, 2000
+	})
+	mallory, victim, friend := newPrincipal(1), newPrincipal(2), newPrincipal(3)
+	f.register(mallory)
+	f.register(friend)
+	forged := f.mint(mallory, victim, nil) // sub = the victim's key, signed by mallory's mailbox
+	for i := 0; i < 10; i++ {
+		f.expectFrom(hostA, req{method: "PUT", path: "/v1/blob/" + mallory.mbx, body: make([]byte, 1000), signer: &mallory, token: forged}, 401, CodeSignatureInvalid)
+	}
+	tok := f.mint(friend, victim, nil)
+	up := req{method: "PUT", path: "/v1/blob/" + friend.mbx, body: make([]byte, 1000), signer: &victim, token: tok}
+	f.expectFrom(hostB, up, 201, "")
+	f.expectFrom(hostB, up, 201, "")
+	f.expectFrom(hostB, up, 429, CodeRateLimited) // now the victim's own 2,000 are spent
+}

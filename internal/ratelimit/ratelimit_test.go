@@ -160,3 +160,20 @@ func TestRefundAndReady(t *testing.T) {
 		t.Fatalf("refund created a bucket: %d", l.Len())
 	}
 }
+
+// Charge takes tokens unconditionally, into debt; the bucket refills from
+// there.
+func TestChargeIntoDebt(t *testing.T) {
+	l := New(100, 100, 0)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l.Charge("a", 250, now) // 100 - 250 = -150
+	if l.Ready("a", now.Add(time.Second)) {
+		t.Fatal("ready while in debt")
+	}
+	if !l.Ready("a", now.Add(1510*time.Millisecond)) {
+		t.Fatal("not ready once the debt is paid")
+	}
+	if p := l.Peak(); p != 1 {
+		t.Fatalf("peak %v", p)
+	}
+}

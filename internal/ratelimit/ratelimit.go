@@ -81,6 +81,34 @@ func (l *Limiter) AllowN(key string, n int64, now time.Time) (bool, time.Duratio
 	return false, wait
 }
 
+// Charge takes n tokens from key's bucket unconditionally: the bucket
+// may go into debt (below zero), which later requests then wait out. It
+// is for a cost known only after the fact (bytes already received from a
+// caller identified only then).
+func (l *Limiter) Charge(key string, n int64, now time.Time) {
+	if n <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[key]
+	if !ok {
+		if len(l.buckets) >= l.maxKeys {
+			l.pruneLocked(now)
+		}
+		b = &bucket{tokens: l.burst, last: now}
+		l.buckets[key] = b
+	}
+	if el := now.Sub(b.last).Seconds(); el > 0 {
+		b.tokens = math.Min(l.burst, b.tokens+el*l.rate)
+		b.last = now
+	}
+	b.tokens -= float64(n)
+	if used := 1 - b.tokens/l.burst; used > l.peak {
+		l.peak = math.Min(used, 1)
+	}
+}
+
 // Refund gives back n tokens taken from key's bucket (a request charged
 // in advance that turned out to cost nothing), up to the burst.
 func (l *Limiter) Refund(key string, n int64) {

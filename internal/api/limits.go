@@ -106,6 +106,7 @@ type ByteLimiter interface {
 	AllowN(key string, n int64, now time.Time) (bool, time.Duration)
 	Refund(key string, n int64)
 	Ready(key string, now time.Time) bool
+	Charge(key string, n int64, now time.Time)
 	Burst() int64
 }
 
@@ -133,7 +134,7 @@ func newLimiterMetrics(reg *metrics.Registry) *limiterMetrics {
 		refused: reg.CounterVec("relay_ratelimit_refused_total", "Requests a rate limiter refused (429 rate_limited), by limiter.", "limiter"),
 		peak:    reg.GaugeVec("relay_ratelimit_peak_permille", "How full the busiest bucket of each limiter got during the last full minute, in thousandths of its burst (1000: something was refused).", "limiter"),
 		busiest: reg.GaugeVec("relay_ratelimit_busiest_per_minute", "Requests of the busiest single client network (limiter address) and of the busiest single key (limiter key) during the last full minute.", "limiter"),
-		bytes:   reg.GaugeVec("relay_ratelimit_busiest_bytes_per_minute", "Bytes charged to the busiest single client network during the last full minute, by byte budget (bytes: deposits and claims; blob_bytes: blob uploads and downloads).", "limiter"),
+		bytes:   reg.GaugeVec("relay_ratelimit_busiest_bytes_per_minute", "Bytes charged to the busiest single client network (bytes, blob_bytes) or key (blob_key_bytes) during the last full minute, by byte budget (bytes: deposits and claims; blob_bytes and blob_key_bytes: blob uploads and downloads).", "limiter"),
 		lastRef: map[string]int64{},
 		count:   map[string]map[string]int{limAddress: {}, limKey: {}, limBytes: {}, limBlobBytes: {}, limBlobKeyBytes: {}},
 		hit:     map[string]struct{}{},
@@ -212,21 +213,32 @@ func (s *Server) refundBytes(name string, l ByteLimiter, network string, n int64
 
 // takeBlobBytes charges n blob bytes to key's budget and to network's
 // ceiling, or neither (the 429 of the one that refused).
+// (Used for downloads, whose key, the owner's, is verified first.)
 func (s *Server) takeBlobBytes(key, network string, n int64) *apiError {
-	if e := s.takeBytes(limBlobKeyBytes, s.blobKeyLimit, key, n); e != nil {
-		return e
+	now := s.now()
+	if ok, wait := s.blobKeyLimit.AllowN(key, n, now); !ok {
+		s.rl.refused.With(limBlobKeyBytes).Inc()
+		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
 	}
-	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, n); e != nil {
-		s.refundBytes(limBlobKeyBytes, s.blobKeyLimit, key, n)
-		return e
+	if ok, wait := s.blobByteLimit.AllowN(network, n, now); !ok {
+		s.blobKeyLimit.Refund(key, n)
+		s.rl.refused.With(limBlobBytes).Inc()
+		return &apiError{code: CodeRateLimited, retryAfter: ratelimit.RetryAfterSeconds(wait)}
+	}
+	for _, x := range [][2]string{{limBlobKeyBytes, key}, {limBlobBytes, network}} {
+		s.rl.allowed.With(x[0]).Inc()
+		s.rl.tally(x[0], x[1], int(n), false)
 	}
 	return nil
 }
 
-// refundBlobBytes gives back n bytes charged by takeBlobBytes.
-func (s *Server) refundBlobBytes(key, network string, n int64) {
-	s.refundBytes(limBlobKeyBytes, s.blobKeyLimit, key, n)
-	s.refundBytes(limBlobBytes, s.blobByteLimit, network, n)
+// chargeBlobKey charges n bytes to key's blob budget after the fact,
+// even into debt (the bytes have arrived; the sender's key is proved only
+// now). Never refuses.
+func (s *Server) chargeBlobKey(key string, n int64) {
+	s.blobKeyLimit.Charge(key, n, s.now())
+	s.rl.allowed.With(limBlobKeyBytes).Inc()
+	s.rl.tally(limBlobKeyBytes, key, int(n), false)
 }
 
 // declaredLength is what a byte budget charges for a body before it is

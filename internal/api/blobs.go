@@ -230,14 +230,27 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		s.refuseUnread(w, r, e)
 		return
 	}
-	// The network's blob byte budget, on the declared length. An upload
-	// that stores nothing gets back the part of the charge it never sent;
-	// every byte that reached the relay stays charged, whatever refuses
-	// the upload (body failure, signature, quota, store), so holding a
-	// transfer slot with a trickle is never free. Only an upload refused
-	// a slot gets everything back: it held none.
+	// The blob byte budgets. The token's sub names the sender's key, but
+	// the mailbox owner wrote the token: the sender is proved only by the
+	// request signature (step 7), after the body. So before the body only
+	// the network's ceiling is charged, with the declared length; the
+	// key's budget is only looked at (an empty one is refused unread) and
+	// charged once the signature has verified, with what arrived. Nobody
+	// can spend another key's budget by naming it in a token.
+	//
+	// An upload that stores nothing gets back the part of the network
+	// charge it never sent; every byte that reached the relay stays
+	// charged, whatever refuses the upload (body failure, signature,
+	// quota, store), so holding a transfer slot with a trickle is never
+	// free. Only an upload refused a slot gets everything back: it held
+	// none.
 	network, charged := s.network(r), declaredLength(r, limit)
-	if e := s.takeBlobBytes(da.claims.Sub, network, charged); e != nil {
+	if !s.blobKeyLimit.Ready(da.claims.Sub, s.now()) {
+		s.rl.refused.With(limBlobKeyBytes).Inc()
+		s.refuseUnread(w, r, &apiError{code: CodeRateLimited, retryAfter: 1})
+		return
+	}
+	if e := s.takeBytes(limBlobBytes, s.blobByteLimit, network, charged); e != nil {
 		s.refuseUnread(w, r, e)
 		return
 	}
@@ -250,7 +263,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 			kept = max(sent, int64(buf.Len()))
 		}
 		if !stored && charged > kept {
-			s.refundBlobBytes(da.claims.Sub, network, charged-kept)
+			s.refundBytes(limBlobBytes, s.blobByteLimit, network, charged-kept)
 		}
 	}()
 
@@ -298,6 +311,10 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	size := int64(buf.Len())
+	// The sender is proved: its key's budget pays for what arrived,
+	// whatever the store then says (into debt if need be; never refused
+	// here).
+	s.chargeBlobKey(da.claims.Sub, size)
 	info, err := s.blobs.PutBlob(r.Context(), store.BlobPut{
 		Mailbox: mailboxID,
 		Size:    size,
