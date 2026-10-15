@@ -32,7 +32,7 @@ import (
 // Two byte budgets per network bound what one network can make the relay
 // store and move, whatever number of keys and mailboxes it holds. They are
 // charged with a request's declared length (Content-Length) before its
-// body is read. Shared (relay-wide, proposed for 0.9.4: with several
+// body is read. Shared (relay-wide since 0.9.4: with several
 // processes on one store, a per-process ceiling multiplied by the process
 // count could take the store's whole write capacity):
 //

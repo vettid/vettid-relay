@@ -13,7 +13,7 @@ import (
 )
 
 // The network ceilings of the byte budgets (§7.2 limits 11 and 12) are
-// relay-wide (proposed 0.9.4): two relay instances sharing one Valkey
+// relay-wide (0.9.4): two relay instances sharing one Valkey
 // draw on one bucket per network, with the charges, refunds and kept
 // charges of TestByteChargesRefundedWhenNothingIsStored made across them.
 // Each instance has a store of its own; only the limits are shared.

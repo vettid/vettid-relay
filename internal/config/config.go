@@ -98,7 +98,7 @@ type Config struct {
 	// Byte budgets. Charged with a request's declared length before its
 	// body is read. The per-key budgets are per relay process; the
 	// network ceilings (RELAY_RATE_IP_BYTES_*, RELAY_RATE_BLOB_BYTES_*)
-	// are relay-wide when the processes share Valkey (proposed 0.9.4).
+	// are relay-wide when the processes share Valkey (0.9.4).
 	// Deposit and claim bytes, per authenticated key (the depositor's,
 	// once its signature verified; a claim's creator) ...
 	RateKeyBytesPerSec float64 // RELAY_RATE_KEY_BYTES_PER_SEC

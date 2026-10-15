@@ -1,6 +1,6 @@
 # VettID Relay Protocol
 
-**Version:** 0.9.4 (draft; **proposed**, awaiting the owner's approval: 0.9.3 is the approved text)
+**Version:** 0.9.4 (draft)
 **Status:** Pre-implementation draft for review
 
 ## 1. Purpose & design principles
@@ -888,8 +888,8 @@ a network: the per-process and per-key limits.)
 | 8 | WebSocket sessions per network | network, per relay process | 1,024 | to an upgrade for a mailbox that already has a WebSocket session on that process; the first session of a mailbox is admitted beyond it, up to 9. `429` with `retry_after` 5 |
 | 9 | WebSocket sessions per network, ceiling | network, per relay process | 2,000 | to every upgrade, a mailbox's first session included: no network holds more on a process. `429` with `retry_after` 5. At least 8 and at most 7 |
 | 10 | WebSocket window | session | 128 messages | to messages sent on a session and not yet acked there: the relay leases a further batch (32) only while it fits, so it pauses at 97 or more outstanding, until acks arrive or leases end |
-| 11 | stored bytes | authenticated key, per relay process; and network as a ceiling, relay-wide (*proposed 0.9.4*: one bucket per network for all relay processes; per process before) | per key 64 KiB/s, burst 2 MiB; per network 768 KiB/s, burst 8 MiB (*proposed 0.9.4*, relay-wide; 1 MiB/s, burst 32 MiB per process before) | charged in bytes. Deposits: the key is the sender's, the token's `sub` (an open token's signer), which the request signature proves only after the body (§5.3 step 7); so after step 6 and **before the body is read**, the network's ceiling is charged with the declared body length (without a `Content-Length`, the largest deposit body) and the key's budget is only checked (an empty one is refused, and the deposit is not read); once the signature has verified, the key's budget is charged with the body's length, unconditionally (it may go into debt). Claim creation (§6.9): the key is the claim's creator, the mailbox owner whose signature verified; key and network are charged together with the claim's length (refused by either, charged to neither). A deposit or claim that is then not stored (quota, signature, malformed body, store failure) is refunded. `429` with `retry_after` |
-| 12 | blob bytes | authenticated key, per relay process; and network as a ceiling, relay-wide (*proposed 0.9.4*: one bucket per network for all relay processes; per process before) | per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst 256 MiB (*proposed 0.9.4*: the same numbers, now relay-wide) | charged in bytes. Blob uploads: the key is the token's `sub`, which the mailbox owner wrote and the request signature proves only after the body (§5.3 step 7); so after §5.3 steps 1–6 and the checks of §6.8 (an upload they refuse, with `quota_exceeded` or, for reservations only, `rate_limited`, holds no slot and is charged nothing), and before the body is read, the network's ceiling is charged with the declared length (an upload without one is refused `bad_request` before this, §6.8) and the key's budget is only checked (an empty one is refused unread); once the signature has verified the key's budget is charged with the bytes received, unconditionally (it may go into debt). Blob downloads: after the owner's signature verified, the owner's key and the network's ceiling are charged together with the blob's size, at most a key's burst (refused by either, charged to neither). An upload that stores nothing is refunded only the part of its network charge it never sent: the bytes that reached the relay stay charged whatever refused it (body failure, signature, quota, store failure); an upload refused a transfer slot (13), or refused at it for its reservation (§6.8), holds none and is refunded entirely. A download by an owner whose budget, or whose network's, is empty is refused before the store is read. `429` with `retry_after` |
+| 11 | stored bytes | authenticated key, per relay process; and network as a ceiling, relay-wide (0.9.4: one bucket per network for all relay processes; per process before) | per key 64 KiB/s, burst 2 MiB; per network 768 KiB/s, burst 8 MiB (0.9.4, relay-wide; 1 MiB/s, burst 32 MiB per process before) | charged in bytes. Deposits: the key is the sender's, the token's `sub` (an open token's signer), which the request signature proves only after the body (§5.3 step 7); so after step 6 and **before the body is read**, the network's ceiling is charged with the declared body length (without a `Content-Length`, the largest deposit body) and the key's budget is only checked (an empty one is refused, and the deposit is not read); once the signature has verified, the key's budget is charged with the body's length, unconditionally (it may go into debt). Claim creation (§6.9): the key is the claim's creator, the mailbox owner whose signature verified; key and network are charged together with the claim's length (refused by either, charged to neither). A deposit or claim that is then not stored (quota, signature, malformed body, store failure) is refunded. `429` with `retry_after` |
+| 12 | blob bytes | authenticated key, per relay process; and network as a ceiling, relay-wide (0.9.4: one bucket per network for all relay processes; per process before) | per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst 256 MiB (0.9.4: the same numbers, now relay-wide) | charged in bytes. Blob uploads: the key is the token's `sub`, which the mailbox owner wrote and the request signature proves only after the body (§5.3 step 7); so after §5.3 steps 1–6 and the checks of §6.8 (an upload they refuse, with `quota_exceeded` or, for reservations only, `rate_limited`, holds no slot and is charged nothing), and before the body is read, the network's ceiling is charged with the declared length (an upload without one is refused `bad_request` before this, §6.8) and the key's budget is only checked (an empty one is refused unread); once the signature has verified the key's budget is charged with the bytes received, unconditionally (it may go into debt). Blob downloads: after the owner's signature verified, the owner's key and the network's ceiling are charged together with the blob's size, at most a key's burst (refused by either, charged to neither). An upload that stores nothing is refunded only the part of its network charge it never sent: the bytes that reached the relay stay charged whatever refused it (body failure, signature, quota, store failure); an upload refused a transfer slot (13), or refused at it for its reservation (§6.8), holds none and is refunded entirely. A download by an owner whose budget, or whose network's, is empty is refused before the store is read. `429` with `retry_after` |
 | 13 | blob transfers | relay process; mailbox; sender and mailbox | 8 per process; per mailbox 2 uploads and, apart, 2 downloads; 1 upload per sender key and mailbox; uploads at most 8 − 2 = 6 per process | to blob uploads once their body has begun to arrive (an upload that has sent nothing holds no slot), and to blob downloads; the mailbox is the recipient's for an upload and the owner's for a download. Uploads never take a mailbox's download slots nor the 2 process slots kept for downloads. `429` with `retry_after` 2. A transfer's body must move at least 16 KiB in every 5 s and finish within 5 minutes, or the transfer is dropped (an upload is answered `400` with `Connection: close`): an upload that trickles at the minimum pace holds its slot up to 5 minutes unless it is cut off for a new upload (0.9.1). When a new upload finds no upload slot free (in the process, or in its mailbox), one in-progress upload is cut off and the new upload takes its slot. It is chosen among the uploads still reading their body (to that mailbox, if the mailbox is full) that are *evictable*: that have run at least 5 s (one pace window), come from another network than the new upload's, and have run at least 30 s or come from a network that has held upload slots on the process for at least 30 s. "Network" here is the IPv4 address or the IPv6 /48, and its 30 s run on across gaps shorter than 30 s with no slot. Of those, the one that received the fewest bytes per second over the last 10 s (over its age, at least 5 s, if younger) goes; of nearly equal speeds (within 10% or 1 KiB/s), the one whose network holds the most upload slots. A sender's own upload to a mailbox is never cut off for its next upload to that mailbox. The cut-off upload is answered `429` with `retry_after` 2 and `Connection: close`, and the bytes it sent stay charged (12). If none is evictable, the new upload is refused as above |
 
 Nothing else is keyed on a network. A request that is properly signed by a
@@ -980,7 +980,7 @@ does the same on its own mailbox.
   recipient two requests, so 10 messages a second sustained; the burst is
   three full batches of 32 with their acks.
 - *Stored bytes, per key 64 KiB/s, burst 2 MiB; per network 768 KiB/s,
-  burst 8 MiB, relay-wide (proposed 0.9.4).* The per-mailbox caps do not bound a network: mailboxes
+  burst 8 MiB, relay-wide (0.9.4).* The per-mailbox caps do not bound a network: mailboxes
   and keys cost nothing. At the flood guard alone one address could store
   about 26 MB a second (100 deposits of 262,144 bytes). Messages pass
   through vaults (phone → own vault → peer vault → peer phone), and a
@@ -996,7 +996,7 @@ does the same on its own mailbox.
   flood guard first, to at most 100 deposits a second, about 0.5 MiB/s,
   under the ceiling's rate; the 8 MiB burst is for moments above the
   rate, about 17 s of that host's busiest steady traffic, and four of a
-  key's bursts (a message to 300 connections each). *Proposed 0.9.4:* the
+  key's bursts (a message to 300 connections each). *0.9.4:* the
   ceiling is relay-wide, shared by every relay process, because it is
   part of what one network can cost the shared store, and the deployment
   runs several processes (2 to 8 in production) against one table. Per
@@ -1023,18 +1023,22 @@ does the same on its own mailbox.
   messages a minute of 4 KB (90 deposits a second) costs about 1,800
   to 1,900 units a second by itself.
 
-  So **a table capped at 2,000 write units a second (the current
-  setting of vettid.org's relay data stack) is too small for one full vault host**:
-  the cap must be raised before such a host arrives, and this ceiling,
-  like the flood guard, sized as a share of it (with a cap of 10,000,
-  for instance, one network's worst case is about a quarter, and a full
-  host a fifth). The ceiling's 768 KiB/s is kept: lowering it would not
+  A table capped at 2,000 write units a second, the production setting
+  until 0.9.4, is too small for one full vault host: either worst case
+  above, or that host alone, takes about all of it. So **the cap is
+  being raised to 10,000 write units a second** (vettid.org's relay data
+  stack), and this ceiling, like the flood guard, is sized as a share of
+  it: one network's worst case is then about a quarter of the table
+  (2,500, small messages at the flood guard with their acks; 1,750, 18%,
+  large messages at the ceiling), and a full 900-vault host about a
+  fifth (1,800 to 1,900), which leaves the rest to every other tenant.
+  The ceiling's 768 KiB/s is kept: lowering it would not
   protect the table from small messages (the flood guard bounds those),
   and it would throttle that host, which needs 0.47 MiB/s. Charges are on the
   declared body length (base64 included) and are refunded for a deposit
   that is then not stored.
 - *Blob bytes, per key 1 MiB/s, burst 32 MiB; per network 8 MiB/s, burst
-  256 MiB, relay-wide (proposed 0.9.4).* Attachments go phone → own vault → peer vault → peer phone,
+  256 MiB, relay-wide (0.9.4).* Attachments go phone → own vault → peer vault → peer phone,
   so they pass through vaults, and a vault host carries hundreds of vaults
   behind one address: a single budget per network would throttle the
   whole host as one. So the budget is per authenticated key, the vault's
@@ -1052,7 +1056,7 @@ does the same on its own mailbox.
   blob served whole from the SQLite store holds up to 8 MiB. 8 MiB/s (67
   Mbit/s) is about what one small relay task can
   move, and bounds a network's blob egress at about 0.7 TB a day (an
-  estimate: about $65 a day at $0.09/GB). *Proposed 0.9.4:* the ceiling
+  estimate: about $65 a day at $0.09/GB). *0.9.4:* the ceiling
   is relay-wide, so that bound holds for the whole relay, not per
   process (with 8 processes it was 8 times that). Blob bodies go to the
   object store, not the table: what a blob costs the table is a few
@@ -1154,7 +1158,7 @@ sender's budget, and an unauthorized deposit's body is not read.
   address then wait their turn.
 - **Storage and its cost are bounded per network by limits 11 and 12, and
   relay-wide only by the deployment** (the store's throughput ceiling, the
-  blob bucket's expiry). *Proposed 0.9.4:* the network ceilings are
+  blob bucket's expiry). *0.9.4:* the network ceilings are
   relay-wide, so one network stores at most 768 KiB/s however many relay
   processes run (before, N times the ceiling behind N processes, which
   with two or more could reach the production table's write ceiling by
@@ -1164,9 +1168,11 @@ sender's budget, and an unauthorized deposit's body is not read.
   per-process buckets of the same size (see "Shared state"), and for that
   time a network can again store up to N times the ceiling. The ceiling
   bounds bytes, not writes: for small messages a network's use of the
-  table is bounded by the request limits (the flood guard), and either
-  bound, like one full vault host, is about the whole of a table capped
-  at 2,000 write units a second ("Where the numbers come from"). Many
+  table is bounded by the request limits (the flood guard). Either
+  bound, like one full vault host, would take about the whole of a
+  table capped at 2,000 write units a second; with the production cap
+  being raised to 10,000, each is a quarter of it or less ("Where the
+  numbers come from"). Many
   addresses together can still fill the relay up to the deployment's
   ceiling. Per
   mailbox, vettid-relay keeps at most 10,000 messages and 32 MiB of them
@@ -1186,7 +1192,7 @@ sender's budget, and an unauthorized deposit's body is not read.
   - After that, to keep a slot it must keep that upload faster, over the
     last 10 s, than an evictable upload of someone else. It pays for every
     byte from its network's ceiling (12; sender keys are free, so the key
-    budgets do not bind it): 8 MiB/s (relay-wide, proposed 0.9.4), about
+    budgets do not bind it): 8 MiB/s (relay-wide, 0.9.4), about
     1.3 MiB/s for each of the 6 upload slots of one process, less if it
     holds slots on several, faster than most uploads from phones.
     Holding them that way spends its whole ceiling (about 0.7 TB a day),
@@ -1232,14 +1238,14 @@ sender's budget, and an unauthorized deposit's body is not read.
 - **Blob keys cost nothing.** Anyone with a mailbox mints tokens for
   fresh sender keys, each with its own blob budget (12), so what bounds
   one network's blob traffic is the network's ceiling, 8 MiB/s
-  relay-wide (proposed 0.9.4), not the key's budget; a vault host's honest traffic shares
+  relay-wide (0.9.4), not the key's budget; a vault host's honest traffic shares
   that ceiling with anything else behind its address. The reverse does
   not hold: a token whose `sub` names another's key (anyone can mint one
   for their own mailbox) cannot spend that key's budget, which is charged
   only once the request signature has proved the key.
 - **Byte keys cost nothing (11 too).** Fresh sender keys each have their
   own deposit budget, so what bounds one network's deposits is its
-  ceiling, 768 KiB/s relay-wide (proposed 0.9.4), which a vault host shares with anything
+  ceiling, 768 KiB/s relay-wide (0.9.4), which a vault host shares with anything
   else behind its address. A token whose `sub` names another's key
   cannot spend that key's budget: it is charged only once the signature
   has proved the key.
@@ -1266,7 +1272,7 @@ and go, and would give whoever gains use of a listed address an unlimited
 relay.
 
 **Shared state.** With several relay processes, limits 1 to 5 and
-(*proposed 0.9.4*) the network ceilings of 11 and 12 are shared (their
+(0.9.4) the network ceilings of 11 and 12 are shared (their
 observable budget is the same however requests are spread; a ceiling's
 charge, forced charge and refund are each one atomic operation on the
 shared bucket, so processes charging at once cannot take more than it
@@ -1307,7 +1313,7 @@ off for a newer one, which the `rate limits` line ends with as
 `relay_ratelimit_busiest_per_minute` (`address`, `key`),
 `relay_ratelimit_busiest_bytes_per_minute` (`bytes`, `blob_bytes`,
 `blob_key_bytes`, `key_bytes`: the bytes charged to the busiest single
-network or key; *proposed 0.9.4:* this, like every busiest-per-minute
+network or key; 0.9.4: this, like every busiest-per-minute
 figure, stays a per-process count of the requests that process served,
 also for the relay-wide ceilings, so a network's relay-wide use is the
 sum over processes, while the `bytes` and `blob_bytes` peaks are how
@@ -1343,7 +1349,7 @@ refuses to start otherwise). The window (10) is not configurable.
 `RELAY_RATE_KEY_BYTES` and `RELAY_RATE_IP_BYTES` (11: per key, and the
 network's ceiling), `RELAY_RATE_BLOB_KEY_BYTES` and
 `RELAY_RATE_BLOB_BYTES` (12: per key, and the network's ceiling), each as
-`_PER_SEC` and `_BURST`, in bytes (*proposed 0.9.4*: the same variables;
+`_PER_SEC` and `_BURST`, in bytes (0.9.4: the same variables;
 the network ceilings' values are now relay-wide, per process only
 without, or while without, the shared store); `RELAY_MAX_CONCURRENT_BLOB_TRANSFERS`
 and `RELAY_MAX_BLOB_TRANSFERS_PER_MAILBOX` (13), and
@@ -1565,8 +1571,9 @@ The push gateway API is specified separately.
 
 ## 10. Changelog
 
-- **0.9.4** — *proposed* (vettid-relay, awaiting the owner's approval of
-  the wording). §7.2: the network ceilings of the byte budgets (limit 11,
+- **0.9.4** — **approved by the owner 2026-10-15** (vettid-relay #14),
+  with raising the production table's cap to 10,000 write units a
+  second. §7.2: the network ceilings of the byte budgets (limit 11,
   deposits and claims; limit 12, blobs) are **relay-wide**, one bucket
   per network shared by every relay process (through the shared store,
   like limits 1 to 5), instead of per process: behind several processes
@@ -1586,7 +1593,8 @@ The push gateway API is specified separately.
   per-process fallback). "Where the numbers come from" states what a
   message costs the table, that the request limits bound small
   messages' share of it, and that the production table's cap of 2,000
-  write units a second is too small for one full vault host; the
+  write units a second is too small for one full vault host, so it is
+  raised to 10,000 and the worst cases are sized against that; the
   busiest-per-minute figures stay per process. No wire change: clients
   see only more or fewer `429`s
 - **0.9.3** — errata approved by the owner 2026-10-15 (vettid-relay

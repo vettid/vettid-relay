@@ -193,8 +193,10 @@ version does not protect against. In short:
   a network's table use (about 2,500 units a second at 100 deposits a
   second of about 5.5 KB, acks included), and a full 900-vault host
   needs about 1,800 to 1,900 by itself. A table capped at 2,000 write
-  units a second is too small for one full host: raise the cap before
-  the load, and size these limits as a share of it.
+  units a second is too small for one full host, so production's cap is
+  being raised to 10,000 (vettid.org's relay data stack); against it
+  one network's worst case is about a quarter and a full host about a
+  fifth. Size these limits as a share of the table's cap.
 - **Blob transfers**: at most 8 per process, of which at most 6 uploads
   (2 are kept for downloads); per mailbox at most 2 uploads and,
   separately, 2 downloads; one upload at a time per sender key and
