@@ -79,6 +79,27 @@ jobs:
     needs: [test]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: mirror settings match the Dockerfile
+        # BUILDKIT_SYNTAX must be the mirror of the Dockerfile's pinned
+        # # syntax digest, and each build-contexts key must be one of its
+        # FROM references (a key that matches no FROM is ignored, and the
+        # image would come from Docker Hub after all).
+        run: |
+          bad=0
+          want=$(sed -nE '1s/^# syntax=[^ ]+@(sha256:[0-9a-f]{64})$/\1/p' Dockerfile)
+          [ -n "$want" ] || { echo "::error::the Dockerfile's # syntax line is not pinned by digest"; bad=1; }
+          syn=$(grep -oE '^ +BUILDKIT_SYNTAX=[^ ]+' .github/workflows/ci.yml | sed -E 's/^ +//' || true)
+          [ -n "$syn" ] || { echo "::error::no BUILDKIT_SYNTAX in ci.yml"; bad=1; }
+          for v in $syn; do
+            [ "${v##*@}" = "$want" ] || { echo "::error::$v, Dockerfile # syntax digest $want"; bad=1; }
+          done
+          froms=$(sed -nE 's/^FROM (--platform=[^ ]+ )?([^ ]+).*/\2/p' Dockerfile)
+          keys=$(grep -oE '^ +[^ =#]+@sha256:[0-9a-f]{64}=docker-image://' .github/workflows/ci.yml | sed -E 's/^ +//; s/=docker-image:\/\/$//' || true)
+          [ -n "$keys" ] || { echo "::error::no build-contexts in ci.yml"; bad=1; }
+          for k in $keys; do
+            grep -qxF -- "$k" <<<"$froms" || { echo "::error::build-contexts key $k is not a FROM of the Dockerfile"; bad=1; }
+          done
+          exit "$bad"
       # binfmt, BuildKit, the Dockerfile frontend and the golang base image
       # from VettID's mirror of the upstream digests (vettid.org
       # .github/mirror), not Docker Hub; upstream references in the comments.
