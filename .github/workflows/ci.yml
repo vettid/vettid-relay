@@ -34,13 +34,18 @@ jobs:
     # mailbox deletion).
     runs-on: ubuntu-26.04
     timeout-minutes: 10
+    # Service images: VettID's mirror of the upstream digests (vettid.org
+    # .github/mirror), not Docker Hub (anonymous pull limits on shared
+    # runners). The upstream reference is in the comment.
     services:
       dynamodb:
-        image: amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+        # docker.io/amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+        image: ghcr.io/vettid/mirror/dynamodb-local@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
         ports: ["18000:8000"]
         options: --memory 1g
       valkey:
-        image: valkey/valkey:8.1.10-alpine@sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
+        # docker.io/valkey/valkey:8.1.10-alpine@sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
+        image: ghcr.io/vettid/mirror/valkey@sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
         ports: ["16379:6379"]
         options: --memory 256m
     steps:
@@ -74,8 +79,17 @@ jobs:
     needs: [test]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # binfmt, BuildKit, the Dockerfile frontend and the golang base image
+      # from VettID's mirror of the upstream digests (vettid.org
+      # .github/mirror), not Docker Hub; upstream references in the comments.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          # docker.io/tonistiigi/binfmt:latest@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          image: ghcr.io/vettid/mirror/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # docker.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea (v0.33.1)
+          driver-opts: image=ghcr.io/vettid/mirror/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - name: build image (amd64 + arm64, not pushed)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -83,6 +97,12 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: false
           tags: vettid-relay:ci
+          # Dockerfile: # syntax=docker.io/docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+          build-args: |
+            BUILDKIT_SYNTAX=ghcr.io/vettid/mirror/dockerfile@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+          # Dockerfile: FROM docker.io/library/golang:1.26-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c
+          build-contexts: |
+            docker.io/library/golang:1.26-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c=docker-image://ghcr.io/vettid/mirror/golang@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c
 
   publish:
     # main only: publish a multi-arch image to GHCR. Deployments pin the
@@ -95,8 +115,17 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # binfmt, BuildKit, the Dockerfile frontend and the golang base image
+      # from VettID's mirror of the upstream digests (vettid.org
+      # .github/mirror), not Docker Hub; upstream references in the comments.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          # docker.io/tonistiigi/binfmt:latest@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          image: ghcr.io/vettid/mirror/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # docker.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea (v0.33.1)
+          driver-opts: image=ghcr.io/vettid/mirror/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -111,6 +140,12 @@ jobs:
           push: true
           provenance: true
           sbom: true
+          # Dockerfile: # syntax=docker.io/docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+          build-args: |
+            BUILDKIT_SYNTAX=ghcr.io/vettid/mirror/dockerfile@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+          # Dockerfile: FROM docker.io/library/golang:1.26-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c
+          build-contexts: |
+            docker.io/library/golang:1.26-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c=docker-image://ghcr.io/vettid/mirror/golang@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c
           tags: |
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
             ghcr.io/${{ github.repository }}:main

@@ -25,8 +25,11 @@ race:
 # test that needs them (DynamoDB conformance, coord, API suite on DynamoDB,
 # multi-process e2e) and always tears them down.
 CONTAINER      ?= $(shell command -v docker || command -v podman)
-DDB_IMAGE      ?= docker.io/amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
-VALKEY_IMAGE   ?= docker.io/valkey/valkey:8.1.10-alpine@sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
+# VettID's mirror of the upstream digests (vettid.org .github/mirror):
+#   docker.io/amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+#   docker.io/valkey/valkey:8.1.10-alpine@sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
+DDB_IMAGE      ?= ghcr.io/vettid/mirror/dynamodb-local@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+VALKEY_IMAGE   ?= ghcr.io/vettid/mirror/valkey@sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
 DDB_PORT       ?= 18000
 VALKEY_PORT    ?= 16379
 SHARED_ENV      = RELAY_TEST_DYNAMODB_ENDPOINT=http://127.0.0.1:$(DDB_PORT) RELAY_TEST_VALKEY_ADDR=127.0.0.1:$(VALKEY_PORT) RELAY_TEST_REQUIRE_SHARED=1
