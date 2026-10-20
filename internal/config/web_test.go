@@ -2,6 +2,7 @@ package config
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -108,6 +109,107 @@ func FuzzParseCertFingerprints(f *testing.F) {
 			again, err := ParseCertFingerprints(fp)
 			if err != nil || len(again) != 1 || again[0] != fp {
 				t.Fatalf("not idempotent: %q", fp)
+			}
+		}
+	})
+}
+
+func TestIOSAppIDDefaults(t *testing.T) {
+	c, err := Load(env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(c.IOSAppIDs, []string{"3X25CJ86MV.com.vettid.app", "3X25CJ86MV.com.vettid.app.staging"}) {
+		t.Fatalf("%v", c.IOSAppIDs)
+	}
+	// Defaults are copied, never shared with the package variable.
+	c.IOSAppIDs[0] = "x"
+	if DefaultIOSAppIDs[0] != "3X25CJ86MV.com.vettid.app" {
+		t.Fatal("defaults aliased")
+	}
+}
+
+func TestIOSAppIDOverrides(t *testing.T) {
+	c, err := Load(env(map[string]string{
+		"RELAY_IOS_APP_IDS": " ABCDE12345.org.example.app-2 , ,3X25CJ86MV.com.vettid.app.dev,ABCDE12345.org.example.app-2",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(c.IOSAppIDs, []string{"ABCDE12345.org.example.app-2", "3X25CJ86MV.com.vettid.app.dev"}) {
+		t.Fatalf("%v", c.IOSAppIDs)
+	}
+	// Set but empty (or blank): apple-app-site-association is off.
+	for _, v := range []string{"", " ", " , "} {
+		c, err = Load(env(map[string]string{"RELAY_IOS_APP_IDS": v}))
+		if err != nil || len(c.IOSAppIDs) != 0 {
+			t.Fatalf("%q: %v %v", v, c.IOSAppIDs, err)
+		}
+	}
+}
+
+func TestIOSAppIDRejects(t *testing.T) {
+	for _, v := range []string{
+		"com.vettid.app",                             // no team ID
+		"3X25CJ86MV",                                 // no bundle id
+		"3X25CJ86MV.",                                // empty bundle id
+		"3X25CJ86MV.vettid",                          // one segment
+		"3x25cj86mv.com.vettid.app",                  // lower-case team ID
+		"3X25CJ86M.com.vettid.app",                   // 9-character team ID
+		"3X25CJ86MVX.com.vettid.app",                 // 11-character team ID
+		"3X25CJ86MV.com..app",                        // empty segment
+		"3X25CJ86MV.com.vettid.app.",                 // trailing dot
+		"3X25CJ86MV.com.vettid_app",                  // underscore
+		"3X25CJ86MV.com.vettid app",                  // space
+		"3X25CJ86MV.com.vettid.*",                    // wildcard
+		"3X25CJ86MV.com.vettid.app\"",                // quote
+		"3X25CJ86MV.com.vettid.app/x",                // slash
+		"3X25CJ86MV.com." + "é" + ".app",             // non-ASCII
+		"3X25CJ86MV.com." + strings.Repeat("a", 250), // too long
+	} {
+		if _, err := Load(env(map[string]string{"RELAY_IOS_APP_IDS": v})); err == nil {
+			t.Errorf("%q: expected error", v)
+		}
+	}
+	var list []string
+	for i := 0; i < 33; i++ {
+		list = append(list, "ABCDE12345.org.example.app"+strconv.Itoa(i))
+	}
+	if _, err := ParseIOSAppIDs(strings.Join(list, ",")); err == nil {
+		t.Fatal("33 App IDs accepted")
+	}
+	if ids, err := ParseIOSAppIDs(strings.Join(list[:32], ",")); err != nil || len(ids) != 32 {
+		t.Fatalf("32 App IDs: %d %v", len(ids), err)
+	}
+	// A list set directly on the Config is checked too.
+	c := Defaults()
+	c.IOSAppIDs = []string{"bad"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("invalid IOSAppIDs passed validation")
+	}
+}
+
+func FuzzParseIOSAppIDs(f *testing.F) {
+	for _, s := range []string{"3X25CJ86MV.com.vettid.app", "3X25CJ86MV.com.vettid.app,3X25CJ86MV.com.vettid.app.staging", "", ",", " , ", "3X25CJ86MV.a.b", "x", "3X25CJ86MV..", "\"", "3X25CJ86MV.a.b,3X25CJ86MV.a.b"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		ids, err := ParseIOSAppIDs(s)
+		if err != nil {
+			return
+		}
+		if len(ids) > maxIOSAppIDs {
+			t.Fatalf("%d App IDs", len(ids))
+		}
+		seen := map[string]bool{}
+		for _, id := range ids {
+			if seen[id] || !validIOSAppID(id) || strings.ContainsAny(id, "\"\\ ,*/?#") {
+				t.Fatalf("bad output %q", id)
+			}
+			seen[id] = true
+			again, err := ParseIOSAppIDs(id)
+			if err != nil || len(again) != 1 || again[0] != id {
+				t.Fatalf("not idempotent: %q", id)
 			}
 		}
 	})

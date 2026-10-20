@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -158,7 +159,7 @@ func TestConnectConditional(t *testing.T) {
 
 func TestWebMethods(t *testing.T) {
 	f := newFixture(t, nil)
-	for _, p := range []string{"/connect", "/.well-known/assetlinks.json", "/robots.txt"} {
+	for _, p := range []string{"/connect", "/.well-known/assetlinks.json", "/.well-known/apple-app-site-association", "/robots.txt"} {
 		for _, m := range []string{"POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "PROPFIND"} {
 			r := f.web(m, p+"?q=1", nil)
 			if r.status != http.StatusMethodNotAllowed || len(r.body) != 0 || r.header.Get("Allow") != "GET, HEAD" ||
@@ -181,7 +182,10 @@ func TestWebVariantsAreOrdinary404s(t *testing.T) {
 		"/connect/", "/connect/x", "/connect/.", "/connect/..", "/Connect", "/CONNECT", "//connect", "/./connect",
 		"/x/../connect", "/%63onnect", "/connect%2F", "/connect%2f", "/connect.html", "/connect;x", "/connect%00",
 		"/connectx", "/connect/?x=1", "/.well-known/", "/.well-known", "/.well-known/assetlinks.json/",
-		"/.well-known/./assetlinks.json", "/.well-known/apple-app-site-association", "/.well-known/security.txt",
+		"/.well-known/./assetlinks.json", "/.well-known/security.txt",
+		"/.well-known/apple-app-site-association.json", "/apple-app-site-association", "/.well-known/apple-app-site-association/",
+		"/.well-known/Apple-App-Site-Association", "/.well-known/%61pple-app-site-association", "/.well-known/apple-app-site-association%2F",
+		"/.well-known/apple-app-site-association/x", "//.well-known/apple-app-site-association",
 		"/robots.txt/", "/v1//mailbox", "/v1/../connect", "/favicon.ico", "/index.html", "/",
 	} {
 		r := f.web("GET", p, nil)
@@ -322,6 +326,126 @@ func TestAssetLinksConfigurable(t *testing.T) {
 	}
 }
 
+// aasaDefault is the apple-app-site-association body with the default
+// configuration, byte for byte as RELAY-PROTOCOL §6.11 gives it.
+const aasaDefault = `{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": [
+          "3X25CJ86MV.com.vettid.app",
+          "3X25CJ86MV.com.vettid.app.staging"
+        ],
+        "components": [
+          {
+            "/": "/connect"
+          }
+        ]
+      }
+    ]
+  }
+}
+`
+
+func TestAASADefault(t *testing.T) {
+	f := newFixture(t, nil)
+	r := f.web("GET", "/.well-known/apple-app-site-association", nil)
+	if r.status != 200 || string(r.body) != aasaDefault {
+		t.Fatalf("%d %q", r.status, r.body)
+	}
+	// The same headers as assetlinks.json, apart from the body's ETag and
+	// Content-Length.
+	al := f.web("GET", "/.well-known/assetlinks.json", nil)
+	if r.header.Get("Etag") != f.s.web.aasa.etag || r.header.Get("Content-Length") != strconv.Itoa(len(aasaDefault)) {
+		t.Fatalf("etag/length %v", r.header)
+	}
+	for _, h := range []http.Header{r.header, al.header} {
+		h.Del("Etag")
+		h.Del("Content-Length")
+	}
+	if !sameResp(webResp{200, r.header, nil}, webResp{200, al.header, nil}) {
+		t.Fatalf("headers differ from assetlinks.json:\n%v\n%v", r.header, al.header)
+	}
+	if r.header.Get("Content-Type") != "application/json" || r.header.Get("Cache-Control") != webCacheControl ||
+		r.header.Get("Content-Security-Policy") != webDataCSP || r.header.Get("Location") != "" || r.header.Get("Set-Cookie") != "" {
+		t.Fatalf("%v", r.header)
+	}
+
+	// Nothing but applinks for /connect.
+	var doc map[string]any
+	if err := json.Unmarshal(r.body, &doc); err != nil || len(doc) != 1 || doc["applinks"] == nil {
+		t.Fatalf("%v %v", doc, err)
+	}
+	for _, bad := range []string{"webcredentials", "appclips", "\"paths\"", "\"appID\"", "exclude", "*"} {
+		if strings.Contains(string(r.body), bad) {
+			t.Errorf("body contains %s", bad)
+		}
+	}
+
+	// The same bytes for every request; 304 and HEAD as for the others.
+	base := f.web("GET", "/.well-known/apple-app-site-association", nil)
+	for _, v := range []struct {
+		path string
+		hdr  http.Header
+	}{
+		{"/.well-known/apple-app-site-association?x=MARKERQ", nil},
+		{"/.well-known/apple-app-site-association", http.Header{"User-Agent": {"AASA-Bot/1.0.0 MARKERUA"}, "Referer": {"https://MARKERR"}}},
+		{"/.well-known/apple-app-site-association", http.Header{"Accept": {"text/html"}, "Cookie": {"MARKERC=1"}, "Range": {"bytes=0-3"}}},
+	} {
+		got := f.web("GET", v.path, v.hdr)
+		if !sameResp(base, got) {
+			t.Errorf("%s %v: response differs", v.path, v.hdr)
+		}
+		all, _ := json.Marshal(got.header)
+		if bytes.Contains(got.body, []byte("MARKER")) || bytes.Contains(all, []byte("MARKER")) {
+			t.Errorf("%s: request content reflected", v.path)
+		}
+	}
+	nm := f.web("GET", "/.well-known/apple-app-site-association", http.Header{"If-None-Match": {f.s.web.aasa.etag}})
+	if nm.status != http.StatusNotModified || len(nm.body) != 0 || nm.header.Get("Etag") != f.s.web.aasa.etag {
+		t.Fatalf("304: %d %v", nm.status, nm.header)
+	}
+	h := f.web("HEAD", "/.well-known/apple-app-site-association", nil)
+	if h.status != 200 || len(h.body) != 0 || h.header.Get("Content-Length") != base.header.Get("Content-Length") {
+		t.Fatalf("HEAD: %d %v", h.status, h.header)
+	}
+}
+
+func TestAASAConfigurable(t *testing.T) {
+	cfg, err := config.Load(func(k string) (string, bool) {
+		v, ok := map[string]string{"RELAY_IOS_APP_IDS": " ABCDE12345.org.example.relay-app , 3X25CJ86MV.com.vettid.app.dev"}[k]
+		return v, ok
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixture(t, func(c *config.Config) { c.IOSAppIDs = cfg.IOSAppIDs })
+	r := f.web("GET", "/.well-known/apple-app-site-association", nil)
+	want := strings.Replace(aasaDefault, `"3X25CJ86MV.com.vettid.app",
+          "3X25CJ86MV.com.vettid.app.staging"`, `"ABCDE12345.org.example.relay-app",
+          "3X25CJ86MV.com.vettid.app.dev"`, 1)
+	if r.status != 200 || string(r.body) != want {
+		t.Fatalf("%d %s", r.status, r.body)
+	}
+
+	// An empty list turns the document off: the ordinary 404; the other
+	// documents still serve.
+	off := newFixture(t, func(c *config.Config) { c.IOSAppIDs = nil })
+	if r, ref := off.web("GET", "/.well-known/apple-app-site-association", nil), off.web("GET", "/nope", nil); !sameResp(r, ref) {
+		t.Fatalf("disabled AASA: %d %s", r.status, r.body)
+	}
+	for _, p := range []string{"/connect", "/.well-known/assetlinks.json"} {
+		if r := off.web("GET", p, nil); r.status != 200 {
+			t.Fatalf("%s without AASA: %d", p, r.status)
+		}
+	}
+	// And the other way round.
+	noAndroid := newFixture(t, func(c *config.Config) { c.AndroidCertFingerprints = nil })
+	if r := noAndroid.web("GET", "/.well-known/apple-app-site-association", nil); r.status != 200 || string(r.body) != aasaDefault {
+		t.Fatalf("AASA without assetlinks: %d", r.status)
+	}
+}
+
 // The web bucket is per IP and separate from the API's: a scanner that
 // exhausts it gets 429 on web paths and unknown paths only, and mailbox
 // traffic is unaffected (and the other way round).
@@ -382,9 +506,11 @@ func TestWebLogsCarryNothingRequestSpecific(t *testing.T) {
 	f.web("GET", "/connect/LOGPATH", hdr)
 	f.web("GET", "//connect/LOGPATH2", hdr)
 	f.web("GET", "/.well-known/assetlinks.json?LOGQUERY4", hdr)
+	f.web("GET", "/.well-known/apple-app-site-association?LOGQUERY5", hdr)
 	f.web("GET", "/.well-known/LOGPATH3", hdr)
 	out := logs.String()
-	if !strings.Contains(out, `"route":"/connect"`) || !strings.Contains(out, `"route":"/.well-known/assetlinks.json"`) || !strings.Contains(out, `"route":"unmatched"`) {
+	if !strings.Contains(out, `"route":"/connect"`) || !strings.Contains(out, `"route":"/.well-known/assetlinks.json"`) ||
+		!strings.Contains(out, `"route":"/.well-known/apple-app-site-association"`) || !strings.Contains(out, `"route":"unmatched"`) {
 		t.Fatalf("expected route patterns in logs:\n%s", out)
 	}
 	for _, m := range []string{"LOG" + "QUERY", "LOGPATH", "LOGREF", "LOGUA", "LOGCOOKIE", "example.net", "?", "Referer", "referer"} {

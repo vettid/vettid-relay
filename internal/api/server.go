@@ -57,7 +57,7 @@ type Server struct {
 	claimLimit       RateLimiter   // unauthenticated claim GETs, per IPv4 / IPv6 /64
 	webLimit         RateLimiter   // everything outside /v1/ and /healthz, per IPv4 / IPv6 /64 (always in-process)
 
-	web  *webDocs // /connect, /.well-known/assetlinks.json, /robots.txt (§6.11)
+	web  *webDocs // /connect, /.well-known/assetlinks.json, apple-app-site-association, /robots.txt (§6.11)
 	hsts bool     // public base URL is https: send Strict-Transport-Security
 
 	hub      *hub
@@ -171,7 +171,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		webLimit:         ratelimit.New(cfg.RateWebPerSec, cfg.RateWebBurst, 100_000),
 		hsts:             strings.HasPrefix(cfg.BaseURL, "https://"),
 	}
-	web, err := newWebDocs(cfg.AndroidPackage, cfg.AndroidCertFingerprints, s.hsts)
+	web, err := newWebDocs(cfg.AndroidPackage, cfg.AndroidCertFingerprints, cfg.IOSAppIDs, s.hsts)
 	if err != nil {
 		panic("relay web documents: " + err.Error()) // the embedded page is malformed: a build defect
 	}

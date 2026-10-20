@@ -121,6 +121,10 @@ type Config struct {
 	// assetlinks.json off (404).
 	AndroidPackage          string   // RELAY_ANDROID_PACKAGE
 	AndroidCertFingerprints []string // RELAY_ANDROID_CERT_SHA256 (comma-separated)
+	// /.well-known/apple-app-site-association names the iOS apps allowed
+	// to open this relay's /connect links. An empty list
+	// (RELAY_IOS_APP_IDS set to "") turns the document off (404).
+	IOSAppIDs []string // RELAY_IOS_APP_IDS (comma-separated)
 
 	MaxCollectorsPerMailbox int // RELAY_MAX_COLLECTORS_PER_MAILBOX
 	MaxWebSocketSessions    int // RELAY_MAX_WS_SESSIONS: open WebSocket collect sessions, per relay process
@@ -179,6 +183,15 @@ var DefaultAndroidCertFingerprints = []string{
 	// Staging signers (staging builds also use relay.vettid.org).
 	"BD:83:A0:75:3F:AA:6A:F6:F8:D8:1B:9F:76:A0:4A:C1:A4:99:EA:6C:7F:46:C6:F1:11:3D:4B:57:87:EC:B2:C4",
 	"2F:ED:27:B7:27:46:79:7A:93:1F:D4:14:FF:3D:AC:4C:D9:69:FA:0C:2F:F3:62:09:AE:05:36:5F:58:00:14:F2",
+}
+
+// DefaultIOSAppIDs are the App IDs (team ID and bundle id) of the official
+// VettID iOS app, production and staging (staging builds also use
+// relay.vettid.org), so that every relay lets the official app open its
+// links.
+var DefaultIOSAppIDs = []string{
+	"3X25CJ86MV.com.vettid.app",
+	"3X25CJ86MV.com.vettid.app.staging",
 }
 
 // Defaults returns the documented default configuration.
@@ -245,6 +258,7 @@ func Defaults() Config {
 
 		AndroidPackage:          DefaultAndroidPackage,
 		AndroidCertFingerprints: append([]string(nil), DefaultAndroidCertFingerprints...),
+		IOSAppIDs:               append([]string(nil), DefaultIOSAppIDs...),
 
 		MaxCollectorsPerMailbox: 4,
 		MaxWebSocketSessions:    4000,
@@ -401,6 +415,14 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			c.AndroidCertFingerprints = fps
 		}
 	}
+	if v, ok := lookup("RELAY_IOS_APP_IDS"); ok {
+		ids, err := ParseIOSAppIDs(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("RELAY_IOS_APP_IDS: %w", err))
+		} else {
+			c.IOSAppIDs = ids
+		}
+	}
 
 	integer("RELAY_MAX_COLLECTORS_PER_MAILBOX", &c.MaxCollectorsPerMailbox)
 	integer("RELAY_MAX_WS_SESSIONS", &c.MaxWebSocketSessions)
@@ -539,6 +561,15 @@ func (c Config) Validate() error {
 			break
 		}
 	}
+	if len(c.IOSAppIDs) > maxIOSAppIDs {
+		errs = append(errs, fmt.Errorf("RELAY_IOS_APP_IDS: at most %d App IDs", maxIOSAppIDs))
+	}
+	for _, id := range c.IOSAppIDs {
+		if !validIOSAppID(id) {
+			errs = append(errs, errors.New("RELAY_IOS_APP_IDS: App IDs must be TEAMID.bundle.id"))
+			break
+		}
+	}
 	switch strings.ToLower(c.LogLevel) {
 	case "debug", "info", "warn", "error":
 	default:
@@ -617,6 +648,66 @@ func ParseCertFingerprints(s string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// maxIOSAppIDs bounds RELAY_IOS_APP_IDS.
+const maxIOSAppIDs = 32
+
+// ParseIOSAppIDs parses a comma-separated list of iOS App IDs
+// ("3X25CJ86MV.com.vettid.app"). Spaces around each item and empty items
+// are ignored, duplicates dropped and the order kept. An empty or blank
+// string yields an empty list.
+func ParseIOSAppIDs(s string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, item := range strings.Split(s, ",") {
+		id := strings.TrimSpace(item)
+		if id == "" {
+			continue
+		}
+		if !validIOSAppID(id) {
+			return nil, errors.New("want App IDs like 3X25CJ86MV.com.vettid.app (a 10-character team ID, a dot, a bundle id)")
+		}
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+		if len(out) > maxIOSAppIDs {
+			return nil, fmt.Errorf("at most %d App IDs", maxIOSAppIDs)
+		}
+	}
+	return out, nil
+}
+
+// validIOSAppID reports whether s is an App ID: a team ID of 10 characters
+// A-Z or 0-9, a dot, and a bundle id of at least two dot-separated
+// non-empty segments of letters, digits and hyphens.
+func validIOSAppID(s string) bool {
+	if len(s) < 14 || len(s) > 255 || s[10] != '.' {
+		return false
+	}
+	for i := 0; i < 10; i++ {
+		ch := s[i]
+		if !(ch >= 'A' && ch <= 'Z') && !(ch >= '0' && ch <= '9') {
+			return false
+		}
+	}
+	segs := strings.Split(s[11:], ".")
+	if len(segs) < 2 {
+		return false
+	}
+	for _, seg := range segs {
+		if seg == "" {
+			return false
+		}
+		for i := 0; i < len(seg); i++ {
+			ch := seg[i]
+			if !(ch >= 'a' && ch <= 'z') && !(ch >= 'A' && ch <= 'Z') && !(ch >= '0' && ch <= '9') && ch != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // validAndroidPackage reports whether s is a valid Android application id:
