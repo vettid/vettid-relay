@@ -141,6 +141,7 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | Per-source-IP bucket for the web endpoints (§6.11) and every other path outside `/v1/` except `/healthz`. It's separate from the API bucket, so scanners never use up mailbox traffic's budget, and always in-process (per relay process, no Valkey round trip). |
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `/.well-known/assetlinks.json`. |
 | `RELAY_ANDROID_CERT_SHA256` | the official VettID app's signing keys | Comma-separated SHA-256 certificate fingerprints for `assetlinks.json`, colon-separated or plain hex, any case (served in uppercase colon form). The built-in default (`config.DefaultAndroidCertFingerprints`: the production upload key and the two staging signers) lets a self-hosted relay open links in the official app with no configuration. Set but empty turns `assetlinks.json` off (404). |
+| `RELAY_IOS_APP_IDS` | `3X25CJ86MV.com.vettid.app,3X25CJ86MV.com.vettid.app.staging` | Comma-separated iOS App IDs (`TEAMID.bundle.id`) for `appIDs` in `/.well-known/apple-app-site-association`, in order; spaces and empty items ignored, duplicates dropped, at most 32. The built-in default (`config.DefaultIOSAppIDs`: the official app's production and staging App IDs) lets a self-hosted relay open links in the official iOS app with no configuration. Anything else stops the relay at start. Set but empty turns the document off (404). |
 | `RELAY_MAX_COLLECTORS_PER_MAILBOX` | `4` | Concurrent long-polls plus WebSockets per mailbox. |
 | `RELAY_MAX_WS_SESSIONS` | `4000` | Open WebSocket collect sessions per relay process, over all mailboxes. An upgrade beyond it is answered `429 rate_limited` with `retry_after` 5; long-poll isn't affected. At about 45 KiB a session the default is about 176 MiB. |
 | `RELAY_MAX_WS_SESSIONS_PER_NETWORK` | `1024` | Of those, the sessions of one client network (the IPv4 address or the IPv6 /64) per relay process. The first session of a mailbox is always admitted, so a full network keeps no mailbox behind it from collecting; beyond the maximum a network gets one session per mailbox, up to the ceiling below. Other upgrades are answered `429 rate_limited` with `retry_after` 5. See [Rate limiting](#rate-limiting). |
@@ -416,10 +417,11 @@ bucket of 20/s, burst 40 ("old": this code with `main`'s limits, not
   `blob_id`. Payloads, blob bytes, tokens, signatures, public keys, mailbox
   ids and client IPs are never logged. A test enforces this. For the web
   endpoints the line has the route (`/connect`,
-  `/.well-known/assetlinks.json`, or `unmatched` for every other path),
+  `/.well-known/assetlinks.json`, `/.well-known/apple-app-site-association`,
+  or `unmatched` for every other path),
   never the query, the raw path or `Referer`.
-- **Web endpoints** (spec §6.11). `/connect`, `/.well-known/assetlinks.json`
-  and `/robots.txt` are fixed documents built at startup (the page is
+- **Web endpoints** (spec §6.11). `/connect`, `/.well-known/assetlinks.json`,
+  `/.well-known/apple-app-site-association` and `/robots.txt` are fixed documents built at startup (the page is
   embedded with `go:embed` from `internal/api/web/`), the same bytes for
   every request: query ignored, `GET`/`HEAD` only (`405` otherwise),
   `Cache-Control: public, max-age=86400, immutable` with a strong `ETag`.
@@ -540,6 +542,7 @@ other process sees, refuses or is woken by.
 | `GET /healthz` | none | `200` when the DB is reachable and not draining, else `503`. The DB is asked at most once every 2 s per process; requests in between get the last answer |
 | `GET /connect` | none (web bucket) | `200 text/html`: the invitation landing page (§6.11). Invitation URLs are `<relay>/connect#<link>`; the fragment never reaches the relay. |
 | `GET /.well-known/assetlinks.json` | none (web bucket) | `200 application/json`: Android App Links statement for the VettID app |
+| `GET /.well-known/apple-app-site-association` | none (web bucket) | `200 application/json`: iOS Universal Links (`applinks`) for the VettID app, the path `/connect` only (§6.11) |
 | `GET /robots.txt` | none (web bucket) | `200 text/plain` |
 
 Error bodies are `{"code", "message", "retry_after"?}`, and a `quota_exceeded`

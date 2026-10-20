@@ -14,8 +14,8 @@ import (
 	"strings"
 )
 
-// Web endpoints (spec §6.11): fixed documents served to browsers and to
-// Android's App Links verifier. Each is built once at startup and served
+// Web endpoints (spec §6.11): fixed documents served to browsers, to
+// Android's App Links verifier and to Apple's associated-domains CDN. Each is built once at startup and served
 // byte-for-byte the same to every request: nothing in a response depends on
 // the request (path variants, query, headers or cookies) except the method
 // and If-None-Match. Invitation links carry their payload in the URL
@@ -30,6 +30,7 @@ var robotsTXT []byte
 const (
 	pathConnect    = "/connect"
 	pathAssetLinks = "/.well-known/assetlinks.json"
+	pathAASA       = "/.well-known/apple-app-site-association"
 	pathRobots     = "/robots.txt"
 
 	// webCacheControl lets browsers and shared caches keep a document for a
@@ -145,6 +146,7 @@ type webDocs struct {
 	connect    *staticDoc
 	robots     *staticDoc
 	assetLinks *staticDoc // nil when no fingerprints are configured
+	aasa       *staticDoc // nil when no iOS App IDs are configured
 	connectCSP string
 }
 
@@ -152,7 +154,7 @@ type webDocs struct {
 const hstsValue = "max-age=31536000"
 
 // newWebDocs builds the web documents for this configuration.
-func newWebDocs(androidPackage string, fingerprints []string, hsts bool) (*webDocs, error) {
+func newWebDocs(androidPackage string, fingerprints, iosAppIDs []string, hsts bool) (*webDocs, error) {
 	csp, err := connectCSP(connectHTML)
 	if err != nil {
 		return nil, err
@@ -169,7 +171,42 @@ func newWebDocs(androidPackage string, fingerprints []string, hsts bool) (*webDo
 		}
 		wd.assetLinks = newStaticDoc(body, "application/json", webDataCSP, hsts)
 	}
+	if len(iosAppIDs) > 0 {
+		body, err := aasaJSON(iosAppIDs)
+		if err != nil {
+			return nil, err
+		}
+		wd.aasa = newStaticDoc(body, "application/json", webDataCSP, hsts)
+	}
 	return wd, nil
+}
+
+// aasaJSON is the Apple App Site Association file letting the iOS app open
+// this relay's invitation links as Universal Links: applinks only, the
+// exact path /connect only (any query, any fragment). No webcredentials,
+// no appclips.
+func aasaJSON(appIDs []string) ([]byte, error) {
+	type component struct {
+		Path string `json:"/"`
+	}
+	type detail struct {
+		AppIDs     []string    `json:"appIDs"`
+		Components []component `json:"components"`
+	}
+	type applinks struct {
+		Details []detail `json:"details"`
+	}
+	type aasa struct {
+		Applinks applinks `json:"applinks"`
+	}
+	b, err := json.MarshalIndent(aasa{Applinks: applinks{Details: []detail{{
+		AppIDs:     appIDs,
+		Components: []component{{Path: pathConnect}},
+	}}}}, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
 }
 
 // assetLinksJSON is the Digital Asset Links statement list letting the
@@ -235,6 +272,9 @@ func (s *Server) webRoutes() {
 	s.mux.HandleFunc(pathRobots, s.exactDoc(pathRobots, s.web.robots))
 	if s.web.assetLinks != nil {
 		s.mux.HandleFunc(pathAssetLinks, s.exactDoc(pathAssetLinks, s.web.assetLinks))
+	}
+	if s.web.aasa != nil {
+		s.mux.HandleFunc(pathAASA, s.exactDoc(pathAASA, s.web.aasa))
 	}
 }
 

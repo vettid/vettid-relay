@@ -1,6 +1,6 @@
 # VettID Relay Protocol
 
-**Version:** 0.9.4 (draft)
+**Version:** 0.10.0 (draft)
 **Status:** Pre-implementation draft for review
 
 ## 1. Purpose & design principles
@@ -678,8 +678,8 @@ self-hosted one or a home appliance — with nothing from vettid.org
 |---|---|---|
 | `/connect` | `text/html; charset=utf-8` | the invitation landing page |
 | `/.well-known/assetlinks.json` | `application/json` | Android Digital Asset Links for the VettID app |
+| `/.well-known/apple-app-site-association` | `application/json` | (0.10.0) Apple App Site Association for the VettID iOS app (Universal Links) |
 | `/robots.txt` | `text/plain; charset=utf-8` | `User-agent: *`, `Allow: /.well-known/`, `Disallow: /` |
-| `/.well-known/apple-app-site-association` | — | reserved for iOS universal links; not served yet (the ordinary `404`) |
 
 An invitation URL is `<relay>/connect#<link>`. The payload is the URL
 fragment, which browsers never send, so the relay never receives it. The
@@ -782,6 +782,79 @@ letting the VettID Android app handle the relay's links:
   app declares `relay.vettid.org`. On any other relay the document is
   harmless, and the page's `vettid:` link opens the app instead.
 
+**`/.well-known/apple-app-site-association`** (0.10.0). An Apple App Site
+Association file letting the VettID iOS app open the relay's invitation
+links as Universal Links (IOS-PLAN §6.8). With the default configuration
+the body is exactly these bytes (two-space indent, `\n` line ends, one
+final `\n`):
+
+```json
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": [
+          "3X25CJ86MV.com.vettid.app",
+          "3X25CJ86MV.com.vettid.app.staging"
+        ],
+        "components": [
+          {
+            "/": "/connect"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- **Invitation path only.** One `details` entry. `components` is fixed
+  and not configurable: the single exact path `/connect`, with no
+  wildcard and no `?` or `#` key, so any query and any fragment match
+  (the invitation is in the fragment, VAULT-MESSAGING §6.4). No other
+  relay path opens the app: not `/connect/…`, not `/v1`, not `/`.
+- **`applinks` only.** No `webcredentials` (the app keeps no passwords
+  or passkeys for the relay), no `appclips`, no legacy `paths`/`appID`
+  keys (the app needs iOS 17, IOS-PLAN ID4), no `exclude` entries and
+  no `comment`. Nothing in the file is secret: App IDs are the team ID
+  and the bundle id, both public with the app.
+- **`appIDs`** lists the configured App IDs (`<team ID>.<bundle ID>`)
+  in the configured order. The relay software's **built-in default**
+  names the official VettID app, production `3X25CJ86MV.com.vettid.app`
+  and staging `3X25CJ86MV.com.vettid.app.staging` (staging builds also
+  use `relay.vettid.org`), so a self-hosted relay serves them with no
+  configuration. Operators MAY replace the list (for example for a fork
+  of the app). An empty list turns the document off: it gets the
+  ordinary `404`.
+- **Served as the other documents are.** The fixed-response rules above
+  apply unchanged: the exact path with no file extension
+  (`/.well-known/apple-app-site-association.json`, the legacy root
+  `/apple-app-site-association` and every other spelling get the
+  ordinary `404`), never a redirect (Apple refuses redirects for this
+  file), `Content-Type: application/json`, `GET`/`HEAD` only, the same
+  `Cache-Control: public, max-age=86400, immutable`, strong `ETag` and
+  security headers as `assetlinks.json` (the non-HTML
+  `Content-Security-Policy`). The file is not signed.
+- **Who fetches it.** iOS fetches the file through Apple's CDN, not from
+  the phone, so the relay sees Apple's requests, rare and per domain,
+  and learns nothing about who installs the app. A change to the App ID
+  list reaches phones on Apple's schedule, not the relay's. Apple's
+  requests share the per-address web bucket like any other (see "Rate
+  limits"); a `429` is retried later.
+- iOS verifies a Universal Link only for domains in the app's Associated
+  Domains entitlement; the official app declares
+  `applinks:relay.vettid.org`. On any other relay the document is
+  harmless, and the page's `vettid:` link opens the app instead.
+- **Tests (reference relay).** The default body equals the bytes above;
+  the headers equal `assetlinks.json`'s apart from the body's `ETag` and
+  `Content-Length`; the same bytes for every request (query, headers);
+  `304` on a matching `If-None-Match`; `405` for other methods; the
+  `.json`, root, trailing-slash, case and percent-encoded spellings are
+  the ordinary `404`; a configured list replaces the default in order;
+  an empty list gives the ordinary `404` while `/connect` and
+  `assetlinks.json` still serve; invalid configuration is refused at
+  start; the access log names only the route.
+
 **Rate limits.** A relay SHOULD rate-limit these paths, and every other path
 outside `/v1` except its health check, per client address (the IPv4 address
 or the IPv6 /64), with a budget **separate** from the `/v1` limits (§7.2), so
@@ -807,6 +880,7 @@ any proxy or load balancer in front of the relay.
 |---|---|---|
 | `RELAY_ANDROID_PACKAGE` | `com.vettid.app` | `package_name` in `assetlinks.json` |
 | `RELAY_ANDROID_CERT_SHA256` | the official app's keys (above) | comma-separated fingerprints, colon form or plain hex in any case; set but empty turns `assetlinks.json` off |
+| `RELAY_IOS_APP_IDS` | `3X25CJ86MV.com.vettid.app,3X25CJ86MV.com.vettid.app.staging` | (0.10.0) comma-separated App IDs for `appIDs` in `apple-app-site-association`, in order; spaces around each and empty items ignored, duplicates dropped; each is a 10-character team ID (`A`–`Z`, `0`–`9`), a dot and a bundle id of at least two dot-separated segments of letters, digits and `-`; at most 32; anything else stops the relay at start; set but empty turns the document off |
 | `RELAY_RATE_WEB_RPS` / `RELAY_RATE_WEB_BURST` | `2` / `20` | the per-address web bucket, per relay process |
 | `RELAY_BASE_URL` | — | `https` turns on `Strict-Transport-Security` |
 
@@ -1571,6 +1645,15 @@ The push gateway API is specified separately.
 
 ## 10. Changelog
 
+- **0.10.0** — **awaiting the owner's approval**. §6.11: relays serve
+  `/.well-known/apple-app-site-association` (was reserved, `404`), so
+  the VettID iOS app opens invitation links as Universal Links
+  (IOS-PLAN §6.8, §9.2). `applinks` only, one `details` entry, the exact
+  path `/connect` as its only component; `appIDs` configurable
+  (`RELAY_IOS_APP_IDS`), the official production and staging App IDs by
+  default, an empty list turning the document off. The same fixed-response
+  rules, caching and headers as `assetlinks.json`; no `webcredentials`,
+  no `appclips`. No `/v1` changes; additive for clients.
 - **0.9.4** — **approved by the owner 2026-10-15** (vettid-relay #14),
   with raising the production table's cap to 10,000 write units a
   second. §7.2: the network ceilings of the byte budgets (limit 11,

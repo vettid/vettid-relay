@@ -74,6 +74,7 @@ fuzz:
 	$(GO) test ./relayauth -run '^$$' -fuzz '^FuzzParseClaims$$' -fuzztime $(FUZZTIME)
 	$(GO) test ./relayauth -run '^$$' -fuzz '^FuzzParseClaimID$$' -fuzztime $(FUZZTIME)
 	$(GO) test ./internal/config -run '^$$' -fuzz '^FuzzParseCertFingerprints$$' -fuzztime $(FUZZTIME)
+	$(GO) test ./internal/config -run '^$$' -fuzz '^FuzzParseIOSAppIDs$$' -fuzztime $(FUZZTIME)
 	$(GO) test ./internal/api -run '^$$' -fuzz '^FuzzETagMatch$$' -fuzztime $(FUZZTIME)
 
 scan:
