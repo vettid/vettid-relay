@@ -9,12 +9,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
+	mrand "math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -151,11 +152,12 @@ func backoff(attempt int) time.Duration {
 	return d/2 + jitter(d/2)
 }
 
+// jitter spreads retries out; it is not security-relevant, so math/rand.
 func jitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 0
 	}
-	return time.Duration(rand.Int64N(int64(d)))
+	return time.Duration(mrand.Int64N(int64(d)))
 }
 
 func (c *Client) once(ctx context.Context, r request) (*http.Response, error) {
@@ -309,11 +311,16 @@ func (c *Client) MintOpenToken(audience string, ttl time.Duration, jti string) (
 	})
 }
 
+// randomID returns a default token jti: 26 characters of Crockford
+// base32 (ULID-shaped, 130 random bits) from crypto/rand. A jti is what a
+// mailbox owner revokes and what a one-shot open token is spent by
+// (RELAY-PROTOCOL §5.5, §5.6), so it must not be predictable.
 func randomID() string {
 	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 	b := make([]byte, 26)
+	crand.Read(b) // never fails (crypto/rand, Go ≥ 1.24)
 	for i := range b {
-		b[i] = alphabet[rand.IntN(len(alphabet))]
+		b[i] = alphabet[b[i]&31] // 256 is a multiple of 32: unbiased
 	}
 	return string(b)
 }
