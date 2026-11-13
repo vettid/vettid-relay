@@ -125,6 +125,97 @@ func TestCollectStoreErrorNotEmpty(t *testing.T) {
 	}
 }
 
+// contendedFixture is a fixture whose store answers ErrContended for every
+// collect, with one message waiting in owner's mailbox.
+func contendedFixture(t *testing.T) (*fixture, principal) {
+	t.Helper()
+	f := newFixture(t, nil)
+	cs, inner := &contendedStore{n: 1 << 30}, f.newSt
+	f.newSt = func() store.Backend { cs.Backend = inner(); return cs }
+	f.restart()
+	owner := newPrincipal(1)
+	f.register(owner)
+	if _, err := f.st.Deposit(context.Background(), owner.mbx, "s", []byte("x"), time.Hour, store.Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	return f, owner
+}
+
+// A long-poll whose last attempt was contended is not answered empty at
+// its deadline (§6.3): it fails rate_limited.
+func TestLongPollContendedAtDeadline(t *testing.T) {
+	f, owner := contendedFixture(t)
+	code, b := f.do(req{method: "GET", path: "/v1/mailbox?wait=1", signer: &owner})
+	if code != 429 || !strings.Contains(string(b), CodeRateLimited) {
+		t.Fatalf("contended long-poll at its deadline: %d %s", code, b)
+	}
+}
+
+// The same at shutdown: a contended long-poll released by the drain fails
+// rate_limited, not empty.
+func TestLongPollContendedAtDrain(t *testing.T) {
+	f, owner := contendedFixture(t)
+	type res struct {
+		code int
+		b    []byte
+	}
+	done := make(chan res, 1)
+	go func() {
+		code, b := f.do(req{method: "GET", path: "/v1/mailbox?wait=10", signer: &owner})
+		done <- res{code, b}
+	}()
+	waitFor(t, func() bool { return f.counter("relay_collect_contended_total") >= 2 })
+	f.s.drainCancel()
+	select {
+	case r := <-done:
+		if r.code != 429 || !strings.Contains(string(r.b), CodeRateLimited) {
+			t.Fatalf("contended long-poll at drain: %d %s", r.code, r.b)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("not released by the drain")
+	}
+}
+
+// A contended wait=0 collect ends at once when the mailbox is deleted
+// (mailbox_unknown) or the relay drains (rate_limited), rather than
+// retrying until its budget is spent.
+func TestCollectContendedWaitZeroEnds(t *testing.T) {
+	for _, tc := range []struct {
+		name, code string
+		end        func(*fixture, principal)
+	}{
+		{"deleted", CodeMailboxUnknown, func(f *fixture, o principal) { f.s.hub.kill(o.mbx) }},
+		{"drain", CodeRateLimited, func(f *fixture, _ principal) { f.s.drainCancel() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, owner := contendedFixture(t)
+			type res struct {
+				code int
+				b    []byte
+			}
+			done := make(chan res, 1)
+			go func() {
+				code, b := f.do(req{method: "GET", path: "/v1/mailbox", signer: &owner})
+				done <- res{code, b}
+			}()
+			waitFor(t, func() bool { return f.counter("relay_collect_contended_total") >= 1 })
+			start := time.Now()
+			tc.end(f, owner)
+			select {
+			case r := <-done:
+				if !strings.Contains(string(r.b), tc.code) || r.code < 400 {
+					t.Fatalf("%d %s, want %s", r.code, r.b, tc.code)
+				}
+				if d := time.Since(start); d > contendedBudget/2 {
+					t.Fatalf("ended after %v: it waited out the budget", d)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("never answered")
+			}
+		})
+	}
+}
+
 func TestContendedBackoff(t *testing.T) {
 	for n, want := range []time.Duration{50, 100, 200, 400, 800, 1000, 1000} {
 		want *= time.Millisecond
@@ -136,7 +227,8 @@ func TestContendedBackoff(t *testing.T) {
 
 // A WebSocket session whose lease attempts are contended keeps going: the
 // first delivery and a resend after the lease ends both arrive, and the
-// session is not closed.
+// session is not closed. (A regression test for the contended handling
+// #22 added; the forced re-read fix is TestWebSocketForcedReadSurvivesContention.)
 func TestWebSocketContended(t *testing.T) {
 	f := newFixture(t, nil)
 	cs, inner := &contendedStore{}, f.newSt
@@ -190,8 +282,10 @@ func TestForcedReadSurvivesContention(t *testing.T) {
 	owner := newPrincipal(1)
 	f.register(owner)
 	done := make(chan collectResp, 1)
+	skips := f.counter("relay_collect_store_skips_total")
 	go func() { done <- f.collect(owner, "?wait=10") }()
-	time.Sleep(200 * time.Millisecond) // parked, skipping the store
+	// Parked, skipping the store: its generation is loaded before WakeAll.
+	waitFor(t, func() bool { return f.counter("relay_collect_store_skips_total") > skips })
 	m, err := f.st.Deposit(context.Background(), owner.mbx, "s", []byte("x"), time.Hour, store.Limits{})
 	if err != nil {
 		t.Fatal(err)
@@ -219,12 +313,14 @@ func TestWebSocketForcedReadSurvivesContention(t *testing.T) {
 	f.restart()
 	owner := newPrincipal(1)
 	f.register(owner)
+	skips := f.counter("relay_collect_store_skips_total")
 	c, _, err := f.dialWS(owner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.CloseNow()
-	time.Sleep(200 * time.Millisecond) // the session skips the store
+	// The session skips the store: its generation is loaded before WakeAll.
+	waitFor(t, func() bool { return f.counter("relay_collect_store_skips_total") > skips })
 	m, err := f.st.Deposit(context.Background(), owner.mbx, "s", []byte("x"), time.Hour, store.Limits{})
 	if err != nil {
 		t.Fatal(err)

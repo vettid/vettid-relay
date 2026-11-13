@@ -407,10 +407,11 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		// A wait=0 collect always asks the store: the empty hint may hide
 		// a deposit whose bump was lost (RELAY-PROTOCOL §6.3).
 		msgs, next, err := s.collectOnce(r.Context(), mb.ID, max, g != gen || wait == 0)
-		if !errors.Is(err, store.ErrContended) {
+		contended := errors.Is(err, store.ErrContended)
+		if !contended {
 			gen = g // a forced re-read is spent only by an attempt that read the mailbox through
 		}
-		if errors.Is(err, store.ErrContended) {
+		if contended {
 			// Other collectors won every candidate tried, and more may
 			// wait: never an empty answer (§6.3). A wait=0 collect tries
 			// again within contendedBudget, then answers rate_limited; a
@@ -468,10 +469,10 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, fail(CodeMailboxUnknown))
 			done = true
 		case <-deadline.C:
-			s.respondMessages(w, nil)
+			s.endPoll(w, contended)
 			done = true
 		case <-s.drainCtx.Done():
-			s.respondMessages(w, nil) // shutting down: release the client now
+			s.endPoll(w, contended) // shutting down: release the client now
 			done = true
 		case <-r.Context().Done():
 			done = true
@@ -483,6 +484,19 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// endPoll ends a long-poll that found nothing by its deadline or at
+// shutdown. When its last attempt lost every candidate to other collectors,
+// messages may still wait unleased, so it is never answered empty (§6.3):
+// it fails rate_limited, as a contended wait=0 collect does, and the
+// client tries again.
+func (s *Server) endPoll(w http.ResponseWriter, contended bool) {
+	if contended {
+		s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
+		return
+	}
+	s.respondMessages(w, nil)
 }
 
 func max0(d time.Duration) time.Duration {
