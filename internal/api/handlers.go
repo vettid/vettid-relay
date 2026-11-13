@@ -402,7 +402,9 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 	for {
 		wake := s.hub.wait(mb.ID) // before leasing: no lost wakeups
 		g := s.forceGen.Load()
-		msgs, next, err := s.collectOnce(r.Context(), mb.ID, max, g != gen)
+		// A wait=0 collect always asks the store: the empty hint may hide
+		// a deposit whose bump was lost (RELAY-PROTOCOL §6.3).
+		msgs, next, err := s.collectOnce(r.Context(), mb.ID, max, g != gen || wait == 0)
 		gen = g
 		if err != nil {
 			if r.Context().Err() != nil {

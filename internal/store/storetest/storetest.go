@@ -829,6 +829,9 @@ func testConcurrentCollect(t *testing.T, h Harness) {
 			defer wg.Done()
 			for i := 0; i < 10; i++ {
 				got, _, err := s.Collect(ctx, "a", 4, time.Hour)
+				if errors.Is(err, store.ErrContended) {
+					continue // others won every candidate it tried: try again, as the API does
+				}
 				if err != nil {
 					t.Error(err)
 					return

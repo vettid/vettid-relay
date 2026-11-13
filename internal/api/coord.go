@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/vettid/vettid-relay/internal/store"
@@ -177,6 +178,11 @@ func (s *Server) collectOnce(ctx context.Context, mailbox string, max int, force
 	}
 	s.m.storeQueries.Inc()
 	msgs, next, err := s.st.Collect(ctx, mailbox, max, s.cfg.VisibilityTimeout)
+	if errors.Is(err, store.ErrContended) {
+		// Other collectors won every candidate tried, and more may wait:
+		// not empty. No hint is marked; the caller tries again shortly.
+		return nil, s.now().Add(contendedRetry), nil
+	}
 	if err != nil || !haveVersion {
 		return msgs, next, err
 	}
@@ -198,5 +204,13 @@ func (s *Server) collectOnce(ctx context.Context, mailbox string, max int, force
 // already void from the moment a message is deposited or a lease ends).
 func (s *Server) collectRange(ctx context.Context, mailbox, after, upTo string, max int) ([]store.Message, time.Time, error) {
 	s.m.storeQueries.Inc()
-	return s.st.CollectRange(ctx, mailbox, after, upTo, max, s.cfg.VisibilityTimeout)
+	msgs, next, err := s.st.CollectRange(ctx, mailbox, after, upTo, max, s.cfg.VisibilityTimeout)
+	if errors.Is(err, store.ErrContended) {
+		return nil, s.now().Add(contendedRetry), nil // as collectOnce
+	}
+	return msgs, next, err
 }
+
+// contendedRetry is how soon a collect that lost every candidate to other
+// collectors tries again.
+const contendedRetry = 50 * time.Millisecond

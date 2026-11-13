@@ -368,17 +368,27 @@ func TestMultiProcess(t *testing.T) {
 		vault.Ack(ctx, m[0].MsgID)
 	})
 
-	t.Run("empty hints: idle polls skip the store, deposits are still delivered", func(t *testing.T) {
+	t.Run("empty hints: idle long-polls skip the store, wait=0 polls do not, deposits are still delivered", func(t *testing.T) {
 		vb := as(vault, b.url)
 		q0, s0 := metric(t, b, "relay_collect_store_queries_total"), metric(t, b, "relay_collect_store_skips_total")
 		for i := 0; i < 6; i++ {
-			if m, err := vb.Collect(ctx, 0, 10); err != nil || len(m) != 0 {
+			if m, err := vb.Collect(ctx, time.Second, 10); err != nil || len(m) != 0 {
 				t.Fatalf("%+v %v", m, err)
 			}
 		}
 		q1, s1 := metric(t, b, "relay_collect_store_queries_total"), metric(t, b, "relay_collect_store_skips_total")
 		if s1-s0 < 5 || q1-q0 > 1 {
-			t.Fatalf("6 idle polls: %d queries, %d skips", q1-q0, s1-s0)
+			t.Fatalf("6 idle long-polls: %d queries, %d skips", q1-q0, s1-s0)
+		}
+		// A wait=0 poll always asks the store (RELAY-PROTOCOL §6.3): a
+		// deposit whose hint bump was lost is never hidden from it.
+		for i := 0; i < 3; i++ {
+			if m, err := vb.Collect(ctx, 0, 10); err != nil || len(m) != 0 {
+				t.Fatalf("%+v %v", m, err)
+			}
+		}
+		if q2 := metric(t, b, "relay_collect_store_queries_total"); q2-q1 != 3 {
+			t.Fatalf("3 wait=0 polls: %d queries", q2-q1)
 		}
 		// A deposit on A is found by the next poll on B (version bump), and
 		// a long-poll parked on B in skip mode is woken by one.
