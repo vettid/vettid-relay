@@ -40,6 +40,11 @@ var (
 	// ErrRevoked is returned when a token was issued before the mailbox's
 	// TokensNotBefore (it predates a deletion of the mailbox, §6.10).
 	ErrRevoked = errors.New("store: token predates the mailbox")
+	// ErrContended is returned by a collect that leased nothing because
+	// other collectors won every candidate it tried, while more messages
+	// past those may wait: the caller retries shortly and must not take
+	// the mailbox for empty (RELAY-PROTOCOL §6.3).
+	ErrContended = errors.New("store: every candidate leased by another collector")
 )
 
 // Store is the SQLite-backed relay store.

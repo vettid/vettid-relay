@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"errors"
+	"math/rand/v2"
 	"time"
 
 	"github.com/vettid/vettid-relay/internal/store"
@@ -177,6 +179,13 @@ func (s *Server) collectOnce(ctx context.Context, mailbox string, max int, force
 	}
 	s.m.storeQueries.Inc()
 	msgs, next, err := s.st.Collect(ctx, mailbox, max, s.cfg.VisibilityTimeout)
+	if errors.Is(err, store.ErrContended) {
+		// Other collectors won every candidate tried, and more may wait:
+		// not empty. No hint is marked; the caller tries again
+		// (contendedDelay) and never answers a wait=0 collect empty.
+		s.m.contended.Inc()
+		return nil, time.Time{}, err
+	}
 	if err != nil || !haveVersion {
 		return msgs, next, err
 	}
@@ -198,5 +207,29 @@ func (s *Server) collectOnce(ctx context.Context, mailbox string, max int, force
 // already void from the moment a message is deposited or a lease ends).
 func (s *Server) collectRange(ctx context.Context, mailbox, after, upTo string, max int) ([]store.Message, time.Time, error) {
 	s.m.storeQueries.Inc()
-	return s.st.CollectRange(ctx, mailbox, after, upTo, max, s.cfg.VisibilityTimeout)
+	msgs, next, err := s.st.CollectRange(ctx, mailbox, after, upTo, max, s.cfg.VisibilityTimeout)
+	if errors.Is(err, store.ErrContended) {
+		s.m.contended.Inc() // as collectOnce: the caller tries again
+	}
+	return msgs, next, err
 }
+
+// contendedDelay is how soon a collect that lost every candidate to other
+// collectors tries again: 50 to 150 ms, jittered so that contending
+// collectors spread out.
+func contendedDelay() time.Duration {
+	return 50*time.Millisecond + rand.N(100*time.Millisecond)
+}
+
+// contendedBackoff is the n-th wait of a long-poll that keeps losing every
+// candidate: 50 ms doubling to 1 s, jittered.
+func contendedBackoff(n int) time.Duration {
+	d := 50 * time.Millisecond << min(n, 5)
+	d = min(d, time.Second)
+	return d/2 + rand.N(d/2+1)
+}
+
+// contendedBudget is how long a wait=0 collect keeps trying while
+// contended before it answers rate_limited (never empty: RELAY-PROTOCOL
+// §6.3).
+const contendedBudget = time.Second

@@ -51,13 +51,15 @@ func TestEmptyHintsSkipAndNeverMiss(t *testing.T) {
 	f.register(owner)
 	tok := f.mint(owner, sender, nil)
 
+	// wait=0 collects always ask the store (RELAY-PROTOCOL §6.3); the
+	// hint lets a long-poll skip it (below).
 	for i := 0; i < 4; i++ {
 		if got := f.collect(owner, ""); len(got.Messages) != 0 {
 			t.Fatal("empty")
 		}
 	}
-	if q, s := f.counter("relay_collect_store_queries_total"), f.counter("relay_collect_store_skips_total"); q != 1 || s != 3 {
-		t.Fatalf("queries=%d skips=%d, want 1 and 3", q, s)
+	if q, s := f.counter("relay_collect_store_queries_total"), f.counter("relay_collect_store_skips_total"); q != 4 || s != 0 {
+		t.Fatalf("queries=%d skips=%d, want 4 and 0", q, s)
 	}
 	// A deposit through the API bumps the version: the next collect queries.
 	id := f.mustDeposit(owner, sender, tok, []byte("x"))
@@ -150,10 +152,11 @@ func TestEmptyHintsLeaseExpiryRedelivery(t *testing.T) {
 	if got := f.collect(owner, ""); len(got.Messages) != 0 {
 		t.Fatal("leased")
 	}
-	if got := f.collect(owner, ""); len(got.Messages) != 0 { // skipped
-		t.Fatal("leased")
-	}
-	if f.counter("relay_collect_store_skips_total") < 1 {
+	// A long-poll skips the store while the lease is out (the finding is
+	// trusted until it can end).
+	skips := f.counter("relay_collect_store_skips_total")
+	f.collect(owner, "?wait=1")
+	if f.counter("relay_collect_store_skips_total") <= skips {
 		t.Fatal("expected a skip while the lease is outstanding")
 	}
 	time.Sleep(1100 * time.Millisecond) // the hint's validity runs on Valkey's clock
@@ -189,13 +192,27 @@ func TestEmptyHintsLostBumpIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := f.collect(owner, ""); len(got.Messages) != 0 {
-		t.Fatal("expected the stale finding to be trusted (this is the bounded case)")
+	// A wait=0 collect always asks the store, past the stale finding.
+	if got := f.collect(owner, ""); len(got.Messages) != 1 || got.Messages[0].MsgID != m.ID {
+		t.Fatal("a wait=0 collect trusted a stale empty finding")
 	}
-	waitFor(t, func() bool { // within EmptySkipMax (1 s)
-		got := f.collect(owner, "")
-		return len(got.Messages) == 1 && got.Messages[0].MsgID == m.ID
-	})
+	f.ack(owner, m.ID)
+	f.collect(owner, "") // empty finding again
+	m1, err := f.st.Deposit(context.Background(), owner.mbx, "s", []byte("x1"), time.Hour, store.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A waiting collect may trust it (the bounded case), until EmptySkipMax.
+	skips := f.counter("relay_collect_store_skips_total")
+	start := time.Now()
+	got := f.collect(owner, "?wait=5")
+	if f.counter("relay_collect_store_skips_total") <= skips {
+		t.Fatal("the waiting collect did not trust the empty finding")
+	}
+	if len(got.Messages) != 1 || got.Messages[0].MsgID != m1.ID || time.Since(start) > 3*time.Second {
+		t.Fatalf("%+v after %v", got, time.Since(start))
+	}
+	m = m1
 
 	// WakeAll (resubscribe, Valkey outage) forces a real query at once.
 	f.ack(owner, m.ID)

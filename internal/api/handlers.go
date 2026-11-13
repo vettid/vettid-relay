@@ -399,11 +399,36 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	gen := s.forceGen.Load()
+	start := time.Now() // the budget runs on the wall clock (a test clock may not move)
+	contendedN := 0
 	for {
 		wake := s.hub.wait(mb.ID) // before leasing: no lost wakeups
 		g := s.forceGen.Load()
-		msgs, next, err := s.collectOnce(r.Context(), mb.ID, max, g != gen)
+		// A wait=0 collect always asks the store: the empty hint may hide
+		// a deposit whose bump was lost (RELAY-PROTOCOL §6.3).
+		msgs, next, err := s.collectOnce(r.Context(), mb.ID, max, g != gen || wait == 0)
 		gen = g
+		if errors.Is(err, store.ErrContended) {
+			// Other collectors won every candidate tried, and more may
+			// wait: never an empty answer (§6.3). A wait=0 collect tries
+			// again within contendedBudget, then answers rate_limited; a
+			// waiting one parks briefly and tries again.
+			if wait == 0 {
+				if time.Since(start) >= contendedBudget {
+					s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
+					return
+				}
+				select {
+				case <-time.After(contendedDelay()):
+					continue
+				case <-r.Context().Done():
+					return
+				}
+			}
+			// A long-poll backs off, doubling from 50 ms to about 1 s.
+			err, next = nil, s.now().Add(contendedBackoff(contendedN))
+			contendedN++
+		}
 		if err != nil {
 			if r.Context().Err() != nil {
 				return

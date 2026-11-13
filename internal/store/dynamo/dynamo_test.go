@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,3 +152,106 @@ func TestSenderItemsDoNotAccumulate(t *testing.T) {
 }
 
 func bytesReader(n int) *bytes.Reader { return bytes.NewReader(make([]byte, n)) }
+
+// racingDB is another collector winning lease writes: for the first lose
+// lease writes, it leases the message itself and reports the conditional
+// failure the store sees when another collector got there first.
+type racingDB struct {
+	dynamo.DB
+	mu   sync.Mutex
+	lose int
+	fail error // when set, every lease write fails with it (not a lost race)
+}
+
+func (r *racingDB) PutItem(ctx context.Context, in *dynamodb.PutItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
+	sk, _ := in.Item["sk"].(*types.AttributeValueMemberS)
+	r.mu.Lock()
+	if fail := r.fail; fail != nil && sk != nil && strings.HasPrefix(sk.Value, "L#") {
+		r.mu.Unlock()
+		return nil, fail
+	}
+	steal := sk != nil && strings.HasPrefix(sk.Value, "L#") && r.lose > 0
+	if steal {
+		r.lose--
+	}
+	r.mu.Unlock()
+	if !steal {
+		return r.DB.PutItem(ctx, in, opts...)
+	}
+	theirs := *in
+	theirs.ConditionExpression, theirs.ExpressionAttributeValues = nil, nil
+	if _, err := r.DB.PutItem(ctx, &theirs, opts...); err != nil {
+		return nil, err
+	}
+	return nil, &types.ConditionalCheckFailedException{Message: aws.String("leased by another collector")}
+}
+
+func racingStore(t *testing.T, lose int) (*dynamo.Store, []string) {
+	s, ids, _ := racingStoreDB(t, lose)
+	return s, ids
+}
+
+func racingStoreDB(t *testing.T, lose int) (*dynamo.Store, []string, *racingDB) {
+	t.Helper()
+	db := ddblocal.Client(t)
+	table := ddblocal.Table(t, db)
+	r := &racingDB{DB: db}
+	s, err := dynamo.New(dynamo.Config{Table: table, DB: r, S3: fakes3.New(t).Client(), Bucket: "b", Now: storetest.NewClock().Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for i := 0; i < 20; i++ {
+		m, err := s.Deposit(ctx, "a", "s", []byte{byte(i)}, time.Hour, store.Limits{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, m.ID)
+	}
+	r.mu.Lock()
+	r.lose = lose
+	r.mu.Unlock()
+	return s, ids, r
+}
+
+// A collect that loses every candidate to another collector, its walk cut
+// at max, walks again and leases the messages past them, instead of
+// answering empty.
+func TestCollectRewalksAfterLosingAll(t *testing.T) {
+	s, ids := racingStore(t, 3)
+	got, _, err := s.Collect(ctx, "a", 3, time.Minute)
+	if err != nil || len(got) != 3 {
+		t.Fatalf("%d messages (%v)", len(got), err)
+	}
+	for i, m := range got {
+		if m.ID != ids[3+i] {
+			t.Fatalf("message %d is %s, want %s", i, m.ID, ids[3+i])
+		}
+	}
+}
+
+// One that keeps losing past its bound reports ErrContended, never an
+// empty mailbox.
+func TestCollectContended(t *testing.T) {
+	s, _ := racingStore(t, 1000)
+	got, next, err := s.Collect(ctx, "a", 3, time.Minute)
+	if !errors.Is(err, store.ErrContended) || len(got) != 0 || !next.IsZero() {
+		t.Fatalf("%d messages, next %v, err %v", len(got), next, err)
+	}
+}
+
+// A lease write that fails for another reason than a lost race, with no
+// lease won, is an error: never an empty answer, never ErrContended.
+func TestCollectLeaseWriteError(t *testing.T) {
+	s, _, r := racingStoreDB(t, 0)
+	r.mu.Lock()
+	r.fail = errors.New("throttled")
+	r.mu.Unlock()
+	got, _, err := s.Collect(ctx, "a", 3, time.Minute)
+	if err == nil || errors.Is(err, store.ErrContended) || len(got) != 0 {
+		t.Fatalf("%d messages, err %v", len(got), err)
+	}
+}

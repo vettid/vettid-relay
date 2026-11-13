@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -128,6 +129,14 @@ func (s *Server) wsLease(ctx context.Context, mailbox string, c *wsCursor, outst
 	defer func() {
 		if n := len(msgs); n > 0 && msgs[n-1].ID > c.high {
 			c.high = msgs[n-1].ID
+		}
+	}()
+	// Other collectors won every candidate tried (store.ErrContended): not
+	// empty; look again shortly, the cursor left as it is (a lapsed pass
+	// goes on where it was, rather than ending early).
+	defer func() {
+		if errors.Is(err, store.ErrContended) {
+			msgs, next, err = nil, s.now().Add(contendedDelay()), nil
 		}
 	}()
 	if !c.lapsed || c.high == "" { // (nothing sent yet: nothing to send again, and no id to range from)

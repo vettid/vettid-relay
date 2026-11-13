@@ -94,6 +94,7 @@ type serverMetrics struct {
 	claimGets     metrics.Counter
 	storeQueries  metrics.Counter
 	storeSkips    metrics.Counter
+	contended     metrics.Counter
 }
 
 func newServerMetrics(reg *metrics.Registry) *serverMetrics {
@@ -120,6 +121,7 @@ func newServerMetrics(reg *metrics.Registry) *serverMetrics {
 		claimGets:     reg.Counter("relay_claim_fetches_total", "Claims fetched (and thereby deleted)."),
 		storeQueries:  reg.Counter("relay_collect_store_queries_total", "Collect attempts that queried the store."),
 		storeSkips:    reg.Counter("relay_collect_store_skips_total", "Collect attempts that skipped the store: mailbox known empty (empty hints)."),
+		contended:     reg.Counter("relay_collect_contended_total", "Collect attempts that lost every candidate to other collectors past the store's re-walks: tried again, never answered empty."),
 	}
 	for _, c := range allCodes {
 		m.errors.With(c) // pre-create every series so rates start at 0

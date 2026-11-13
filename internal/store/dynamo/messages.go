@@ -230,7 +230,31 @@ func (s *Store) Collect(ctx context.Context, mailbox string, max int, visibility
 // (the sort keys L#<id> and M#<id> order like the ids). Deposits give
 // every message an id above the mailbox's last (see newID), so a range
 // that starts after an id holds exactly the messages deposited after it.
+//
+// When every candidate it tried was leased by another collector first and
+// the walk stopped at max, messages past them were never tried: it walks
+// again (the lost ones are now leased, so each walk reaches further), up
+// to collectPasses times, and then reports store.ErrContended rather than
+// an empty mailbox.
 func (s *Store) CollectRange(ctx context.Context, mailbox, after, upTo string, max int, visibility time.Duration) ([]store.Message, time.Time, error) {
+	for pass := 0; ; pass++ {
+		msgs, next, contended, err := s.collectPass(ctx, mailbox, after, upTo, max, visibility)
+		if err != nil || !contended {
+			return msgs, next, err
+		}
+		if pass+1 >= collectPasses {
+			return nil, time.Time{}, store.ErrContended
+		}
+	}
+}
+
+// collectPasses bounds the walks of one collect that lose every candidate
+// to other collectors.
+const collectPasses = 4
+
+// collectPass is one walk and lease attempt of CollectRange. contended
+// reports a walk that stopped at max and lost every candidate.
+func (s *Store) collectPass(ctx context.Context, mailbox, after, upTo string, max int, visibility time.Duration) (msgs []store.Message, nextAt time.Time, contended bool, err error) {
 	// Sort-key ranges to walk, in order; BETWEEN is inclusive, so the
 	// lower bound itself (the id `after`) is skipped below.
 	ranges := [][2]string{{"L#", "M$"}}
@@ -241,7 +265,7 @@ func (s *Store) CollectRange(ctx context.Context, mailbox, after, upTo string, m
 		}
 		ranges = [][2]string{{"L#" + after, lhi}, {"M#" + after, mhi}}
 		if "L#"+after > lhi { // an empty range (after >= upTo): BETWEEN would be rejected
-			return nil, time.Time{}, nil
+			return nil, time.Time{}, false, nil
 		}
 	}
 	now := s.now()
@@ -285,7 +309,7 @@ func (s *Store) CollectRange(ctx context.Context, mailbox, after, upTo string, m
 			}
 			return true
 		}, func() bool { return len(candidates) < max }); err != nil {
-			return nil, time.Time{}, err
+			return nil, time.Time{}, false, err
 		}
 	}
 	s.dropExpiredMessages(ctx, mailbox, expired, now)
@@ -322,18 +346,21 @@ func (s *Store) CollectRange(ctx context.Context, mailbox, after, upTo string, m
 		}()
 	}
 	wg.Wait()
-	var msgs []store.Message
 	for i, m := range candidates {
 		if won[i] {
 			msgs = append(msgs, m)
 		}
 	}
 	if len(msgs) == 0 && firstErr != nil {
-		return nil, time.Time{}, firstErr
+		return nil, time.Time{}, false, firstErr
 	}
 	sort.Slice(msgs, func(i, j int) bool { return msgs[i].ID < msgs[j].ID })
 	if len(msgs) > 0 {
-		return msgs, time.Time{}, nil
+		return msgs, time.Time{}, false, nil
+	}
+	if len(candidates) == max {
+		// Every candidate lost, and the walk stopped at max: more may wait.
+		return nil, time.Time{}, true, nil
 	}
 	// Candidates whose lease another collector won just now are leased
 	// until about now+visibility (by the winner's clock): report that as
@@ -346,9 +373,9 @@ func (s *Store) CollectRange(ctx context.Context, mailbox, after, upTo string, m
 		}
 	}
 	if next == 0 {
-		return nil, time.Time{}, nil
+		return nil, time.Time{}, false, nil
 	}
-	return nil, fromMS(next), nil
+	return nil, fromMS(next), false, nil
 }
 
 // walk runs the query page by page, handing each item to visit, for as
