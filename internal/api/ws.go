@@ -118,6 +118,9 @@ type wsCursor struct {
 	passEnd string    // the current pass goes up to this id
 	retry   string    // ... and has done the ids up to here; "": the next batch begins a pass
 	retryAt time.Time // the next batch of the pass is due
+	// contended: the last lease attempt lost every candidate to other
+	// collectors (it does not spend a forced re-read).
+	contended bool
 }
 
 // wsLease leases the next batch for a session whose window has room and
@@ -135,7 +138,8 @@ func (s *Server) wsLease(ctx context.Context, mailbox string, c *wsCursor, outst
 	// empty; look again shortly, the cursor left as it is (a lapsed pass
 	// goes on where it was, rather than ending early).
 	defer func() {
-		if errors.Is(err, store.ErrContended) {
+		c.contended = errors.Is(err, store.ErrContended)
+		if c.contended {
 			msgs, next, err = nil, s.now().Add(contendedDelay()), nil
 		}
 	}()
@@ -381,7 +385,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			g := s.forceGen.Load()
 			var err error
 			msgs, next, err = s.wsLease(ctx, mb.ID, &cur, win.len(), now, g != gen)
-			gen = g
+			if !cur.contended {
+				gen = g
+			}
 			if err != nil {
 				if ctx.Err() == nil {
 					s.log.Error("ws lease failed", "err", err)

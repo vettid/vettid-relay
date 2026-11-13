@@ -407,7 +407,9 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 		// A wait=0 collect always asks the store: the empty hint may hide
 		// a deposit whose bump was lost (RELAY-PROTOCOL §6.3).
 		msgs, next, err := s.collectOnce(r.Context(), mb.ID, max, g != gen || wait == 0)
-		gen = g
+		if !errors.Is(err, store.ErrContended) {
+			gen = g // a forced re-read is spent only by an attempt that read the mailbox through
+		}
 		if errors.Is(err, store.ErrContended) {
 			// Other collectors won every candidate tried, and more may
 			// wait: never an empty answer (§6.3). A wait=0 collect tries
@@ -421,6 +423,12 @@ func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {
 				select {
 				case <-time.After(contendedDelay()):
 					continue
+				case <-gone: // the owner deleted the mailbox (§6.10): terminal
+					s.writeError(w, fail(CodeMailboxUnknown))
+					return
+				case <-s.drainCtx.Done(): // shutting down: busy, not empty
+					s.writeError(w, &apiError{code: CodeRateLimited, retryAfter: 1})
+					return
 				case <-r.Context().Done():
 					return
 				}
