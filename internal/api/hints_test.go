@@ -152,6 +152,13 @@ func TestEmptyHintsLeaseExpiryRedelivery(t *testing.T) {
 	if got := f.collect(owner, ""); len(got.Messages) != 0 {
 		t.Fatal("leased")
 	}
+	// A long-poll skips the store while the lease is out (the finding is
+	// trusted until it can end).
+	skips := f.counter("relay_collect_store_skips_total")
+	f.collect(owner, "?wait=1")
+	if f.counter("relay_collect_store_skips_total") <= skips {
+		t.Fatal("expected a skip while the lease is outstanding")
+	}
 	time.Sleep(1100 * time.Millisecond) // the hint's validity runs on Valkey's clock
 	f.clk.add(1100 * time.Millisecond)  // the lease on the store's
 	if got := f.collect(owner, ""); len(got.Messages) != 1 || got.Messages[0].MsgID != id {
@@ -196,8 +203,12 @@ func TestEmptyHintsLostBumpIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A waiting collect may trust it (the bounded case), until EmptySkipMax.
+	skips := f.counter("relay_collect_store_skips_total")
 	start := time.Now()
 	got := f.collect(owner, "?wait=5")
+	if f.counter("relay_collect_store_skips_total") <= skips {
+		t.Fatal("the waiting collect did not trust the empty finding")
+	}
 	if len(got.Messages) != 1 || got.Messages[0].MsgID != m1.ID || time.Since(start) > 3*time.Second {
 		t.Fatalf("%+v after %v", got, time.Since(start))
 	}

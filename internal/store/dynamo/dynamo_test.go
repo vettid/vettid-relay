@@ -160,11 +160,16 @@ type racingDB struct {
 	dynamo.DB
 	mu   sync.Mutex
 	lose int
+	fail error // when set, every lease write fails with it (not a lost race)
 }
 
 func (r *racingDB) PutItem(ctx context.Context, in *dynamodb.PutItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
 	sk, _ := in.Item["sk"].(*types.AttributeValueMemberS)
 	r.mu.Lock()
+	if fail := r.fail; fail != nil && sk != nil && strings.HasPrefix(sk.Value, "L#") {
+		r.mu.Unlock()
+		return nil, fail
+	}
 	steal := sk != nil && strings.HasPrefix(sk.Value, "L#") && r.lose > 0
 	if steal {
 		r.lose--
@@ -182,6 +187,11 @@ func (r *racingDB) PutItem(ctx context.Context, in *dynamodb.PutItemInput, opts 
 }
 
 func racingStore(t *testing.T, lose int) (*dynamo.Store, []string) {
+	s, ids, _ := racingStoreDB(t, lose)
+	return s, ids
+}
+
+func racingStoreDB(t *testing.T, lose int) (*dynamo.Store, []string, *racingDB) {
 	t.Helper()
 	db := ddblocal.Client(t)
 	table := ddblocal.Table(t, db)
@@ -204,7 +214,7 @@ func racingStore(t *testing.T, lose int) (*dynamo.Store, []string) {
 	r.mu.Lock()
 	r.lose = lose
 	r.mu.Unlock()
-	return s, ids
+	return s, ids, r
 }
 
 // A collect that loses every candidate to another collector, its walk cut
@@ -230,5 +240,18 @@ func TestCollectContended(t *testing.T) {
 	got, next, err := s.Collect(ctx, "a", 3, time.Minute)
 	if !errors.Is(err, store.ErrContended) || len(got) != 0 || !next.IsZero() {
 		t.Fatalf("%d messages, next %v, err %v", len(got), next, err)
+	}
+}
+
+// A lease write that fails for another reason than a lost race, with no
+// lease won, is an error: never an empty answer, never ErrContended.
+func TestCollectLeaseWriteError(t *testing.T) {
+	s, _, r := racingStoreDB(t, 0)
+	r.mu.Lock()
+	r.fail = errors.New("throttled")
+	r.mu.Unlock()
+	got, _, err := s.Collect(ctx, "a", 3, time.Minute)
+	if err == nil || errors.Is(err, store.ErrContended) || len(got) != 0 {
+		t.Fatalf("%d messages, err %v", len(got), err)
 	}
 }
