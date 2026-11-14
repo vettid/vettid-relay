@@ -357,8 +357,11 @@ func (s *Store) forget(ids ...string) {
 	s.cacheMu.Unlock()
 }
 
-// Register implements store.Backend.
-func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, error) {
+// Register implements store.Backend. tokensNotBefore comes from the
+// consistent read or the write that decided the answer, never the cache:
+// none for a mailbox item created new (a tombstone keeps its item, so a
+// new item means none is held).
+func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time.Time, error) {
 	for attempt := 0; attempt < 3; attempt++ {
 		_, err := s.cfg.DB.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: &s.cfg.Table,
@@ -370,23 +373,23 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, erro
 		})
 		if err == nil {
 			s.forget(id)
-			return true, nil
+			return true, time.Time{}, nil
 		}
 		if !isCCF(err) {
-			return false, err
+			return false, time.Time{}, err
 		}
 		mb, ok, err := s.getMailbox(ctx, id)
 		if err != nil {
-			return false, err
+			return false, time.Time{}, err
 		}
 		if !ok {
 			continue // purged in between; try again
 		}
 		if subtle.ConstantTimeCompare(mb.PubKey, pub) != 1 {
-			return false, fmt.Errorf("store: mailbox id collision")
+			return false, time.Time{}, fmt.Errorf("store: mailbox id collision")
 		}
 		if !dead(mb, s.now()) {
-			return false, nil
+			return false, mb.TokensNotBefore, nil
 		}
 		// Deleted, or past its rotation grace and not purged yet: the key
 		// starts a fresh, empty mailbox. A rotated-away one is removed now:
@@ -396,11 +399,18 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, erro
 			nb, _ = s.cfg.Tombstones.Times(s.now())
 		}
 		revived, err := s.revive(ctx, id, pub, nb)
-		if err != nil || revived {
-			return revived, err
+		if err != nil {
+			return false, time.Time{}, err
+		}
+		if revived {
+			// revive keeps nb, or sets it to a non-zero nb.
+			if nb.IsZero() {
+				nb = mb.TokensNotBefore
+			}
+			return true, nb.Truncate(time.Millisecond), nil
 		}
 	}
-	return false, errors.New("dynamo: register: mailbox keeps disappearing")
+	return false, time.Time{}, errors.New("dynamo: register: mailbox keeps disappearing")
 }
 
 // revive turns a dead mailbox item back into a fresh, empty, live mailbox:

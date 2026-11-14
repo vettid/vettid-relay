@@ -241,6 +241,10 @@ type Limits struct {
 	MaxMailboxBlobBytes *int64 `json:"max_mailbox_blob_bytes,omitempty"`
 	MaxSenderBlobBytes  *int64 `json:"max_sender_blob_bytes,omitempty"`
 	MaxSenderBlobs      *int64 `json:"max_sender_blobs,omitempty"`
+	// Protocol ≥ 0.12.0 (§6.1): the relay reports tombstones at
+	// registration. Only true counts; a relay without it says nothing
+	// about tombstones (Registration.Tombstone).
+	ReportsTombstones json.RawMessage `json:"reports_tombstones,omitempty"`
 }
 
 // Registration is the register response.
@@ -248,6 +252,39 @@ type Registration struct {
 	MailboxID string `json:"mailbox_id"`
 	Limits    Limits `json:"limits"`
 	Created   bool   `json:"-"`
+	// TokensNotBefore is the answer's tokens_not_before as sent; read it
+	// with Tombstone.
+	TokensNotBefore json.RawMessage `json:"tokens_not_before,omitempty"`
+}
+
+// Tombstone reads the answer's tombstone report (RELAY-PROTOCOL 0.12.0
+// §6.1). reported is false when the relay doesn't report tombstones (no
+// limits.reports_tombstones, or any value but true): the answer then says
+// nothing about them. When reported, notBefore is the tombstone's
+// tokens-not-before time, rounded up to the whole second, or zero when the
+// relay holds no tombstone for the id. A tokens_not_before without the
+// flag, or one that can't be parsed, counts as neither being there.
+func (r Registration) Tombstone() (notBefore time.Time, reported bool) {
+	var flag bool
+	if json.Unmarshal(r.Limits.ReportsTombstones, &flag) != nil || !flag {
+		return time.Time{}, false
+	}
+	if len(r.TokensNotBefore) == 0 {
+		return time.Time{}, true
+	}
+	var s string
+	if json.Unmarshal(r.TokensNotBefore, &s) != nil {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	t = t.UTC()
+	if w := t.Truncate(time.Second); w.Before(t) {
+		t = w.Add(time.Second) // a fractional second is rounded up
+	}
+	return t, true
 }
 
 // Register registers (idempotently) this principal's mailbox.

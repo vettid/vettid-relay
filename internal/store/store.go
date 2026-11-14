@@ -215,10 +215,12 @@ type Mailbox struct {
 // removed yet is gone: registering its key again starts a fresh, empty
 // mailbox (created is true), as after the sweep. A deleted mailbox (§6.10)
 // has no row; its tombstone gives the new mailbox its TokensNotBefore.
-func (s *Store) Register(ctx context.Context, id string, pub []byte) (created bool, err error) {
+// tokensNotBefore is read in the same transaction, from the row deposits
+// are checked against.
+func (s *Store) Register(ctx context.Context, id string, pub []byte) (created bool, tokensNotBefore time.Time, err error) {
 	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return false, time.Time{}, err
 	}
 	defer tx.Rollback()
 	now := s.now()
@@ -226,27 +228,33 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (created bo
 	switch {
 	case errors.Is(err, ErrNotFound):
 	case err != nil:
-		return false, err
+		return false, time.Time{}, err
 	case subtle.ConstantTimeCompare(mb.PubKey, pub) != 1:
 		// 130-bit truncated hash collision; treat as a conflict.
-		return false, fmt.Errorf("store: mailbox id collision")
+		return false, time.Time{}, fmt.Errorf("store: mailbox id collision")
 	case mb.DeleteAfter == nil || now.Before(*mb.DeleteAfter):
-		return false, nil // live: idempotent
+		return false, mb.TokensNotBefore, nil // live: idempotent
 	default:
 		// Past its rotation grace: tombstone it and purge it (ON DELETE
 		// CASCADE) first, as the sweeper would have.
 		if err := s.tombstoneRotated(ctx, tx, now, `mailbox_id=?`, id); err != nil {
-			return false, err
+			return false, time.Time{}, err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM mailboxes WHERE mailbox_id=?`, id); err != nil {
-			return false, err
+			return false, time.Time{}, err
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO mailboxes(mailbox_id, pubkey, created_at) VALUES(?,?,?)`, id, pub, ms(now)); err != nil {
-		return false, err
+		return false, time.Time{}, err
 	}
-	return true, tx.Commit()
+	if mb, err = s.mailbox(ctx, tx, id, true); err != nil {
+		return false, time.Time{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, time.Time{}, err
+	}
+	return true, mb.TokensNotBefore, nil
 }
 
 // Mailbox returns a live mailbox (not past its rotation grace period).

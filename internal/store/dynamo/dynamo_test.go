@@ -34,7 +34,7 @@ func TestCountersRecoverFromTTLDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
+	if _, _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
 		t.Fatal(err)
 	}
 	lim := store.Limits{MailboxMaxMsgs: 2}
@@ -99,7 +99,7 @@ func TestSenderItemsDoNotAccumulate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
+	if _, _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
 		t.Fatal(err)
 	}
 	senderItems := func() int {
@@ -200,7 +200,7 @@ func racingStoreDB(t *testing.T, lose int) (*dynamo.Store, []string, *racingDB) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
+	if _, _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
 		t.Fatal(err)
 	}
 	var ids []string

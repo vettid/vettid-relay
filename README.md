@@ -524,7 +524,7 @@ other process sees, refuses or is woken by.
 
 | Method and path | Auth | Success |
 |---|---|---|
-| `POST /v1/register` | signed by the key being registered | `201` (new) or `200` (existing): `{mailbox_id, limits}` |
+| `POST /v1/register` | signed by the key being registered | `201` (new) or `200` (existing): `{mailbox_id, limits, tokens_not_before?}`; `limits.reports_tombstones` is `true`, and `tokens_not_before` is there while a tombstone for the id is held (0.12.0, §6.1) |
 | `POST /v1/mailbox/{mailbox_id}` | deposit token + signed by token `sub` (open token: any signer) | `201 {msg_id}` |
 | `GET /v1/mailbox?wait=0..25&max=1..100` | owner | `200 {messages:[{msg_id, deposited_at, sender, payload}]}` (defaults: `wait=0`, `max=32`) |
 | `GET /v1/mailbox/ws` | owner (at upgrade) | WebSocket: server frames are messages, client frames are `{"ack": "<msg_id>"}` |
@@ -636,6 +636,25 @@ implementation chooses as follows:
   rotation grace starts a fresh, empty mailbox (`201`). (Before 0.5.0 it
   answered `200` for a mailbox that no longer resolved, and a swept
   mailbox's key could register again with its old tokens valid.)
+- **Tombstones at registration** (0.12.0, §6.1): `limits` carries
+  `reports_tombstones: true`, and both `201` and `200` carry
+  `tokens_not_before` while a tombstone for the id is held: its
+  tokens-not-before time, rounded up to the whole second. Deposits compare
+  a token's whole-second `iat` with the unrounded time, which gives the
+  same answer as comparing with the rounded one. The value comes from the
+  registration itself (SQLite: its transaction; DynamoDB: its consistent
+  read or write), never from a process's cache. With SQLite the field goes
+  once the tombstone is swept. With DynamoDB, a re-registered mailbox keeps
+  its tokens-not-before for good (deposits keep checking it), so its `200`s
+  keep reporting it.
+- **Don't lower the token lifetime limits.** Tombstones and denylist
+  entries are kept for the limits configured now
+  (`RELAY_MAX_TOKEN_LIFETIME`, `RELAY_OPEN_TOKEN_MAX_LIFETIME`), but
+  RELAY-PROTOCOL 0.12.0 §6.10 asks for the largest ever advertised: a
+  token minted under a larger limit can outlive a lowering. To shorten
+  them, keep the old values configured until every token minted under them
+  has expired (the old `RELAY_MAX_TOKEN_LIFETIME` after the change), then
+  lower them. Keeping a high-water mark is planned.
 - **Open tokens and blobs.** One-shot open tokens are refused for
   `PUT /v1/blob` with `token_invalid`. §5.6 grants "exactly one deposit".
   §6.8 says blob authorization is "identical to deposit", but letting a

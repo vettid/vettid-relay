@@ -34,7 +34,7 @@ func TestAuthorizeDepositOrder(t *testing.T) {
 	f := newFixture(t, nil)
 	ctx := context.Background()
 	owner, sender, other := newPrincipal(1), newPrincipal(2), newPrincipal(3)
-	if _, err := f.st.Register(ctx, owner.mbx, owner.pub); err != nil {
+	if _, _, err := f.st.Register(ctx, owner.mbx, owner.pub); err != nil {
 		t.Fatal(err)
 	}
 	body := depositBody([]byte("x"))

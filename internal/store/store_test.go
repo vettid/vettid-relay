@@ -41,7 +41,7 @@ func key(b byte) []byte { return bytes.Repeat([]byte{b}, 32) }
 
 func mustRegister(t *testing.T, s *Store, id string, b byte) {
 	t.Helper()
-	if _, err := s.Register(ctx, id, key(b)); err != nil {
+	if _, _, err := s.Register(ctx, id, key(b)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -74,15 +74,15 @@ func TestOpenCreatesWALFile(t *testing.T) {
 
 func TestRegisterIdempotent(t *testing.T) {
 	s, _ := open(t)
-	created, err := s.Register(ctx, "mbx", key(1))
+	created, _, err := s.Register(ctx, "mbx", key(1))
 	if err != nil || !created {
 		t.Fatalf("first register: created=%v err=%v", created, err)
 	}
-	created, err = s.Register(ctx, "mbx", key(1))
+	created, _, err = s.Register(ctx, "mbx", key(1))
 	if err != nil || created {
 		t.Fatalf("second register: created=%v err=%v", created, err)
 	}
-	if _, err := s.Register(ctx, "mbx", key(2)); err == nil {
+	if _, _, err := s.Register(ctx, "mbx", key(2)); err == nil {
 		t.Fatal("expected collision error for different key")
 	}
 	mb, err := s.Mailbox(ctx, "mbx")

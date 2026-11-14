@@ -78,7 +78,7 @@ func (h Harness) pair(t *testing.T) (store.Backend, store.Backend, *Clock) {
 
 func mustRegister(t *testing.T, s store.Backend, id string, b byte) {
 	t.Helper()
-	if _, err := s.Register(ctx, id, key(b)); err != nil {
+	if _, _, err := s.Register(ctx, id, key(b)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -129,15 +129,15 @@ func Run(t *testing.T, h Harness) {
 
 func testRegisterIdempotent(t *testing.T, h Harness) {
 	s, _ := h.open(t)
-	created, err := s.Register(ctx, "mbx", key(1))
-	if err != nil || !created {
-		t.Fatalf("first register: created=%v err=%v", created, err)
+	created, nb, err := s.Register(ctx, "mbx", key(1))
+	if err != nil || !created || !nb.IsZero() {
+		t.Fatalf("first register: created=%v nb=%v err=%v", created, nb, err)
 	}
-	created, err = s.Register(ctx, "mbx", key(1))
-	if err != nil || created {
-		t.Fatalf("second register: created=%v err=%v", created, err)
+	created, nb, err = s.Register(ctx, "mbx", key(1))
+	if err != nil || created || !nb.IsZero() {
+		t.Fatalf("second register: created=%v nb=%v err=%v", created, nb, err)
 	}
-	if _, err := s.Register(ctx, "mbx", key(2)); err == nil {
+	if _, _, err := s.Register(ctx, "mbx", key(2)); err == nil {
 		t.Fatal("expected collision error for different key")
 	}
 	mb, err := s.Mailbox(ctx, "mbx")
@@ -527,7 +527,7 @@ func testRotatedMailboxPurged(t *testing.T, h Harness) {
 	if _, err := s.TakeClaim(ctx, claim); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("claim of a purged mailbox: %v", err)
 	}
-	created, err := s.Register(ctx, "old", key(1))
+	created, _, err := s.Register(ctx, "old", key(1))
 	if err != nil || !created {
 		t.Fatalf("re-register after purge: %v %v", created, err)
 	}
@@ -979,16 +979,16 @@ func testDeleteReRegister(t *testing.T, h Harness) {
 		t.Fatal(err)
 	}
 	c.Add(time.Minute)
-	created, err := s.Register(ctx, "a", key(1))
-	if err != nil || !created {
-		t.Fatalf("re-register: %v %v", created, err)
+	created, got, err := s.Register(ctx, "a", key(1))
+	if err != nil || !created || !got.Equal(nb.Truncate(time.Millisecond)) {
+		t.Fatalf("re-register: %v %v (want %v) %v", created, got, nb, err)
 	}
 	mb, err := s.Mailbox(ctx, "a")
 	if err != nil || !mb.TokensNotBefore.Equal(nb.Truncate(time.Millisecond)) {
 		t.Fatalf("TokensNotBefore %v (want %v), %v", mb.TokensNotBefore, nb, err)
 	}
-	if created, err := s.Register(ctx, "a", key(1)); err != nil || created {
-		t.Fatalf("second re-register: %v %v", created, err)
+	if created, got, err := s.Register(ctx, "a", key(1)); err != nil || created || !got.Equal(mb.TokensNotBefore) {
+		t.Fatalf("second re-register: %v %v %v", created, got, err)
 	}
 	if got, _, _ := s.Collect(ctx, "a", 10, time.Minute); len(got) != 0 {
 		t.Fatalf("re-registered mailbox has %d old messages", len(got))
@@ -1077,7 +1077,7 @@ func testDeleteAcrossProcesses(t *testing.T, h Harness) {
 	if _, err := b.PutBlob(ctx, store.BlobPut{Mailbox: "m", Size: 1, TTL: time.Hour, Limits: lim}, bytes.NewReader([]byte("x"))); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("blob on the other process: %v", err)
 	}
-	if _, err := a.Register(ctx, "m", key(1)); err != nil {
+	if _, _, err := a.Register(ctx, "m", key(1)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := b.Deposit(ctx, "m", "s", []byte("x"), time.Hour, lim); !errors.Is(err, store.ErrRevoked) {
@@ -1098,7 +1098,7 @@ func testDeleteTombstoneExpires(t *testing.T, h Harness) {
 	if _, err := s.Sweep(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Register(ctx, "a", key(1)); err != nil {
+	if _, _, err := s.Register(ctx, "a", key(1)); err != nil {
 		t.Fatal(err)
 	}
 	if mb, err := s.Mailbox(ctx, "a"); err != nil || !mb.TokensNotBefore.IsZero() {
@@ -1120,9 +1120,9 @@ func testRegisterAfterGrace(t *testing.T, h Harness) {
 	oldIat := c.Now().Add(-time.Minute)
 	c.Add(2 * time.Minute)
 	at := c.Now()
-	created, err := s.Register(ctx, "old", key(1))
-	if err != nil || !created {
-		t.Fatalf("register after grace: %v %v", created, err)
+	created, got, err := s.Register(ctx, "old", key(1))
+	if err != nil || !created || !got.Equal(at.Add(90*time.Second)) {
+		t.Fatalf("register after grace: %v %v %v", created, got, err)
 	}
 	// The registration removed the rotated mailbox, as a sweep would have:
 	// same tombstone, at the time of the registration.
@@ -1161,8 +1161,8 @@ func testRotatedTombstone(t *testing.T, h Harness) {
 		t.Fatalf("sweep: %+v %v", st, err)
 	}
 	c.Add(time.Hour)
-	if created, err := s.Register(ctx, "old", key(1)); err != nil || !created {
-		t.Fatalf("re-register: %v %v", created, err)
+	if created, got, err := s.Register(ctx, "old", key(1)); err != nil || !created || !got.Equal(removed.Add(90*time.Second)) {
+		t.Fatalf("re-register: %v %v (removed %v) %v", created, got, removed, err)
 	}
 	mb, err := s.Mailbox(ctx, "old")
 	if err != nil || !mb.TokensNotBefore.Equal(removed.Add(90*time.Second)) {
@@ -1200,7 +1200,7 @@ func testRotatedTombstoneAcrossProcesses(t *testing.T, h Harness) {
 	if _, err := a.Sweep(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Register(ctx, "old", key(1)); err != nil {
+	if _, _, err := b.Register(ctx, "old", key(1)); err != nil {
 		t.Fatal(err)
 	}
 	old := store.Limits{TokenJTI: "t", TokenIssuedAt: oldIat, TokenExpires: c.Now().Add(time.Hour)}
