@@ -415,7 +415,9 @@ func (s *Store) checkLive(ctx context.Context, q querier, mailbox string, lim Li
 	if err != nil {
 		return err
 	}
-	if !lim.TokenIssuedAt.IsZero() && lim.TokenIssuedAt.Before(mb.TokensNotBefore) {
+	// iat in whole seconds: k < nb is k < nb rounded up, the value
+	// registration reports (§6.1).
+	if !lim.TokenIssuedAt.IsZero() && lim.TokenIssuedAt.Truncate(time.Second).Before(mb.TokensNotBefore) {
 		return ErrRevoked
 	}
 	return nil

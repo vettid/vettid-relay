@@ -639,9 +639,10 @@ implementation chooses as follows:
 - **Tombstones at registration** (0.12.0, §6.1): `limits` carries
   `reports_tombstones: true`, and both `201` and `200` carry
   `tokens_not_before` while a tombstone for the id is held: its
-  tokens-not-before time, rounded up to the whole second. Deposits compare
-  a token's whole-second `iat` with the unrounded time, which gives the
-  same answer as comparing with the rounded one. The value comes from the
+  tokens-not-before time, rounded up to the whole second. Deposits take a
+  token's `iat` in whole seconds (a fractional second is dropped) and
+  compare it with the unrounded time, which gives the same answer as
+  comparing with the rounded one, whatever the token's format. The value comes from the
   registration itself (SQLite: its transaction; DynamoDB: its consistent
   read or write), never from a process's cache. With SQLite the field goes
   once the tombstone is swept. With DynamoDB, a re-registered mailbox keeps

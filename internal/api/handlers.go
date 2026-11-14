@@ -116,9 +116,9 @@ type registerResponse struct {
 }
 
 // wholeSecondUp is t rounded up to the whole second, as §6.1 reports a
-// tombstone's tokens-not-before. Deposits compare a token's whole-second
-// iat with the unrounded time (iat < t), which for whole seconds is the
-// same as comparing with this.
+// tombstone's tokens-not-before. Deposits take a token's iat in whole
+// seconds (truncated) and compare it with the unrounded time (iat < t),
+// which is the same as comparing with this.
 func wholeSecondUp(t time.Time) time.Time {
 	if r := t.Truncate(time.Second); r.Before(t) {
 		return r.Add(time.Second)

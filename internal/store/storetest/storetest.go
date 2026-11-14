@@ -109,6 +109,7 @@ func Run(t *testing.T, h Harness) {
 		{"LargePayload", testLargePayload},
 		{"DeleteMailbox", testDeleteMailbox},
 		{"DeleteMailboxReRegister", testDeleteReRegister},
+		{"fractional iat against tombstone", testFractionalIatAgainstTombstone},
 		{"DeleteMailboxRotation", testDeleteRotation},
 		{"DeleteMailboxAcrossProcesses", testDeleteAcrossProcesses},
 		{"DeleteMailboxTombstoneExpires", testDeleteTombstoneExpires},
@@ -1005,6 +1006,33 @@ func testDeleteReRegister(t *testing.T, h Harness) {
 		if _, err := s.Deposit(ctx, "a", "s", []byte("new"), time.Hour, fresh); err != nil {
 			t.Fatalf("fresh token, deposit %d: %v", i, err)
 		}
+	}
+}
+
+// A tombstone's tokens-not-before is compared with iat in whole seconds
+// (§6.1: with the value registration reports, rounded up): a token whose iat
+// has a fractional second at or after it, but before the whole second, is
+// refused; one at the whole second is accepted.
+func testFractionalIatAgainstTombstone(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	c.Add(time.Second - c.Now().Sub(c.Now().Truncate(time.Second)) + 400*time.Millisecond) // a whole second, plus 400 ms
+	nb, keep := deleteTimes(c)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), nb, keep); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "a", key(1)); err != nil {
+		t.Fatal(err)
+	}
+	up := nb.Truncate(time.Second).Add(time.Second)
+	exp := up.Add(time.Hour)
+	for _, iat := range []time.Time{nb, nb.Add(300 * time.Millisecond), up.Add(-time.Millisecond)} {
+		if _, err := s.Deposit(ctx, "a", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "f", TokenIssuedAt: iat, TokenExpires: exp}); !errors.Is(err, store.ErrRevoked) {
+			t.Fatalf("iat %v (tokens-not-before %v): %v", iat, nb, err)
+		}
+	}
+	if _, err := s.Deposit(ctx, "a", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "w", TokenIssuedAt: up, TokenExpires: exp}); err != nil {
+		t.Fatalf("iat at the whole second: %v", err)
 	}
 }
 

@@ -255,3 +255,48 @@ func TestCollectLeaseWriteError(t *testing.T) {
 		t.Fatalf("%d messages, err %v", len(got), err)
 	}
 }
+
+// A deletion repeated between a registration's read and its revive (the
+// owner retrying a DELETE whose 204 was lost) raises the tombstone: the
+// registration reads again and reports the raised time, which is the one
+// deposits are checked against.
+func TestRegisterRacingDeleteReportsRaisedNB(t *testing.T) {
+	db := ddblocal.Client(t)
+	table := ddblocal.Table(t, db)
+	c := storetest.NewClock()
+	s, err := dynamo.New(dynamo.Config{Table: table, DB: db, S3: fakes3.New(t).Client(), Bucket: "b", Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := make([]byte, 32)
+	if _, _, err := s.Register(ctx, "a", pub); err != nil {
+		t.Fatal(err)
+	}
+	nb1 := c.Now().Add(90 * time.Second)
+	if _, err := s.DeleteMailbox(ctx, "a", pub, nb1, c.Now().Add(48*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	nb2 := nb1.Add(30 * time.Second)
+	once := false
+	dynamo.SetBeforeRevive(s, func() {
+		if once {
+			return
+		}
+		once = true
+		if _, err := s.DeleteMailbox(ctx, "a", pub, nb2, c.Now().Add(48*time.Hour)); err != nil {
+			t.Error(err)
+		}
+	})
+	created, got, err := s.Register(ctx, "a", pub)
+	if err != nil || !created || !once {
+		t.Fatalf("register: %v %v (hook ran: %v)", created, err, once)
+	}
+	mb, err := s.Mailbox(ctx, "a")
+	if err != nil || !got.Equal(nb2.Truncate(time.Millisecond)) || !mb.TokensNotBefore.Equal(got) {
+		t.Fatalf("reported %v, stored %v (want %v), %v", got, mb.TokensNotBefore, nb2, err)
+	}
+	old := store.Limits{TokenJTI: "t", TokenIssuedAt: nb1.Add(time.Second), TokenExpires: nb2.Add(time.Hour)}
+	if _, err := s.Deposit(ctx, "a", "s", []byte("x"), time.Hour, old); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("a token between the two deletions: %v", err)
+	}
+}

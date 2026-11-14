@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/vettid/vettid-relay/internal/store"
 	auth "github.com/vettid/vettid-relay/relayauth"
@@ -75,8 +76,10 @@ func (s *Server) authorizeDepositToken(ctx context.Context, r *http.Request, mai
 	}
 	// 6a. (0.5.0, §6.10) A token issued before this mailbox id was deleted
 	// predates the current registration of its key. (The store re-checks
-	// atomically with the write.)
-	if claims.Iat.Before(mb.TokensNotBefore) {
+	// atomically with the write.) iat is taken in whole seconds, so this is
+	// the comparison with the value registration reports, rounded up
+	// (§6.1), whatever the token's format.
+	if claims.Iat.Truncate(time.Second).Before(mb.TokensNotBefore) {
 		return nil, fail(CodeTokenRevoked)
 	}
 	// 6b. One-shot open tokens (§5.6): not already consumed. (Consumption is

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"testing"
@@ -132,4 +133,34 @@ func TestWholeSecondUp(t *testing.T) {
 			t.Errorf("%v: %v", in, got)
 		}
 	}
+}
+
+// A token whose iat has a fractional second after the tombstone's time but
+// before the whole second reported is refused: iat is compared with the
+// value reported (§6.1), whatever its format.
+func TestFractionalIatAgainstReportedTombstone(t *testing.T) {
+	f := newFixture(t, nil)
+	owner, sender := newPrincipal(1), newPrincipal(2)
+	f.register(owner)
+	f.clk.set(f.clk.now().Truncate(time.Second).Add(400 * time.Millisecond))
+	nb := f.clk.now().Add(auth.FreshnessWindow)
+	if code, b := f.deleteMailbox(owner); code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", code, b)
+	}
+	_, m := f.registerAnswer(owner)
+	v, _ := tombField(m)
+	reported, err := time.Parse(time.RFC3339, v)
+	if err != nil || !reported.Equal(wholeSecondUp(nb)) {
+		t.Fatalf("reported %q: %v", v, err)
+	}
+	f.clk.set(reported.Add(5 * time.Second))
+	token := func(jti string, iat time.Time) string {
+		claims := fmt.Sprintf(`{"iss":%q,"sub":%q,"aud":%q,"iat":%q,"exp":%q,"jti":%q,"scope":"deposit"}`,
+			owner.mbx, sender.b64, testAud, iat.UTC().Format(time.RFC3339Nano), iat.Add(time.Hour).UTC().Format(time.RFC3339), jti)
+		return auth.SignToken(owner.priv, []byte(claims))
+	}
+	for i, iat := range []time.Time{nb.Add(300 * time.Millisecond), reported.Add(-time.Millisecond)} {
+		f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("x")), signer: &sender, token: token(fmt.Sprint("frac", i), iat)}, 403, CodeTokenRevoked)
+	}
+	f.mustDeposit(owner, sender, token("whole", reported.Add(500*time.Millisecond)), []byte("x"))
 }
