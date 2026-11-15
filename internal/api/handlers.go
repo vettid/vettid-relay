@@ -610,8 +610,6 @@ func (s *Server) ack(ctx context.Context, mailbox, msgID string) *apiError {
 // margin covers the freshness window. The caps are the largest the relay
 // has ever advertised (cfg.RetentionLifetime, §6.10), not only the current
 // ones: tokens minted under an older, larger limit are still live.
-func (s *Server) denylistRetention() time.Duration { return denylistRetention(s.cfg) }
-
 func denylistRetention(cfg config.Config) time.Duration {
 	return max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime, cfg.RetentionLifetime) + auth.FreshnessWindow + time.Minute
 }
