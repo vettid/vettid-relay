@@ -387,6 +387,7 @@ func TestVaultRelayRules(t *testing.T) {
 	for _, zero := range []func(*Config){
 		func(c *Config) { c.RotationGrace = 0 },
 		func(c *Config) { c.MessageTTL = 0 },
+		func(c *Config) { c.MessageTTL = 999 * time.Millisecond },
 	} {
 		c := Defaults()
 		c.ServesVaults = false
@@ -394,5 +395,32 @@ func TestVaultRelayRules(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Error("Validate accepted a zero grace or message TTL")
 		}
+	}
+}
+
+// Integer seconds that don't fit a Duration are refused, not wrapped
+// (18446744074 s would become 290 ms and pass "at most 14 days").
+func TestDurationSecondsRange(t *testing.T) {
+	for _, key := range []string{"RELAY_MESSAGE_TTL", "RELAY_ROTATION_GRACE", "RELAY_MAX_TOKEN_LIFETIME", "RELAY_OPEN_TOKEN_MAX_LIFETIME", "RELAY_CLAIM_TTL", "RELAY_BLOB_TTL", "RELAY_VISIBILITY_TIMEOUT", "RELAY_SWEEP_INTERVAL"} {
+		for _, v := range []string{"18446744074", "9223372037", "-9223372037", "9223372036854775807"} {
+			m := map[string]string{"RELAY_SERVES_VAULTS": "false", key: v}
+			if _, err := Load(env(m)); err == nil {
+				t.Errorf("%s=%s accepted", key, v)
+			} else if v == "18446744074" && !strings.Contains(err.Error(), "out of range") {
+				t.Errorf("%s=%s: %v", key, v, err)
+			}
+		}
+	}
+	// The largest that fits is still read as seconds.
+	c, err := Load(env(map[string]string{"RELAY_SERVES_VAULTS": "false", "RELAY_MAX_TOKEN_LIFETIME": "9223372036"}))
+	if err != nil || c.MaxTokenLifetime != 9223372036*time.Second {
+		t.Fatalf("%v %v", c.MaxTokenLifetime, err)
+	}
+	// A message TTL under a second is refused: it would advertise 0.
+	if _, err := Load(env(map[string]string{"RELAY_MESSAGE_TTL": "500ms"})); err == nil {
+		t.Error("RELAY_MESSAGE_TTL=500ms accepted")
+	}
+	if c, err := Load(env(map[string]string{"RELAY_MESSAGE_TTL": "1s"})); err != nil || c.MessageTTL != time.Second {
+		t.Errorf("1s: %v %v", c.MessageTTL, err)
 	}
 }

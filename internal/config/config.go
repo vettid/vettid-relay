@@ -7,6 +7,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -350,6 +351,12 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		if v, ok := lookup(key); ok && strings.TrimSpace(v) != "" {
 			v = strings.TrimSpace(v)
 			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				// n seconds must fit a Duration (about 292 years), or the
+				// product wraps (18446744074 would become 290 ms).
+				if n > math.MaxInt64/int64(time.Second) || n < math.MinInt64/int64(time.Second) {
+					errs = append(errs, fmt.Errorf("%s: %d seconds is out of range", key, n))
+					return
+				}
 				*dst = time.Duration(n) * time.Second
 			} else if d, err := time.ParseDuration(v); err == nil {
 				*dst = d
@@ -513,8 +520,13 @@ func (c Config) Validate() error {
 	if c.MaxTokenLifetime < time.Second || c.OpenTokenMaxLifetime < time.Second || c.ClaimTTL < time.Second {
 		errs = append(errs, errors.New("token lifetimes and claim TTL must be at least 1s"))
 	}
-	if c.RotationGrace <= 0 || c.MessageTTL <= 0 {
-		errs = append(errs, errors.New("RELAY_ROTATION_GRACE and RELAY_MESSAGE_TTL must be > 0"))
+	if c.RotationGrace <= 0 {
+		errs = append(errs, errors.New("RELAY_ROTATION_GRACE must be > 0"))
+	}
+	// message_ttl_seconds is advertised in whole seconds: under 1 s it
+	// would read 0.
+	if c.MessageTTL < time.Second {
+		errs = append(errs, errors.New("RELAY_MESSAGE_TTL must be at least 1s"))
 	}
 	if c.ServesVaults {
 		// RELAY-PROTOCOL 0.11.1: refused at start rather than served wrong.
