@@ -25,7 +25,11 @@ import (
 //
 // A purge runs for at most purgeBudget, well inside purgeLease: a fence
 // older than the lease belongs to a purge that died (or gave up), and the
-// next purge takes it over and carries on (purging is idempotent).
+// next purge takes it over and carries on (purging is idempotent). The
+// fence's time is the holder's clock and the takeover's check the
+// taker's, so the margin (lease - budget - the fence write's latency) must
+// exceed the clock difference between relay processes: about 3 minutes
+// here, against NTP-synchronised hosts.
 const (
 	purgeLease  = 5 * time.Minute
 	purgeBudget = 2 * time.Minute

@@ -956,3 +956,108 @@ func TestRotateWaitsForFenceTakenAfterRead(t *testing.T) {
 		t.Fatal("the purge's fence was taken or removed")
 	}
 }
+
+// takeover makes another purge take id's fence over while the current
+// holder purges (as after the lease, with a holder that stalled).
+func takeover(s *dynamo.Store, c *storetest.Clock, id string) {
+	once := true
+	dynamo.SetDuringPurge(s, func() {
+		if once {
+			once = false
+			dynamo.SetFence(s, id, c.Now())
+		}
+	})
+}
+
+// A holder whose fence was taken over doesn't commit: not a revive, the
+// sweep's removal of a tombstone, a retire, or a rotation onto a dead
+// successor.
+func TestNoCommitAfterTakeover(t *testing.T) {
+	t.Run("revive", func(t *testing.T) {
+		s, c := newMarked(t)
+		if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		takeover(s, c, "a")
+		_, _, err := s.Register(ctx, "a", k(1))
+		dynamo.SetDuringPurge(s, nil)
+		if err == nil || !dynamo.AccountHas(s, "a", "deleted") {
+			t.Fatalf("revived after its fence was taken over: %v", err)
+		}
+	})
+	t.Run("sweep", func(t *testing.T) {
+		s, c := newMarked(t)
+		dueTombstone(t, s, c, "a", 1)
+		takeover(s, c, "a")
+		st, err := s.Sweep(ctx)
+		dynamo.SetDuringPurge(s, nil)
+		if err != nil || st.Mailboxes != 0 || !dynamo.AccountHas(s, "a", "pub") || !dynamo.StatsExists(s, "a") {
+			t.Fatalf("removed the tombstone after its fence was taken over: %+v %v", st, err)
+		}
+	})
+	t.Run("retire", func(t *testing.T) {
+		s, c := newMarked(t)
+		if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		c.Add(time.Hour + 11*time.Minute)
+		takeover(s, c, "b")
+		st, err := s.Sweep(ctx)
+		dynamo.SetDuringPurge(s, nil)
+		if err != nil || st.Mailboxes != 0 || dynamo.AccountHas(s, "b", "deleted") {
+			t.Fatalf("retired after its fence was taken over: %+v %v", st, err)
+		}
+	})
+	t.Run("rotate", func(t *testing.T) {
+		s, c := newMarked(t)
+		if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.DeleteMailbox(ctx, "b", k(2), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+			t.Fatal(err)
+		}
+		takeover(s, c, "b")
+		err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+		dynamo.SetDuringPurge(s, nil)
+		if err == nil || !dynamo.AccountHas(s, "b", "deleted") {
+			t.Fatalf("rotated onto b after its fence was taken over: %v", err)
+		}
+	})
+}
+
+// A deletion whose mailbox another purge holds waits for it, and answers
+// only once the mailbox is empty: while that purge (here, one that
+// stopped) holds the fence, the deletion fails and keeps nothing it
+// shouldn't; after the lease, a repeat empties it.
+func TestDeletionWaitsForFence(t *testing.T) {
+	s, c := newMarked(t)
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	fill(t, s, c, "a")
+	dynamo.SetBeforeMark(s, func() { dynamo.SetFence(s, "a", c.Now()) })
+	_, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour))
+	dynamo.SetBeforeMark(s, nil)
+	if err == nil {
+		t.Fatalf("the deletion answered with %d items left behind", dynamo.ContentN(s, "a"))
+	}
+	if !dynamo.AccountHas(s, "a", "deleted") {
+		t.Fatal("the deletion didn't tombstone the mailbox first")
+	}
+	c.Add(6 * time.Minute)
+	if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if n := dynamo.ContentN(s, "a"); n != 0 {
+		t.Fatalf("%d items left after the repeat", n)
+	}
+}

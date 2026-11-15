@@ -88,12 +88,34 @@ func (s *Store) tombstone(ctx context.Context, id string, pub []byte, prevNB int
 			return err
 		}
 	}
-	// The contents go under the fence (fence.go). If another purge holds
-	// it, that purge empties the mailbox; if the key registered again
-	// since, there is nothing of this deletion's left to empty.
-	tok, ok, err := s.fence(ctx, id, "pub = :p AND attribute_exists(deleted)", item{":p": avB(pub)})
-	if err != nil || !ok {
-		return err
+	// The contents go under the fence (fence.go). While another purge
+	// holds it, wait: the deletion answers only once its mailbox is empty
+	// (a holder may stop short of that). If the key registered again
+	// since, or the sweep removed the tombstone, nothing of this
+	// deletion's is left to empty.
+	var tok string
+	for attempt := 0; ; attempt++ {
+		t, ok, err := s.fence(ctx, id, "pub = :p AND attribute_exists(deleted)", item{":p": avB(pub)})
+		if err != nil {
+			return err
+		}
+		if ok {
+			tok = t
+			break
+		}
+		it, err := s.getAccount(ctx, id)
+		if err != nil {
+			return err
+		}
+		if _, deleted := it["deleted"]; !deleted {
+			return nil
+		}
+		if attempt >= maxTxAttempts {
+			return fmt.Errorf("dynamo: delete mailbox: %w", errPurging)
+		}
+		if err := backoff(ctx, attempt); err != nil {
+			return err
+		}
 	}
 	defer s.unfence(ctx, id, tok)
 	if _, err := s.purgeFenced(ctx, id); err != nil {
@@ -102,12 +124,18 @@ func (s *Store) tombstone(ctx context.Context, id string, pub []byte, prevNB int
 	// Zero the counters after the purge, so that acks racing it cannot
 	// leave them negative for a later re-registration (which zeroes them
 	// again anyway).
-	_, err = s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+	// Only an existing counters item: one the sweep deleted (after a
+	// takeover of the fence) isn't made again.
+	_, err := s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.cfg.Table,
 		Key:                       key(mbPK(id), skStats),
 		UpdateExpression:          aws.String("SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z"),
+		ConditionExpression:       aws.String("attribute_exists(pk)"),
 		ExpressionAttributeValues: item{":z": avN(0)},
 	})
+	if isCCF(err) {
+		return nil
+	}
 	return err
 }
 

@@ -47,6 +47,25 @@ func AccountHas(s *Store, id, attr string) bool {
 	return ok
 }
 
+// ContentN counts a mailbox's items other than its account and counters
+// items (tests only).
+func ContentN(s *Store, id string) int {
+	n := 0
+	if err := s.queryAll(context.Background(), &dynamodb.QueryInput{
+		KeyConditionExpression:    aws.String("pk = :pk"),
+		ExpressionAttributeValues: item{":pk": avS(mbPK(id))},
+		ProjectionExpression:      aws.String("pk, sk"),
+	}, func(it item) error {
+		if sk := getS(it, "sk"); sk != skAccount && sk != skStats {
+			n++
+		}
+		return nil
+	}); err != nil {
+		panic(err)
+	}
+	return n
+}
+
 // StatsN reads a number attribute of a mailbox's counters item (tests
 // only).
 func StatsN(s *Store, id, attr string) int64 {

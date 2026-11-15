@@ -680,6 +680,9 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			succNBCond = " AND (attribute_not_exists(nb) OR nb <= :snb)"
 			succValsA[":snb"] = avN(succNB)
 		}
+		if s.beforeRotate != nil {
+			s.beforeRotate()
+		}
 		// A live or new successor must not be under a purge by the write;
 		// a dead one is emptied under the fence (taken now, after the
 		// reads), and the write requires it still held.
@@ -721,9 +724,6 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			}
 			succSetS += " REMOVE dead_at"
 			succValsS[":z"], succValsS[":one"] = avN(0), avN(1)
-		}
-		if s.beforeRotate != nil {
-			s.beforeRotate()
 		}
 		da := deleteAfter
 		oldCond := "pub = :oldpub AND attribute_not_exists(delete_after) AND attribute_not_exists(deleted)"
