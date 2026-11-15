@@ -7,7 +7,7 @@ keys to payload content: a compromised relay can drop or delay messages, but
 can't read or forge them.
 
 - **Protocol:** [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md)
-  (**v0.7.0**, reported by `relay -version` and `/healthz`). This repository
+  (**v0.12.0**, reported by `relay -version` and `/healthz`). This repository
   implements all of it:
   - registration
   - deposit tokens (PASETO v4.public, sender-bound), plus one-shot open
@@ -86,7 +86,9 @@ docker run -p 8080:8080 -v relay-data:/data -e RELAY_BASE_URL=https://relay.exam
 
 All configuration is through environment variables. The relay holds no
 secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
-`336h`) or a bare integer number of seconds.
+`336h`) or a bare integer number of seconds, at most 9223372036 (about
+292 years, what a Go duration holds); a larger integer is refused at
+start, not wrapped.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -109,7 +111,7 @@ secrets, so none of these are sensitive. Durations accept Go syntax (`90s`,
 | `RELAY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
 | `RELAY_LOG_INFO_RPS` / `RELAY_LOG_INFO_BURST` | `100` / `1000` | Log budget per relay process: info lines beyond it are dropped and counted (`log_dropped` in the `rate limits` line, `relay_log_lines_dropped_total`). The access lines of successful requests that change a mailbox's state (register, rotate, denylist, delete mailbox) have a second budget of the same size that other lines can't use up. Never dropped: the `rate limits` line (production alarms when it goes missing) and the process's start, drain and stop lines. Warn and error lines are not budgeted, but one message with the same `err`, `route` and `panic` values is written at most once per 10 s; the next one carries `repeated` (`log_suppressed`, `relay_log_lines_suppressed_total`). |
 | `RELAY_MAX_PAYLOAD_BYTES` | `262144` | Max decoded deposit payload (`max_payload_bytes`). |
-| `RELAY_MESSAGE_TTL` | `336h` (14 d) | Lifetime of an unacked message (`message_ttl_seconds`). At most 14 days while `RELAY_SERVES_VAULTS` is true (RELAY-PROTOCOL §6.1); a larger value is refused at start. An expired message is never delivered, but with the DynamoDB store its item stays stored until DynamoDB's TTL deletes it, typically within a few days of expiry. |
+| `RELAY_MESSAGE_TTL` | `336h` (14 d) | Lifetime of an unacked message (`message_ttl_seconds`). At least 1 s (it is advertised in whole seconds), and at most 14 days while `RELAY_SERVES_VAULTS` is true (RELAY-PROTOCOL §6.1); a larger value is refused at start. An expired message is never delivered, but with the DynamoDB store its item stays stored until DynamoDB's TTL deletes it, typically within a few days of expiry. |
 | `RELAY_VISIBILITY_TIMEOUT` | `60s` | Lease length for collected, unacked messages (`visibility_timeout_seconds`). |
 | `RELAY_BLOBS_ENABLED` | `true` | Serve `/v1/blob` (§6.8) and advertise blob limits at registration. |
 | `RELAY_MAX_BLOB_BYTES` | `8388608` | Max blob size (`max_blob_bytes`). An upload must declare its length (`Content-Length`, else `400 bad_request`); a declared length over this is refused unread (`413`). |

@@ -401,7 +401,8 @@ func TestVaultRelayRules(t *testing.T) {
 // Integer seconds that don't fit a Duration are refused, not wrapped
 // (18446744074 s would become 290 ms and pass "at most 14 days").
 func TestDurationSecondsRange(t *testing.T) {
-	for _, key := range []string{"RELAY_MESSAGE_TTL", "RELAY_ROTATION_GRACE", "RELAY_MAX_TOKEN_LIFETIME", "RELAY_OPEN_TOKEN_MAX_LIFETIME", "RELAY_CLAIM_TTL", "RELAY_BLOB_TTL", "RELAY_VISIBILITY_TIMEOUT", "RELAY_SWEEP_INTERVAL"} {
+	for _, key := range []string{"RELAY_MESSAGE_TTL", "RELAY_ROTATION_GRACE", "RELAY_MAX_TOKEN_LIFETIME", "RELAY_OPEN_TOKEN_MAX_LIFETIME", "RELAY_CLAIM_TTL", "RELAY_BLOB_TTL", "RELAY_VISIBILITY_TIMEOUT", "RELAY_SWEEP_INTERVAL",
+		"RELAY_BLOB_EVICT_MIN_AGE", "RELAY_SHUTDOWN_TIMEOUT", "RELAY_EMPTY_SKIP_MAX"} {
 		for _, v := range []string{"18446744074", "9223372037", "-9223372037", "9223372036854775807"} {
 			m := map[string]string{"RELAY_SERVES_VAULTS": "false", key: v}
 			if _, err := Load(env(m)); err == nil {
@@ -417,8 +418,8 @@ func TestDurationSecondsRange(t *testing.T) {
 		t.Fatalf("%v %v", c.MaxTokenLifetime, err)
 	}
 	// A message TTL under a second is refused: it would advertise 0.
-	if _, err := Load(env(map[string]string{"RELAY_MESSAGE_TTL": "500ms"})); err == nil {
-		t.Error("RELAY_MESSAGE_TTL=500ms accepted")
+	if _, err := Load(env(map[string]string{"RELAY_MESSAGE_TTL": "500ms"})); err == nil || !strings.Contains(err.Error(), "RELAY_MESSAGE_TTL must be at least 1s") {
+		t.Errorf("RELAY_MESSAGE_TTL=500ms: %v", err)
 	}
 	if c, err := Load(env(map[string]string{"RELAY_MESSAGE_TTL": "1s"})); err != nil || c.MessageTTL != time.Second {
 		t.Errorf("1s: %v %v", c.MessageTTL, err)
