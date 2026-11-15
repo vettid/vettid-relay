@@ -411,7 +411,7 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time
 			return true, nb, nil
 		}
 	}
-	return false, time.Time{}, errors.New("dynamo: register: mailbox keeps disappearing")
+	return false, time.Time{}, errors.New("dynamo: register: mailbox kept changing (purged, deleted or retired meanwhile)")
 }
 
 // revive turns a dead mailbox item back into a fresh, empty, live mailbox:

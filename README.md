@@ -642,8 +642,8 @@ implementation chooses as follows:
   tokens-not-before time, rounded up to the whole second. Deposits take a
   token's `iat` in whole seconds (a fractional second is dropped) and
   compare it with the unrounded time, which gives the same answer as
-  comparing with the rounded one, whatever the token's format. The value comes from the
-  registration itself (SQLite: its transaction; DynamoDB: its consistent
+  comparing with the rounded one, whatever the token's format. The value
+  comes from the registration itself (SQLite: its transaction; DynamoDB: its consistent
   read or write), never from a process's cache. With SQLite the field goes
   once the tombstone is swept. With DynamoDB, a re-registered mailbox keeps
   its tokens-not-before for good (deposits keep checking it), so its `200`s
