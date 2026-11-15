@@ -660,8 +660,18 @@ implementation chooses as follows:
   the `META`/`LIFETIME` item), raised at every start and never lowered,
   shared by every process. A start with lower limits logs so at WARN and
   keeps the larger retention; the advertised limits are the configured
-  ones. A repeated deletion never shortens a tombstone. The SQLite schema
-  is version 6 from this change, so an older binary refuses that database.
+  ones. A deletion or revocation reads the stored mark when it is made,
+  so a process started before another raised the limits still uses the
+  larger retention; so does DynamoDB's removal of a rotated mailbox. A
+  repeated deletion never shortens a tombstone.
+  - **Resetting the mark** (after a mistaken huge limit): set the
+    `lifetime_mark` row (SQLite) or the `META`/`LIFETIME` item's `life_ms`
+    (DynamoDB) to the configured limit, in milliseconds, but only once every
+    token minted under the larger limit has expired; earlier, revoked or
+    deleted keys' tokens could work again.
+  - **SQLite rollback:** this change moves the schema to version 6 (one
+    added table), so an older binary refuses the database;
+    `PRAGMA user_version=5` lets it open again.
 - **Open tokens and blobs.** One-shot open tokens are refused for
   `PUT /v1/blob` with `token_invalid`. §5.6 grants "exactly one deposit".
   §6.8 says blob authorization is "identical to deposit", but letting a

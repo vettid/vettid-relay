@@ -350,7 +350,13 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 // tombstoneRotated writes (or extends) the tombstone of every mailbox row
 // matching where, removed at now.
 func (s *Store) tombstoneRotated(ctx context.Context, tx *sql.Tx, now time.Time, where string, arg any) error {
-	nb, keep := s.tomb.Times(now)
+	// The policy raised to the stored lifetime mark (§6.10), as the
+	// deletions and revocations the api makes are.
+	var mark int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(lifetime_ms), 0) FROM lifetime_mark`).Scan(&mark); err != nil {
+		return err
+	}
+	nb, keep := s.tomb.WithMark(time.Duration(mark) * time.Millisecond).Times(now)
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO tombstones(mailbox_id, not_before, expires_at)
 		 SELECT mailbox_id, ?, ? FROM mailboxes WHERE `+where+`

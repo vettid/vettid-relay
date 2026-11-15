@@ -115,6 +115,15 @@ type LifetimeMarker interface {
 	SetTombstones(p TombstonePolicy)
 }
 
+// WithMark returns p with its retention at least what the lifetime mark
+// asks: the mark plus the margin plus a minute, the api's denylist
+// retention for that lifetime.
+func (p TombstonePolicy) WithMark(mark time.Duration) TombstonePolicy {
+	p = p.orDefault()
+	p.Retention = max(p.Retention, mark+p.Margin+time.Minute)
+	return p
+}
+
 // Times returns the tombstone's not-before and expiry for a removal at now.
 // The not-before is rounded up to the whole second, so what the stores
 // keep (milliseconds) and what registration reports (whole seconds, §6.1)

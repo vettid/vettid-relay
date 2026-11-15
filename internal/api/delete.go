@@ -44,9 +44,15 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 	// again: iat must be at least notBefore. The freshness window covers an
 	// owner clock running ahead of ours (this request's timestamp was
 	// within it). The tombstone lives until every such token has expired.
-	notBefore, keepUntil := TombstonePolicy(s.cfg).Times(s.now())
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), deleteTimeout)
 	defer cancel()
+	rcfg, err := s.retentionCfg(ctx)
+	if err != nil {
+		s.log.Error("mailbox delete failed: lifetime mark", "err", err)
+		s.writeError(w, fail(CodeInternal))
+		return
+	}
+	notBefore, keepUntil := TombstonePolicy(rcfg).Times(s.now())
 	ids, err := s.st.DeleteMailbox(ctx, auth.MailboxID(sr.Key), sr.Key, notBefore, keepUntil)
 	for _, id := range ids {
 		s.mailboxDeleted(ctx, id)

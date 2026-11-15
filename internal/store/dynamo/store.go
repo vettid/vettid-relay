@@ -170,13 +170,29 @@ func New(cfg Config) (*Store, error) {
 // Close implements store.Backend (the SDK clients hold no resources).
 func (s *Store) Close() error { return nil }
 
-// Ping implements store.Backend: one cheap read.
 // SetTombstones implements store.LifetimeMarker.
 func (s *Store) SetTombstones(p store.TombstonePolicy) { s.cfg.Tombstones = p }
+
+// tombstones is the tombstone policy raised to the mark stored now
+// (another process may have raised it since this one started), for the
+// removals this store makes itself: a rotated mailbox past its grace.
+func (s *Store) tombstones(ctx context.Context) (store.TombstonePolicy, error) {
+	out, err := s.cfg.DB.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &s.cfg.Table, Key: key("META", "LIFETIME"), ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return store.TombstonePolicy{}, err
+	}
+	v, _ := getN(out.Item, "life_ms")
+	return s.cfg.Tombstones.WithMark(time.Duration(v) * time.Millisecond), nil
+}
 
 // RaiseLifetimeMark implements store.LifetimeMarker: a conditional write
 // that only raises life_ms, then a consistent read of what is stored.
 func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Duration, error) {
+	if d <= 0 {
+		d = time.Millisecond // nothing to raise: the read below reports the mark
+	}
 	_, err := s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.cfg.Table,
 		Key:                       key("META", "LIFETIME"),
@@ -200,6 +216,7 @@ func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Du
 	return time.Duration(v) * time.Millisecond, nil
 }
 
+// Ping implements store.Backend: one cheap read.
 func (s *Store) Ping(ctx context.Context) error {
 	_, err := s.cfg.DB.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: &s.cfg.Table,
@@ -428,7 +445,11 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time
 		// its tokens get the tombstone it would have got from the sweep.
 		var setNB time.Time
 		if !mb.DeleteAfter.IsZero() { // not a deletion tombstone (parseMailbox)
-			setNB, _ = s.cfg.Tombstones.Times(s.now())
+			p, err := s.tombstones(ctx)
+			if err != nil {
+				return false, time.Time{}, err
+			}
+			setNB, _ = p.Times(s.now())
 		}
 		if s.beforeRevive != nil {
 			s.beforeRevive()

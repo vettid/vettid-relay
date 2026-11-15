@@ -116,6 +116,7 @@ func Run(t *testing.T, h Harness) {
 		{"DeleteMailboxRepeatKeepsLongerTombstone", testDeleteRepeatKeepsLonger},
 		{"LifetimeMark", testLifetimeMark},
 		{"ReviveOnlyRaisesNotBefore", testReviveOnlyRaisesNB},
+		{"RotatedTombstoneUsesStoredMark", testRotatedTombstoneUsesMark},
 		{"RegisterAfterRotationGrace", testRegisterAfterGrace},
 		{"RotatedMailboxLeavesTombstone", testRotatedTombstone},
 		{"RotatedMailboxTombstoneAcrossProcesses", testRotatedTombstoneAcrossProcesses},
@@ -1691,5 +1692,35 @@ func testReviveOnlyRaisesNB(t *testing.T, h Harness) {
 	mb, err := s.Mailbox(ctx, "a")
 	if err != nil || mb.TokensNotBefore.Before(high) {
 		t.Fatalf("not-before %v lowered below %v: %v", mb.TokensNotBefore, high, err)
+	}
+}
+
+// A rotated mailbox removed at the end of its grace leaves a tombstone kept
+// for the lifetime mark stored then, even one raised after the store
+// opened (by another process): not only the policy it opened with.
+func testRotatedTombstoneUsesMark(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	day := 24 * time.Hour
+	if _, err := s.(store.LifetimeMarker).RaiseLifetimeMark(ctx, 800*day); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "a", 1)
+	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + h.SweepGrace + time.Minute)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Past the default policy's 400 days, within the mark's 800.
+	c.Add(500 * day)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "a", key(1)); err != nil {
+		t.Fatal(err)
+	}
+	if mb, err := s.Mailbox(ctx, "a"); err != nil || mb.TokensNotBefore.IsZero() {
+		t.Fatalf("the tombstone ended with the opening policy, not the stored mark: %+v %v", mb, err)
 	}
 }

@@ -96,7 +96,11 @@ func (s *Store) retire(ctx context.Context, mailbox string, it item, cutoff int6
 	if err != nil {
 		return 0, false, err
 	}
-	nb, keep := s.cfg.Tombstones.Times(s.now())
+	p, err := s.tombstones(ctx)
+	if err != nil {
+		return msgs, false, err
+	}
+	nb, keep := p.Times(s.now())
 	nbv := max(ms(nb), getN0(it, "nb"))
 	_, err = s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{

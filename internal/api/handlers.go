@@ -616,6 +616,24 @@ func denylistRetention(cfg config.Config) time.Duration {
 	return max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime, cfg.RetentionLifetime) + auth.FreshnessWindow + time.Minute
 }
 
+// retentionCfg is s.cfg with RetentionLifetime raised to the mark stored
+// now: another process may have raised it since this one started (a
+// rollout that raises the limits), and an entry written with this
+// process's older mark would expire while tokens minted under the new
+// limits still live (§6.10, §5.5). Deletions and revocations are rare, so
+// they pay one store read. A store without a mark (tests) keeps s.cfg.
+func (s *Server) retentionCfg(ctx context.Context) (config.Config, error) {
+	cfg := s.cfg
+	if m, ok := s.st.(store.LifetimeMarker); ok {
+		mark, err := m.RaiseLifetimeMark(ctx, max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime))
+		if err != nil {
+			return cfg, err
+		}
+		cfg.RetentionLifetime = max(cfg.RetentionLifetime, mark)
+	}
+	return cfg, nil
+}
+
 // TombstonePolicy is the tombstone a mailbox leaves when it ends (§6.10;
 // §6.7 for one removed at the end of its rotation grace): tokens issued
 // before the end plus the freshness window are refused if its key
@@ -668,7 +686,15 @@ func (s *Server) handleDenylist(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	exp := s.now().Add(s.denylistRetention())
+	rcfg, err := s.retentionCfg(r.Context())
+	if err != nil {
+		// Fail closed: a revocation written with a shorter retention than
+		// a live token's lifetime would let it work again; the owner retries.
+		s.log.Error("denylist update failed: lifetime mark", "err", err)
+		s.writeError(w, fail(CodeInternal))
+		return
+	}
+	exp := s.now().Add(denylistRetention(rcfg))
 	switch err := s.st.AddDenylist(r.Context(), mb.ID, entries, exp, s.cfg.MailboxMaxDenylist); {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))
