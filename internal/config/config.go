@@ -73,7 +73,9 @@ type Config struct {
 	MaxSenderBlobs     int64 // RELAY_MAX_SENDER_BLOBS: how many blobs one sender key may hold in one mailbox
 	MailboxMaxDenylist int64 // RELAY_MAILBOX_MAX_DENYLIST
 
-	RotationGrace        time.Duration // RELAY_ROTATION_GRACE
+	// RELAY_ROTATION_GRACE: how long a rotated-away mailbox lives on
+	// (§6.7). With ServesVaults it must be exactly VaultRotationGrace.
+	RotationGrace        time.Duration
 	MaxTokenLifetime     time.Duration // RELAY_MAX_TOKEN_LIFETIME
 	OpenTokenMaxLifetime time.Duration // RELAY_OPEN_TOKEN_MAX_LIFETIME
 
@@ -145,7 +147,26 @@ type Config struct {
 	// long (the worst-case delay if a deposit's hint update is lost).
 	EmptyHints   bool          // RELAY_EMPTY_HINTS
 	EmptySkipMax time.Duration // RELAY_EMPTY_SKIP_MAX
+
+	// RELAY_SERVES_VAULTS (default true): the relay serves VettID vaults,
+	// so RELAY-PROTOCOL 0.11.1's rules for such a relay are enforced at
+	// start: the rotation grace is exactly 14 days (§6.7) and
+	// message_ttl_seconds at most 14 days (§6.1). A relay that never
+	// serves vaults may set it to false to choose other values.
+	ServesVaults bool
 }
+
+// VaultRotationGrace is the rotation grace a relay serving VettID vaults
+// MUST use (RELAY-PROTOCOL 0.11.1 §6.7, VAULT-MESSAGING §3.4.2 RK14): a
+// vault stops collecting its old mailbox 13 days after its anchor, so a
+// shorter grace loses deposits it still collects and a longer one only
+// accepts more it doesn't.
+const VaultRotationGrace = 14 * 24 * time.Hour
+
+// VaultMaxMessageTTL bounds message_ttl_seconds for a relay serving
+// VettID vaults (RELAY-PROTOCOL 0.11.1 §6.1): a vault's dedupe of
+// re-deposits after a rotation assumes no message outlives it.
+const VaultMaxMessageTTL = 14 * 24 * time.Hour
 
 // MaxDynamoPayloadBytes bounds max_payload_bytes for the DynamoDB store: a
 // message item must stay under DynamoDB's 400 KB item limit with room for
@@ -227,7 +248,7 @@ func Defaults() Config {
 		MaxSenderBlobs:      16,
 		MailboxMaxDenylist:  10000,
 
-		RotationGrace:        7 * 24 * time.Hour,
+		RotationGrace:        VaultRotationGrace,
 		MaxTokenLifetime:     30 * 24 * time.Hour,
 		OpenTokenMaxLifetime: 600 * time.Second,
 
@@ -272,6 +293,8 @@ func Defaults() Config {
 
 		EmptyHints:   true,
 		EmptySkipMax: 5 * time.Minute,
+
+		ServesVaults: true,
 	}
 }
 
@@ -433,6 +456,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	dur("RELAY_SWEEP_INTERVAL", &c.SweepInterval)
 	dur("RELAY_SHUTDOWN_TIMEOUT", &c.ShutdownTimeout)
 	boolean("RELAY_EMPTY_HINTS", &c.EmptyHints)
+	boolean("RELAY_SERVES_VAULTS", &c.ServesVaults)
 	dur("RELAY_EMPTY_SKIP_MAX", &c.EmptySkipMax)
 
 	if err := c.Validate(); err != nil {
@@ -488,6 +512,18 @@ func (c Config) Validate() error {
 	}
 	if c.MaxTokenLifetime < time.Second || c.OpenTokenMaxLifetime < time.Second || c.ClaimTTL < time.Second {
 		errs = append(errs, errors.New("token lifetimes and claim TTL must be at least 1s"))
+	}
+	if c.RotationGrace <= 0 || c.MessageTTL <= 0 {
+		errs = append(errs, errors.New("RELAY_ROTATION_GRACE and RELAY_MESSAGE_TTL must be > 0"))
+	}
+	if c.ServesVaults {
+		// RELAY-PROTOCOL 0.11.1: refused at start rather than served wrong.
+		if c.RotationGrace != VaultRotationGrace {
+			errs = append(errs, fmt.Errorf("RELAY_ROTATION_GRACE must be exactly %s for a relay serving vaults (RELAY-PROTOCOL §6.7); got %s (set RELAY_SERVES_VAULTS=false only for a relay that never serves vaults)", VaultRotationGrace, c.RotationGrace))
+		}
+		if c.MessageTTL > VaultMaxMessageTTL {
+			errs = append(errs, fmt.Errorf("RELAY_MESSAGE_TTL must be at most %s for a relay serving vaults (RELAY-PROTOCOL §6.1); got %s", VaultMaxMessageTTL, c.MessageTTL))
+		}
 	}
 	if c.MaxClaimBytes <= 0 {
 		errs = append(errs, errors.New("RELAY_MAX_CLAIM_BYTES must be > 0"))

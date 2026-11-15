@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -332,5 +333,66 @@ func TestBlobShareConfig(t *testing.T) {
 	}
 	if _, err := Load(env(map[string]string{"RELAY_BLOBS_ENABLED": "false", "RELAY_MAILBOX_MAX_BLOB_BYTES": "0", "RELAY_MAX_SENDER_BLOBS": "0"})); err != nil {
 		t.Fatalf("blobs off: %v", err)
+	}
+}
+
+// RELAY-PROTOCOL 0.11.1: a relay serving vaults uses a rotation grace of
+// exactly 14 days (§6.7) and message_ttl_seconds of at most 14 days
+// (§6.1), and refuses to start otherwise.
+func TestVaultRelayRules(t *testing.T) {
+	d := Defaults()
+	if !d.ServesVaults || d.RotationGrace != 14*24*time.Hour || d.MessageTTL != 14*24*time.Hour {
+		t.Fatalf("defaults: serves_vaults %v grace %s ttl %s", d.ServesVaults, d.RotationGrace, d.MessageTTL)
+	}
+	for _, tc := range []struct {
+		env map[string]string
+		ok  bool
+	}{
+		{map[string]string{"RELAY_ROTATION_GRACE": "336h"}, true},
+		{map[string]string{"RELAY_ROTATION_GRACE": "1209600"}, true}, // 14 days in seconds
+		{map[string]string{"RELAY_ROTATION_GRACE": "168h"}, false},   // the old default
+		{map[string]string{"RELAY_ROTATION_GRACE": "335h59m59s"}, false},
+		{map[string]string{"RELAY_ROTATION_GRACE": "336h0m1s"}, false},
+		{map[string]string{"RELAY_ROTATION_GRACE": "720h"}, false},
+		{map[string]string{"RELAY_MESSAGE_TTL": "336h"}, true},
+		{map[string]string{"RELAY_MESSAGE_TTL": "1h"}, true},
+		{map[string]string{"RELAY_MESSAGE_TTL": "336h0m1s"}, false},
+		{map[string]string{"RELAY_MESSAGE_TTL": "720h"}, false},
+		{map[string]string{"RELAY_SERVES_VAULTS": "true", "RELAY_ROTATION_GRACE": "168h"}, false},
+		// A relay that never serves vaults chooses its own values.
+		{map[string]string{"RELAY_SERVES_VAULTS": "false", "RELAY_ROTATION_GRACE": "168h", "RELAY_MESSAGE_TTL": "720h"}, true},
+		{map[string]string{"RELAY_SERVES_VAULTS": "false"}, true},
+		// Never zero or negative, whatever it serves.
+		{map[string]string{"RELAY_SERVES_VAULTS": "false", "RELAY_ROTATION_GRACE": "0s"}, false},
+		{map[string]string{"RELAY_SERVES_VAULTS": "false", "RELAY_MESSAGE_TTL": "0s"}, false},
+		{map[string]string{"RELAY_SERVES_VAULTS": "maybe"}, false},
+	} {
+		c, err := Load(env(tc.env))
+		if (err == nil) != tc.ok {
+			t.Errorf("%v: err %v, want ok=%v", tc.env, err, tc.ok)
+		}
+		if err != nil && tc.env["RELAY_ROTATION_GRACE"] == "168h" && !strings.Contains(err.Error(), "RELAY_ROTATION_GRACE must be exactly 336h0m0s") {
+			t.Errorf("%v: the refusal doesn't name the setting and the value: %v", tc.env, err)
+		}
+		if err == nil && tc.env["RELAY_SERVES_VAULTS"] == "false" && c.ServesVaults {
+			t.Errorf("%v: RELAY_SERVES_VAULTS=false not applied", tc.env)
+		}
+	}
+	// Validate holds the rule for a Config built in code, not only Load.
+	c := Defaults()
+	c.RotationGrace = 7 * 24 * time.Hour
+	if err := c.Validate(); err == nil {
+		t.Error("Validate accepted a 7-day grace on a relay serving vaults")
+	}
+	for _, zero := range []func(*Config){
+		func(c *Config) { c.RotationGrace = 0 },
+		func(c *Config) { c.MessageTTL = 0 },
+	} {
+		c := Defaults()
+		c.ServesVaults = false
+		zero(&c)
+		if err := c.Validate(); err == nil {
+			t.Error("Validate accepted a zero grace or message TTL")
+		}
 	}
 }

@@ -223,6 +223,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 	}
 	log.InfoContext(lifecycle, "relay started", "listen", cfg.ListenAddr, "metrics", cfg.MetricsAddr,
 		"base_url", cfg.BaseURL, "trust_proxy", cfg.TrustProxy, "store", cfg.Store, "shared_coordination", cfg.ValkeyAddr != "",
+		"serves_vaults", cfg.ServesVaults, "rotation_grace", cfg.RotationGrace.String(), "message_ttl", cfg.MessageTTL.String(),
 		"version", buildVersion())
 
 	var runErr error

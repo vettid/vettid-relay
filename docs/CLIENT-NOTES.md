@@ -210,7 +210,8 @@ a claim `GET`: the first response may have consumed the claim.
    the proof.
 2. With the current key, call `POST /v1/mailbox/rotate {new_pubkey,
    new_key_proof}`. The response is the new `mailbox_id`.
-3. Collect from both mailboxes during the grace period (default 7 days).
+3. Collect from both mailboxes during the grace period (default 14 days;
+   7 days before RELAY-PROTOCOL 0.11.0).
 4. Mint new tokens under the new key, announce the new address over E2E,
    and stop using old tokens. They die with the old mailbox.
 
