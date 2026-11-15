@@ -300,3 +300,29 @@ func TestRegisterRacingDeleteReportsRaisedNB(t *testing.T) {
 		t.Fatalf("a token between the two deletions: %v", err)
 	}
 }
+
+// Without a stored lifetime mark (the relay always raises it at start),
+// the store's own removals of a rotated mailbox fail closed rather than
+// fall back to the start-time policy.
+func TestMissingMarkFailsClosed(t *testing.T) {
+	db := ddblocal.Client(t)
+	table := ddblocal.Table(t, db)
+	c := storetest.NewClock()
+	s, err := dynamo.New(dynamo.Config{Table: table, DB: db, S3: fakes3.New(t).Client(), Bucket: "b", Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LifetimeMark(ctx); err == nil {
+		t.Fatal("a missing mark read as a value")
+	}
+	if _, _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "a", "b", append(make([]byte, 31), 2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + time.Minute)
+	if _, _, err := s.Register(ctx, "a", make([]byte, 32)); err == nil {
+		t.Fatal("a rotated mailbox was removed without a mark")
+	}
+}

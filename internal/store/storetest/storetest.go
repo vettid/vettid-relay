@@ -115,6 +115,11 @@ func Run(t *testing.T, h Harness) {
 		{"DeleteMailboxTombstoneExpires", testDeleteTombstoneExpires},
 		{"DeleteMailboxRepeatKeepsLongerTombstone", testDeleteRepeatKeepsLonger},
 		{"DeleteAgainAfterReRegisterKeepsLonger", testDeleteAgainAfterReRegister},
+		{"RotateAfterReRegisterKeepsTombstone", testRotateAfterReRegisterKeeps},
+		{"RotateOntoDeletedKeepsTombstone", testRotateOntoDeletedKeeps},
+		{"RetireKeepsEarlierTombstone", testRetireKeepsEarlier},
+		{"RevivePastGraceKeepsRemovalTombstone", testRevivePastGraceKeeps},
+		{"RotateOntoReRegisteredKeepsTombstone", testRotateOntoReRegisteredKeeps},
 		{"LifetimeMark", testLifetimeMark},
 		{"ReviveOnlyRaisesNotBefore", testReviveOnlyRaisesNB},
 		{"RotatedTombstoneUsesStoredMark", testRotatedTombstoneUsesMark},
@@ -1749,5 +1754,143 @@ func testDeleteAgainAfterReRegister(t *testing.T, h Harness) {
 	}
 	if mb, err := s.Mailbox(ctx, "a"); err != nil || mb.TokensNotBefore.IsZero() {
 		t.Fatalf("the tombstone ended at the shorter expiry: %+v %v", mb, err)
+	}
+}
+
+// tombstoneHeld reports whether id's tombstone still holds after the clock
+// reaches until and a sweep runs: a registration then reports its
+// tokens-not-before (a purged tombstone starts the key afresh).
+func tombstoneHeld(t *testing.T, h Harness, s store.Backend, c *Clock, id string, b byte, until time.Time) bool {
+	t.Helper()
+	c.Add(until.Sub(c.Now()) + h.SweepGrace + time.Minute)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, id, key(b)); err != nil {
+		t.Fatal(err)
+	}
+	mb, err := s.Mailbox(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return !mb.TokensNotBefore.IsZero()
+}
+
+// Deleted (a long tombstone), registered again, rotated away, registered
+// again past the grace, deleted again with a short retention: the long
+// tombstone still holds after the short one ends (§6.10).
+func testRotateAfterReRegisterKeeps(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	day := 24 * time.Hour
+	mustRegister(t, s, "a", 1)
+	long := c.Now().Add(1000 * day)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), c.Now().Add(90*time.Second), long); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "a", 1)
+	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + time.Minute)
+	mustRegister(t, s, "a", 1) // past the grace: a fresh mailbox
+	short := c.Now().Add(time.Hour)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), c.Now(), short); err != nil {
+		t.Fatal(err)
+	}
+	if !tombstoneHeld(t, h, s, c, "a", 1, short) {
+		t.Fatal("the tombstone ended at the short expiry")
+	}
+}
+
+// A deleted id (a long tombstone) that another mailbox rotates onto, then
+// deleted with a short retention: the long tombstone still holds.
+func testRotateOntoDeletedKeeps(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	day := 24 * time.Hour
+	mustRegister(t, s, "b", 2)
+	long := c.Now().Add(1000 * day)
+	if _, err := s.DeleteMailbox(ctx, "b", key(2), c.Now().Add(90*time.Second), long); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "a", 1)
+	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	short := c.Now().Add(time.Hour)
+	if _, err := s.DeleteMailbox(ctx, "b", key(2), c.Now(), short); err != nil {
+		t.Fatal(err)
+	}
+	if !tombstoneHeld(t, h, s, c, "b", 2, short) {
+		t.Fatal("the rotation's successor dropped the earlier tombstone")
+	}
+}
+
+// Deleted (a tombstone longer than the store's policy), registered again,
+// rotated away and retired by the sweep at the end of the grace: the
+// earlier, longer tombstone holds past the policy's own retention.
+func testRetireKeepsEarlier(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	day := 24 * time.Hour
+	mustRegister(t, s, "a", 1)
+	long := c.Now().Add(1000 * day)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), c.Now().Add(90*time.Second), long); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "a", 1)
+	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + h.SweepGrace + time.Minute)
+	if _, err := s.Sweep(ctx); err != nil { // retires a
+		t.Fatal(err)
+	}
+	// Past the default policy's 400 days, within the earlier 1000.
+	if !tombstoneHeld(t, h, s, c, "a", 1, c.Now().Add(500*day)) {
+		t.Fatal("the retire dropped the earlier, longer tombstone")
+	}
+}
+
+// A rotated-away mailbox registered again past its grace is removed then:
+// its tombstone (the store's policy) holds through a later, shorter
+// deletion.
+func testRevivePastGraceKeeps(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + time.Minute)
+	mustRegister(t, s, "a", 1) // removed now: the policy's tombstone
+	short := c.Now().Add(time.Hour)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), c.Now(), short); err != nil {
+		t.Fatal(err)
+	}
+	if !tombstoneHeld(t, h, s, c, "a", 1, short) {
+		t.Fatal("the removal's tombstone ended at the short deletion")
+	}
+}
+
+// An id deleted (a long tombstone) and registered again (the tombstone
+// kept aside), then rotated onto by another mailbox and deleted with a
+// short retention: the long tombstone still holds.
+func testRotateOntoReRegisteredKeeps(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	day := 24 * time.Hour
+	mustRegister(t, s, "b", 2)
+	long := c.Now().Add(1000 * day)
+	if _, err := s.DeleteMailbox(ctx, "b", key(2), c.Now().Add(90*time.Second), long); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "b", 2)
+	mustRegister(t, s, "a", 1)
+	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	short := c.Now().Add(time.Hour)
+	if _, err := s.DeleteMailbox(ctx, "b", key(2), c.Now(), short); err != nil {
+		t.Fatal(err)
+	}
+	if !tombstoneHeld(t, h, s, c, "b", 2, short) {
+		t.Fatal("the long tombstone ended at the short deletion")
 	}
 }

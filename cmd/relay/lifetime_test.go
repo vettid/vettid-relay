@@ -59,6 +59,9 @@ func (f *failingMark) RaiseLifetimeMark(context.Context, time.Duration) (time.Du
 	return 0, errors.New("store down")
 }
 func (f *failingMark) SetTombstones(store.TombstonePolicy) { f.set = true }
+func (f *failingMark) LifetimeMark(context.Context) (time.Duration, error) {
+	return 0, errors.New("store down")
+}
 
 // A mark that can't be raised stops the start (fail closed): no retention
 // is guessed from the config alone.

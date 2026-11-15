@@ -81,6 +81,9 @@ func (failMark) RaiseLifetimeMark(context.Context, time.Duration) (time.Duration
 	return 0, errors.New("store down")
 }
 func (failMark) SetTombstones(store.TombstonePolicy) {}
+func (failMark) LifetimeMark(context.Context) (time.Duration, error) {
+	return 0, errors.New("store down")
+}
 
 // With the mark unreadable, a deletion and a revocation answer 500 and
 // write nothing (fail closed: no entry shorter than a live token).
@@ -120,5 +123,39 @@ func TestRegisterAdvertisesCurrentLimits(t *testing.T) {
 	}
 	if err := json.Unmarshal(b, &ans); err != nil || ans.Limits.Max != int64(30*day/time.Second) {
 		t.Fatalf("advertised %d (%v), want %d", ans.Limits.Max, err, int64(30*day/time.Second))
+	}
+}
+
+// countMark counts the raises of the fixture's mark.
+type countMark struct {
+	store.Backend
+	raises int
+}
+
+func (c *countMark) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Duration, error) {
+	c.raises++
+	return c.Backend.(store.LifetimeMarker).RaiseLifetimeMark(ctx, d)
+}
+func (c *countMark) LifetimeMark(ctx context.Context) (time.Duration, error) {
+	return c.Backend.(store.LifetimeMarker).LifetimeMark(ctx)
+}
+func (c *countMark) SetTombstones(p store.TombstonePolicy) {
+	c.Backend.(store.LifetimeMarker).SetTombstones(p)
+}
+
+// Deletions and revocations read the mark; they don't write it (it is
+// raised at start).
+func TestDeleteAndRevokeOnlyReadMark(t *testing.T) {
+	f := newFixture(t, nil)
+	owner := newPrincipal(1)
+	f.register(owner)
+	cm := &countMark{Backend: f.s.st}
+	f.s.st = cm
+	f.revoke(owner, "jti", "x")
+	if code, b := f.deleteMailbox(owner); code != 204 && code != 200 {
+		t.Fatalf("delete: %d %s", code, b)
+	}
+	if cm.raises != 0 {
+		t.Fatalf("%d raises of the mark on the request path", cm.raises)
 	}
 }

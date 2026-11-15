@@ -110,6 +110,10 @@ func (p TombstonePolicy) orDefault() TombstonePolicy {
 // mark never goes down, across restarts and processes.
 type LifetimeMarker interface {
 	RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Duration, error)
+	// LifetimeMark reads the stored mark without raising it; one that
+	// isn't stored (the relay always raises it at start) is an error, so a
+	// caller fails closed.
+	LifetimeMark(ctx context.Context) (time.Duration, error)
 	// SetTombstones replaces the tombstone policy (before the store is in
 	// use: openStore calls it once the mark is known).
 	SetTombstones(p TombstonePolicy)

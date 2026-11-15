@@ -102,13 +102,16 @@ func (s *Store) retire(ctx context.Context, mailbox string, it item, cutoff int6
 	}
 	nb, keep := p.Times(s.now())
 	nbv := max(ms(nb), getN0(it, "nb"))
+	// An earlier tombstone kept as tomb_keep (a deletion, then a
+	// re-registration, then this rotation) is not shortened (§6.10).
+	keepv := max(ms(keep), getN0(it, "tomb_keep"))
 	_, err = s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName:           &s.cfg.Table,
 			Key:                 key(mbPK(mailbox), skAccount),
 			UpdateExpression:    aws.String("SET deleted = :now, nb = :nb, gsk = :keep REMOVE preds"),
 			ConditionExpression: aws.String("gpk = :due AND gsk <= :cut AND attribute_not_exists(deleted)"),
-			ExpressionAttributeValues: item{":now": avN(ms(s.now())), ":nb": avN(nbv), ":keep": avN(ms(keep)),
+			ExpressionAttributeValues: item{":now": avN(ms(s.now())), ":nb": avN(nbv), ":keep": avN(keepv),
 				":due": avS(dueValue), ":cut": avN(cutoff)},
 		}},
 		{Update: &types.Update{

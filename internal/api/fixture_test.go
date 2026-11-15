@@ -102,6 +102,15 @@ func newFixtureFull(t *testing.T, mut func(*config.Config), logw io.Writer, opts
 func (f *fixture) start() {
 	f.t.Helper()
 	st := f.newSt()
+	// As openStore does at start: the mark is raised to the limits, so a
+	// deletion or revocation finds it (a missing one fails them closed).
+	if m, ok := st.(store.LifetimeMarker); ok {
+		mark, err := m.RaiseLifetimeMark(context.Background(), max(f.cfg.MaxTokenLifetime, f.cfg.OpenTokenMaxLifetime))
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		f.cfg.RetentionLifetime = max(f.cfg.RetentionLifetime, mark)
+	}
 	f.st = st
 	f.reg = metrics.New()
 	opts := []Option{WithClock(f.clk.now)}

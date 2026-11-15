@@ -22,6 +22,10 @@ func TestConformanceSQLite(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { s.Close() })
+			// As the relay does at every start.
+			if _, err := s.RaiseLifetimeMark(context.Background(), time.Millisecond); err != nil {
+				t.Fatal(err)
+			}
 			mu.Lock()
 			dirs[s] = dir
 			mu.Unlock()
