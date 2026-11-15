@@ -75,21 +75,30 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 	if getN0(it, "tomb_keep") > cutoff {
 		return 0, false, nil
 	}
-	msgs, err = s.purgeItems(ctx, mailbox, func(sk string) bool { return sk != skAccount })
+	if s.beforePurge != nil {
+		s.beforePurge()
+	}
+	// The contents first; the account and counters items (which carry the
+	// tombstone and its nb) together, under the condition, so a deletion or
+	// re-registration since the read keeps both (§6.10).
+	msgs, err = s.purgeItems(ctx, mailbox, func(sk string) bool { return sk != skAccount && sk != skStats })
 	if err != nil {
 		return 0, false, err
 	}
-	_, err = s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName: &s.cfg.Table,
-		Key:       key(mbPK(mailbox), skAccount),
-		// Nor while a tomb_keep is still ahead: a writer that set gsk from
-		// an older read (a deletion racing a re-registration) can't end a
-		// tombstone the re-registration kept (§6.10).
-		ConditionExpression:       aws.String("gpk = :due AND gsk <= :cut AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :cut)"),
-		ExpressionAttributeValues: item{":due": avS(dueValue), ":cut": avN(cutoff)},
-	})
-	if isCCF(err) {
-		return msgs, false, nil
+	_, err = s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Delete: &types.Delete{
+			TableName: &s.cfg.Table,
+			Key:       key(mbPK(mailbox), skAccount),
+			// Nor while a tomb_keep is still ahead: a writer that set gsk
+			// from an older read can't end a tombstone the re-registration
+			// kept.
+			ConditionExpression:       aws.String("gpk = :due AND gsk <= :cut AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :cut)"),
+			ExpressionAttributeValues: item{":due": avS(dueValue), ":cut": avN(cutoff)},
+		}},
+		{Delete: &types.Delete{TableName: &s.cfg.Table, Key: key(mbPK(mailbox), skStats)}},
+	}})
+	if r := txReasons(err); r != nil {
+		return msgs, false, nil // changed since the read; the next sweep looks again
 	}
 	s.forget(mailbox)
 	return msgs, err == nil, err

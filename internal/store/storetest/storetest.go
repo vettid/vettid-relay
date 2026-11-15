@@ -120,6 +120,7 @@ func Run(t *testing.T, h Harness) {
 		{"RetireKeepsEarlierTombstone", testRetireKeepsEarlier},
 		{"RevivePastGraceKeepsRemovalTombstone", testRevivePastGraceKeeps},
 		{"RotateOntoReRegisteredKeepsTombstone", testRotateOntoReRegisteredKeeps},
+		{"RotateOntoSameKeyPastGrace", testRotateOntoSameKeyPastGrace},
 		{"LifetimeMark", testLifetimeMark},
 		{"ReviveOnlyRaisesNotBefore", testReviveOnlyRaisesNB},
 		{"RotatedTombstoneUsesStoredMark", testRotatedTombstoneUsesMark},
@@ -1901,5 +1902,29 @@ func testRotateOntoReRegisteredKeeps(t *testing.T, h Harness) {
 	}
 	if !tombstoneHeld(t, h, s, c, "b", 2, short) {
 		t.Fatal("the long tombstone ended at the short deletion")
+	}
+}
+
+// Rotating onto an id of the same key whose rotation grace has ended (not
+// swept yet) removes it first, as a registration would: tokens issued for
+// it before then are refused.
+func testRotateOntoSameKeyPastGrace(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "b", 2)
+	if err := s.Rotate(ctx, "b", "x", key(3), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	before := c.Now()
+	c.Add(time.Hour + time.Minute) // b past its grace, not swept
+	mustRegister(t, s, "a", 1)
+	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	mb, err := s.Mailbox(ctx, "b")
+	if err != nil || mb.TokensNotBefore.IsZero() {
+		t.Fatalf("after the rotation: %+v %v", mb, err)
+	}
+	if _, err := s.Deposit(ctx, "b", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "old", TokenIssuedAt: before, TokenExpires: c.Now().Add(time.Hour)}); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("a token issued before the removal: %v", err)
 	}
 }
