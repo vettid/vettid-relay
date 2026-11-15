@@ -331,6 +331,23 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 	if _, err := s.mailbox(ctx, tx, oldID, false); err != nil {
 		return err
 	}
+	// A successor of the same key past its rotation grace (not swept yet)
+	// is removed now, as Register does: its tombstone first, so the
+	// mailbox it becomes refuses tokens issued before the removal.
+	var succPub []byte
+	var succAfter sql.NullInt64
+	switch err := tx.QueryRowContext(ctx, `SELECT pubkey, delete_after FROM mailboxes WHERE mailbox_id=?`, newID).Scan(&succPub, &succAfter); {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return err
+	case succAfter.Valid && succAfter.Int64 <= ms(now) && subtle.ConstantTimeCompare(succPub, newPub) == 1:
+		if err := s.tombstoneRotated(ctx, tx, now, `mailbox_id=?`, newID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM mailboxes WHERE mailbox_id=?`, newID); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO mailboxes(mailbox_id, pubkey, created_at) VALUES(?,?,?)
 		 ON CONFLICT(mailbox_id) DO NOTHING`, newID, newPub, ms(now)); err != nil {

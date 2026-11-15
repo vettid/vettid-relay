@@ -138,6 +138,8 @@ type Store struct {
 
 	beforeRevive func() // tests only: runs between Register's read and its revive
 	beforeRotate func() // tests only: runs between Rotate's reads and its write
+	beforePurge  func() // tests only: runs between the sweep's read of a tombstone and its purge
+	beforeMark   func() // tests only: runs between DeleteMailbox's read and markDeleted
 }
 
 type cachedMailbox struct {
@@ -199,6 +201,14 @@ func (s *Store) LifetimeMark(ctx context.Context) (time.Duration, error) {
 		return 0, errors.New("dynamo: no lifetime mark stored")
 	}
 	return time.Duration(v) * time.Millisecond, nil
+}
+
+// withVals returns it with o's entries added.
+func withVals(it, o item) item {
+	for k, v := range o {
+		it[k] = v
+	}
+	return it
 }
 
 // heldKeep is the tombstone expiry an account item holds (ms): its gsk (a
@@ -521,8 +531,15 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 	nb := seenNB
 	if setNB.After(nb) {
 		nb = setNB
-		setA, setS = setA+", nb = :nb", setS+", nb = :nb"
-		valsA[":nb"], valsS[":nb"] = avN(ms(nb)), avN(ms(nb))
+		setA = setA + ", nb = :nb"
+		valsA[":nb"] = avN(ms(nb))
+	}
+	// The counters item carries nb too (deposits check it there): written
+	// whenever there is one, so a counters item the sweep removed in a race
+	// can't leave the revived mailbox without it.
+	if !nb.IsZero() {
+		setS = setS + ", nb = :nb"
+		valsS[":nb"] = avN(ms(nb))
 	}
 	// The nb read: a deletion or a retire since (which may raise it) sends
 	// the registration back to read again, so what it reports is what
@@ -622,6 +639,33 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 		// The successor's gsk is removed below: its tombstone's expiry
 		// stays as tomb_keep, which only grows (§6.10).
 		succKeep := heldKeep(succ)
+		// A successor past its rotation grace (not deleted, not swept yet)
+		// is removed now, as Register's revive does: its tokens issued
+		// before the removal are refused (nb), and its tombstone kept.
+		succNB := getN0(succ, "nb")
+		if len(succ) > 0 {
+			if sm := parseMailbox(succ); sm.DeleteAfter != nil && !now.Before(*sm.DeleteAfter) {
+				if _, deleted := succ["deleted"]; !deleted {
+					p, err := s.tombstones(ctx)
+					if err != nil {
+						return err
+					}
+					rnb, rkeep := p.Times(now)
+					succNB, succKeep = max(succNB, ms(rnb)), max(succKeep, ms(rkeep))
+				}
+			}
+		}
+		succSetA, succSetS := "", "REMOVE dead_at"
+		succValsS := item{}
+		if succNB > 0 {
+			succSetA = ", nb = :snb"
+			succSetS = "SET nb = :snb REMOVE dead_at"
+			succValsS[":snb"] = avN(succNB)
+		}
+		succValsA := item{}
+		if succNB > 0 {
+			succValsA[":snb"] = avN(succNB)
+		}
 		if s.beforeRotate != nil {
 			s.beforeRotate()
 		}
@@ -647,13 +691,13 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			{Update: &types.Update{
 				TableName:        &s.cfg.Table,
 				Key:              key(mbPK(newID), skAccount),
-				UpdateExpression: aws.String("SET pub = if_not_exists(pub, :p), created = if_not_exists(created, :now), tomb_keep = :tk ADD preds :old REMOVE delete_after, deleted, gpk, gsk"),
+				UpdateExpression: aws.String("SET pub = if_not_exists(pub, :p), created = if_not_exists(created, :now), tomb_keep = :tk" + succSetA + " ADD preds :old REMOVE delete_after, deleted, gpk, gsk"),
 				ConditionExpression: aws.String("(attribute_not_exists(pk) OR pub = :p) AND " +
 					"(attribute_not_exists(gsk) OR gsk <= :tk) AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :tk)"),
-				ExpressionAttributeValues: item{
+				ExpressionAttributeValues: withVals(item{
 					":p": avB(newPub), ":now": avN(ms(now)), ":old": &types.AttributeValueMemberSS{Value: []string{oldID}},
 					":tk": avN(succKeep),
-				},
+				}, succValsA),
 			}},
 			{Update: &types.Update{
 				TableName:                 &s.cfg.Table,
@@ -662,9 +706,10 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 				ExpressionAttributeValues: item{":da": avN(ms(da))},
 			}},
 			{Update: &types.Update{
-				TableName:        &s.cfg.Table,
-				Key:              key(mbPK(newID), skStats),
-				UpdateExpression: aws.String("REMOVE dead_at"),
+				TableName:                 &s.cfg.Table,
+				Key:                       key(mbPK(newID), skStats),
+				UpdateExpression:          aws.String(succSetS),
+				ExpressionAttributeValues: nilIfEmpty(succValsS),
 			}},
 		}})
 		if err == nil {

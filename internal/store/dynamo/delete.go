@@ -49,6 +49,9 @@ func (s *Store) DeleteMailbox(ctx context.Context, id string, pub []byte, notBef
 			continue // not (or no longer) a predecessor of this mailbox
 		}
 		_, already := it["deleted"]
+		if s.beforeMark != nil {
+			s.beforeMark()
+		}
 		// A repeated deletion never shortens the tombstone (§6.10): its
 		// expiry is the larger of the new one, the stored gsk (a rotated
 		// mailbox's delete_after, or an earlier tombstone's) and tomb_keep
