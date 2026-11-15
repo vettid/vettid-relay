@@ -137,6 +137,7 @@ type Store struct {
 	cache   map[string]cachedMailbox
 
 	beforeRevive func() // tests only: runs between Register's read and its revive
+	beforeRotate func() // tests only: runs between Rotate's reads and its write
 }
 
 type cachedMailbox struct {
@@ -621,6 +622,9 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 		// The successor's gsk is removed below: its tombstone's expiry
 		// stays as tomb_keep, which only grows (§6.10).
 		succKeep := heldKeep(succ)
+		if s.beforeRotate != nil {
+			s.beforeRotate()
+		}
 		da := deleteAfter
 		oldCond := "pub = :oldpub AND attribute_not_exists(delete_after) AND attribute_not_exists(deleted)"
 		vals := item{":oldpub": avB(old.PubKey), ":da": avN(ms(da)), ":new": avS(newID), ":due": avS(dueValue)}
@@ -673,15 +677,18 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 		if reasonCode(r, 1) == "ConditionalCheckFailed" {
 			// Another key's mailbox, or its tombstone raised since the read
 			// (then read again).
-			cur, err := s.getAccount(ctx, newID)
-			if err != nil {
-				return err
+			cur, gerr := s.getAccount(ctx, newID)
+			if gerr != nil {
+				return gerr
 			}
 			if len(cur) > 0 && subtle.ConstantTimeCompare(getB(cur, "pub"), newPub) != 1 {
 				return fmt.Errorf("store: mailbox id collision")
 			}
 			if attempt >= maxTxAttempts {
 				return fmt.Errorf("dynamo: rotate: %w", err)
+			}
+			if err := backoff(ctx, attempt); err != nil {
+				return err
 			}
 			continue
 		}

@@ -703,3 +703,21 @@ func TestIDsOnlyGrowAcrossRestart(t *testing.T) {
 		t.Fatalf("collect after the first id: %v %v", got, err)
 	}
 }
+
+// LifetimeMark with none stored is an error, so a caller fails closed.
+func TestSQLiteLifetimeMarkMissing(t *testing.T) {
+	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "relay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.LifetimeMark(context.Background()); err == nil {
+		t.Fatal("a missing mark read as a value")
+	}
+	if _, err := s.RaiseLifetimeMark(context.Background(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.LifetimeMark(context.Background()); err != nil || got != time.Hour {
+		t.Fatalf("%s %v", got, err)
+	}
+}

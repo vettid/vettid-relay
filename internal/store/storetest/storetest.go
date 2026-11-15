@@ -1773,7 +1773,16 @@ func tombstoneHeld(t *testing.T, h Harness, s store.Backend, c *Clock, id string
 	if err != nil {
 		t.Fatal(err)
 	}
-	return !mb.TokensNotBefore.IsZero()
+	if mb.TokensNotBefore.IsZero() {
+		return false
+	}
+	// And deposits are checked against it: a token issued before it is
+	// refused (not only reported).
+	iat := mb.TokensNotBefore.Add(-time.Hour)
+	if _, err := s.Deposit(ctx, id, "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "old", TokenIssuedAt: iat, TokenExpires: c.Now().Add(time.Hour)}); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("a token issued before the tokens-not-before %v was not refused: %v", mb.TokensNotBefore, err)
+	}
+	return true
 }
 
 // Deleted (a long tombstone), registered again, rotated away, registered

@@ -67,7 +67,13 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 		return 0, false, nil
 	}
 	if _, tomb := it["deleted"]; !tomb {
-		return s.retire(ctx, mailbox, it, cutoff)
+		return s.retire(ctx, mailbox, it, cutoff) // folds tomb_keep into the gsk it sets
+	}
+	// A tombstone isn't purged while a tomb_keep is still ahead: nothing of
+	// the partition (its counters item included, which carries nb) goes
+	// before the tombstone ends (§6.10).
+	if getN0(it, "tomb_keep") > cutoff {
+		return 0, false, nil
 	}
 	msgs, err = s.purgeItems(ctx, mailbox, func(sk string) bool { return sk != skAccount })
 	if err != nil {
