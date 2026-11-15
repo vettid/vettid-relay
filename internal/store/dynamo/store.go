@@ -662,8 +662,12 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			succSetS = "SET nb = :snb REMOVE dead_at"
 			succValsS[":snb"] = avN(succNB)
 		}
+		// nb only grows: one raised since the read (a deletion) fails the
+		// write, and Rotate reads again.
+		succNBCond := " AND attribute_not_exists(nb)"
 		succValsA := item{}
 		if succNB > 0 {
+			succNBCond = " AND (attribute_not_exists(nb) OR nb <= :snb)"
 			succValsA[":snb"] = avN(succNB)
 		}
 		if s.beforeRotate != nil {
@@ -693,7 +697,7 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 				Key:              key(mbPK(newID), skAccount),
 				UpdateExpression: aws.String("SET pub = if_not_exists(pub, :p), created = if_not_exists(created, :now), tomb_keep = :tk" + succSetA + " ADD preds :old REMOVE delete_after, deleted, gpk, gsk"),
 				ConditionExpression: aws.String("(attribute_not_exists(pk) OR pub = :p) AND " +
-					"(attribute_not_exists(gsk) OR gsk <= :tk) AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :tk)"),
+					"(attribute_not_exists(gsk) OR gsk <= :tk) AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :tk)" + succNBCond),
 				ExpressionAttributeValues: withVals(item{
 					":p": avB(newPub), ":now": avN(ms(now)), ":old": &types.AttributeValueMemberSS{Value: []string{oldID}},
 					":tk": avN(succKeep),

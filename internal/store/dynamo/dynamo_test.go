@@ -596,3 +596,76 @@ func TestReviveWritesNBToCounters(t *testing.T) {
 		t.Fatalf("an old token after the revive: %v", err)
 	}
 }
+
+// pastGrace leaves b (key 2) rotated away and past its grace, not swept.
+func pastGrace(t *testing.T, s *dynamo.Store, c *storetest.Clock) {
+	t.Helper()
+	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + time.Minute)
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Rotating onto a same-key id past its grace keeps that removal's
+// tombstone: a later short deletion doesn't end it early.
+func TestRotatePastGraceKeepsRemoval(t *testing.T) {
+	s, c := newMarked(t)
+	pastGrace(t, s, c)
+	_, removedKeep := store.DefaultTombstonePolicy.WithMark(time.Millisecond).Times(c.Now())
+	if err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteMailbox(ctx, "b", k(2), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if !held(t, s, c, "b", 2, removedKeep.Add(-time.Hour)) {
+		t.Fatal("the removal's tombstone ended with the later short deletion")
+	}
+}
+
+// A deletion raising the successor's nb between Rotate's read and its
+// write (with a shorter keep) isn't undone: Rotate reads again.
+func TestRotateKeepsRaisedNB(t *testing.T) {
+	s, c := newMarked(t)
+	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteMailbox(ctx, "b", k(2), c.Now().Add(90*time.Second), c.Now().Add(1000*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(10 * time.Minute)
+	raised := c.Now().Add(90 * time.Second)
+	once := true
+	dynamo.SetBeforeRotate(s, func() {
+		if once {
+			once = false
+			if _, err := s.DeleteMailbox(ctx, "b", k(2), raised, c.Now().Add(time.Hour)); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+	dynamo.SetBeforeRotate(s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mb, err := s.Mailbox(ctx, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mb.TokensNotBefore.Before(raised) {
+		t.Fatalf("tokens-not-before %v, want at least the raised %v", mb.TokensNotBefore, raised)
+	}
+	if _, err := s.Deposit(ctx, "b", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "mid", TokenIssuedAt: raised.Add(-time.Second), TokenExpires: c.Now().Add(time.Hour)}); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("a token issued before the raised not-before: %v", err)
+	}
+}
