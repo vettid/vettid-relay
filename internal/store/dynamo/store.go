@@ -7,7 +7,7 @@
 // # Table layout (one table, pk/sk strings, TTL attribute "ttl_s")
 //
 //	pk            sk               what
-//	MB#<mailbox>  A                mailbox: pub, created, [delete_after, successor, preds, deleted, nb, gpk/gsk]
+//	MB#<mailbox>  A                mailbox: pub, created, [delete_after, successor, preds, deleted, nb, gpk/gsk, tomb_keep]
 //	MB#<mailbox>  S                counters: msgs, bytes, blob_bytes, deny; last_id; v; dead_at; nb; rec_*
 //	MB#<mailbox>  M#<ulid>         message: sz, dep, exp, sender, jti, payload (binary)
 //	MB#<mailbox>  L#<ulid>         lease of that message: lease_until
@@ -18,6 +18,7 @@
 //	MB#<mailbox>  BS#<sender>      a sender's share of the mailbox's blobs (0.9.2): e_<ulid> = {s: size, e: exp} per blob, b (bytes), n (blobs), v; no TTL
 //	MB#<mailbox>  C#<claim id>     claim marker (counts toward the storage cap)
 //	CL#<claim id> CL               claim: mb, sz, exp, body
+//	META          LIFETIME         the high-water mark of the advertised token lifetimes: life_ms (§6.10)
 //
 // The sparse GSI "due" (gpk = "due", gsk = delete_after ms) lists rotated
 // mailboxes so Sweep can purge them after their grace period. Attribute
@@ -168,6 +169,52 @@ func New(cfg Config) (*Store, error) {
 
 // Close implements store.Backend (the SDK clients hold no resources).
 func (s *Store) Close() error { return nil }
+
+// SetTombstones implements store.LifetimeMarker.
+func (s *Store) SetTombstones(p store.TombstonePolicy) { s.cfg.Tombstones = p }
+
+// tombstones is the tombstone policy raised to the mark stored now
+// (another process may have raised it since this one started), for the
+// removals this store makes itself: a rotated mailbox past its grace.
+func (s *Store) tombstones(ctx context.Context) (store.TombstonePolicy, error) {
+	out, err := s.cfg.DB.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &s.cfg.Table, Key: key("META", "LIFETIME"), ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return store.TombstonePolicy{}, err
+	}
+	v, _ := getN(out.Item, "life_ms")
+	return s.cfg.Tombstones.WithMark(time.Duration(v) * time.Millisecond), nil
+}
+
+// RaiseLifetimeMark implements store.LifetimeMarker: a conditional write
+// that only raises life_ms, then a consistent read of what is stored.
+func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Duration, error) {
+	if d <= 0 {
+		d = time.Millisecond // nothing to raise: the read below reports the mark
+	}
+	_, err := s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 &s.cfg.Table,
+		Key:                       key("META", "LIFETIME"),
+		UpdateExpression:          aws.String("SET life_ms = :v"),
+		ConditionExpression:       aws.String("attribute_not_exists(life_ms) OR life_ms < :v"),
+		ExpressionAttributeValues: item{":v": avN(d.Milliseconds())},
+	})
+	if err != nil && !isCCF(err) {
+		return 0, err
+	}
+	out, err := s.cfg.DB.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &s.cfg.Table, Key: key("META", "LIFETIME"), ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return 0, err
+	}
+	v, ok := getN(out.Item, "life_ms")
+	if !ok {
+		return 0, errors.New("dynamo: lifetime mark missing after its write")
+	}
+	return time.Duration(v) * time.Millisecond, nil
+}
 
 // Ping implements store.Backend: one cheap read.
 func (s *Store) Ping(ctx context.Context) error {
@@ -398,7 +445,11 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time
 		// its tokens get the tombstone it would have got from the sweep.
 		var setNB time.Time
 		if !mb.DeleteAfter.IsZero() { // not a deletion tombstone (parseMailbox)
-			setNB, _ = s.cfg.Tombstones.Times(s.now())
+			p, err := s.tombstones(ctx)
+			if err != nil {
+				return false, time.Time{}, err
+			}
+			setNB, _ = p.Times(s.now())
 		}
 		if s.beforeRevive != nil {
 			s.beforeRevive()
@@ -428,7 +479,7 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 	}
 	now := s.now()
 	setA, setS := "SET created = :now", "SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z, v = if_not_exists(v, :z) + :one"
-	valsA, valsS := item{":p": avB(pub), ":now": avN(ms(now))}, item{":z": avN(0), ":one": avN(1)}
+	valsA, valsS := item{":p": avB(pub), ":now": avN(ms(now)), ":zk": avN(0)}, item{":z": avN(0), ":one": avN(1)}
 	nb := seenNB
 	if setNB.After(nb) {
 		nb = setNB
@@ -447,9 +498,11 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 	}
 	_, err := s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
-			TableName:                 &s.cfg.Table,
-			Key:                       key(mbPK(id), skAccount),
-			UpdateExpression:          aws.String(setA + " REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
+			TableName: &s.cfg.Table,
+			Key:       key(mbPK(id), skAccount),
+			// tomb_keep keeps the tombstone's expiry (gsk, which leaves the
+			// sweep index here) so a later deletion never shortens it (§6.10).
+			UpdateExpression:          aws.String(setA + ", tomb_keep = if_not_exists(gsk, :zk) REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
 			ConditionExpression:       aws.String(cond),
 			ExpressionAttributeValues: valsA,
 		}},

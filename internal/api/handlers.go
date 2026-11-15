@@ -606,12 +606,30 @@ func (s *Server) ack(ctx context.Context, mailbox, msgID string) *apiError {
 
 // denylistRetention is how long a denylist entry must live (spec §5.5):
 // every token it could match has iat ≤ now and a lifetime bounded by the
-// configured caps (sender-bound or open), so it expires within the larger
-// cap; a margin covers the freshness window.
-func (s *Server) denylistRetention() time.Duration { return denylistRetention(s.cfg) }
-
+// caps (sender-bound or open), so it expires within the larger cap; a
+// margin covers the freshness window. The caps are the largest the relay
+// has ever advertised (cfg.RetentionLifetime, §6.10), not only the current
+// ones: tokens minted under an older, larger limit are still live.
 func denylistRetention(cfg config.Config) time.Duration {
-	return max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime) + auth.FreshnessWindow + time.Minute
+	return max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime, cfg.RetentionLifetime) + auth.FreshnessWindow + time.Minute
+}
+
+// retentionCfg is s.cfg with RetentionLifetime raised to the mark stored
+// now: another process may have raised it since this one started (a
+// rollout that raises the limits), and an entry written with this
+// process's older mark would expire while tokens minted under the new
+// limits still live (§6.10, §5.5). Deletions and revocations are rare, so
+// they pay one store read. A store without a mark (tests) keeps s.cfg.
+func (s *Server) retentionCfg(ctx context.Context) (config.Config, error) {
+	cfg := s.cfg
+	if m, ok := s.st.(store.LifetimeMarker); ok {
+		mark, err := m.RaiseLifetimeMark(ctx, max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime))
+		if err != nil {
+			return cfg, err
+		}
+		cfg.RetentionLifetime = max(cfg.RetentionLifetime, mark)
+	}
+	return cfg, nil
 }
 
 // TombstonePolicy is the tombstone a mailbox leaves when it ends (§6.10;
@@ -666,7 +684,15 @@ func (s *Server) handleDenylist(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	exp := s.now().Add(s.denylistRetention())
+	rcfg, err := s.retentionCfg(r.Context())
+	if err != nil {
+		// Fail closed: a revocation written with a shorter retention than
+		// a live token's lifetime would let it work again; the owner retries.
+		s.log.Error("denylist update failed: lifetime mark", "err", err)
+		s.writeError(w, fail(CodeInternal))
+		return
+	}
+	exp := s.now().Add(denylistRetention(rcfg))
 	switch err := s.st.AddDenylist(r.Context(), mb.ID, entries, exp, s.cfg.MailboxMaxDenylist); {
 	case errors.Is(err, store.ErrQuota):
 		s.writeError(w, fail(CodeQuotaExceeded))

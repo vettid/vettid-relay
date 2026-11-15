@@ -128,7 +128,7 @@ start, not wrapped.
 | `RELAY_MAILBOX_MAX_DENYLIST` | `10000` | Per-mailbox cap on live denylist entries. |
 | `RELAY_ROTATION_GRACE` | `336h` (14 d) | How long a rotated-away mailbox keeps collecting before deletion (§6.7). Exactly 14 days while `RELAY_SERVES_VAULTS` is true (RELAY-PROTOCOL 0.11.1 §6.7); any other value is refused at start. The default was 7 days before RELAY-PROTOCOL 0.11.0. |
 | `RELAY_SERVES_VAULTS` | `true` | The relay serves VettID vaults, so the rules RELAY-PROTOCOL sets for such a relay are checked at start: `RELAY_ROTATION_GRACE` exactly 14 days and `RELAY_MESSAGE_TTL` at most 14 days. Set `false` only for a relay that never serves vaults. |
-| `RELAY_MAX_TOKEN_LIFETIME` | `720h` (30 d) | `max_token_lifetime_seconds` (§5.2). Sender-bound tokens with `exp − iat` above this are `token_invalid`. It also bounds denylist retention (§5.5). Any positive duration is accepted, for example `9600h` (400 d) for long-lived, low-quota reconnect tokens. |
+| `RELAY_MAX_TOKEN_LIFETIME` | `720h` (30 d) | `max_token_lifetime_seconds` (§5.2). Sender-bound tokens with `exp − iat` above this are `token_invalid`. Denylist and tombstone retention use the largest value ever advertised (the stored lifetime mark, §5.5, §6.10). Any positive duration is accepted, for example `9600h` (400 d) for long-lived, low-quota reconnect tokens. |
 | `RELAY_OPEN_TOKEN_MAX_LIFETIME` | `600s` | `open_token_max_lifetime_seconds` (§5.6). This is the cap on `exp − iat` for one-shot open tokens. Up to 7 days is recommended for remote invitations. |
 | `RELAY_MAX_CLAIM_BYTES` | `16384` | `max_claim_bytes` (§6.9). This is the maximum claim body. |
 | `RELAY_CLAIM_TTL` | `900s` | `claim_ttl_seconds` (§6.9). It's the longest TTL a creator may request with `PUT /v1/claim/ttl/<seconds>`. Up to 7 days is recommended. A bare `PUT /v1/claim` gets min(900 s, this). |
@@ -625,9 +625,10 @@ implementation chooses as follows:
   ASCII bytes of the current `mailbox_id`. During the grace period the old
   mailbox keeps accepting deposits and collects, and it's deleted (with
   its tokens' effect) afterwards.
-- **Denylist retention** (§5.5) is the time of revocation, plus the larger
-  of `RELAY_MAX_TOKEN_LIFETIME` and `RELAY_OPEN_TOKEN_MAX_LIFETIME`, plus
-  the freshness window.
+- **Denylist retention** (§5.5) is the time of revocation, plus the largest
+  of `RELAY_MAX_TOKEN_LIFETIME`, `RELAY_OPEN_TOKEN_MAX_LIFETIME` and the
+  stored lifetime mark (the largest ever advertised, see "Lowering the
+  token lifetime limits"), plus the freshness window.
 - **Deletion tombstones** (§6.10) keep the mailbox id, the
   tokens-not-before time (deletion + 90 s) and an expiry of that time plus
   the denylist retention. With SQLite they are a table without a foreign
@@ -651,14 +652,34 @@ implementation chooses as follows:
   once the tombstone is swept. With DynamoDB, a re-registered mailbox keeps
   its tokens-not-before for good (deposits keep checking it), so its `200`s
   keep reporting it.
-- **Don't lower the token lifetime limits.** Tombstones and denylist
-  entries are kept for the limits configured now
-  (`RELAY_MAX_TOKEN_LIFETIME`, `RELAY_OPEN_TOKEN_MAX_LIFETIME`), but
-  RELAY-PROTOCOL 0.12.0 §6.10 asks for the largest ever advertised: a
-  token minted under a larger limit can outlive a lowering. To shorten
-  them, keep the old values configured until every token minted under them
-  has expired (the old `RELAY_MAX_TOKEN_LIFETIME` after the change), then
-  lower them. Keeping a high-water mark is planned.
+- **Lowering the token lifetime limits.** Tombstones and denylist
+  entries are kept for the largest token lifetime the relay has ever
+  advertised (RELAY-PROTOCOL 0.12.0 §6.10), not only the limits configured
+  now (`RELAY_MAX_TOKEN_LIFETIME`, `RELAY_OPEN_TOKEN_MAX_LIFETIME`): a
+  token minted under a larger limit can outlive a lowering. The store
+  keeps that high-water mark (SQLite: the `lifetime_mark` table; DynamoDB:
+  the `META`/`LIFETIME` item), raised at every start and never lowered,
+  shared by every process. A start with lower limits logs so at WARN and
+  keeps the larger retention; the advertised limits are the configured
+  ones. A deletion or revocation reads the stored mark when it is made,
+  so a process started before another raised the limits still uses the
+  larger retention; so does DynamoDB's removal of a rotated mailbox. A
+  repeated deletion never shortens a tombstone.
+  - **Resetting the mark** (after a mistaken huge limit): set the
+    `lifetime_mark` row (SQLite) or the `META`/`LIFETIME` item's `life_ms`
+    (DynamoDB) to the configured limit, in milliseconds, but only once every
+    token minted under the larger limit has expired; earlier, revoked or
+    deleted keys' tokens could work again. Then restart every relay task, so
+    none keeps the old mark in memory.
+  - **Limits lowered before this version:** the mark starts at the limits
+    configured at the first start with this version. If they were lowered
+    earlier, start once with the old (larger) limits, or set the mark by
+    hand to them, until every token minted under them has expired.
+  - **SQLite rollback:** this change moves the schema to version 6 (one
+    added table), so an older binary refuses the database;
+    `PRAGMA user_version=5` lets it open again. Before upgrading again, set
+    `PRAGMA user_version=6`: the table is still there, and migration 6
+    would fail creating it.
 - **Open tokens and blobs.** One-shot open tokens are refused for
   `PUT /v1/blob` with `token_invalid`. §5.6 grants "exactly one deposit".
   §6.8 says blob authorization is "identical to deposit", but letting a

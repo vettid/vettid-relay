@@ -49,7 +49,11 @@ func (s *Store) DeleteMailbox(ctx context.Context, id string, pub []byte, notBef
 			continue // not (or no longer) a predecessor of this mailbox
 		}
 		_, already := it["deleted"]
-		if err := s.tombstone(ctx, j.id, getB(it, "pub"), getN0(it, "nb"), notBefore, keepUntil); err != nil {
+		// A repeated deletion never shortens the tombstone (§6.10): its
+		// expiry is the larger of the new one, the stored gsk (a rotated
+		// mailbox's delete_after, or an earlier tombstone's) and tomb_keep
+		// (an earlier tombstone's, kept when the key registered again).
+		if err := s.tombstone(ctx, j.id, getB(it, "pub"), getN0(it, "nb"), notBefore, keepUntil, max(getN0(it, "gsk"), getN0(it, "tomb_keep"))); err != nil {
 			return deleted, err
 		}
 		if !already { // a repeat finishes an interrupted purge but reports nothing new
@@ -65,9 +69,10 @@ func (s *Store) DeleteMailbox(ctx context.Context, id string, pub []byte, notBef
 }
 
 // tombstone marks one mailbox deleted and empties it.
-func (s *Store) tombstone(ctx context.Context, id string, pub []byte, prevNB int64, notBefore, keepUntil time.Time) error {
+func (s *Store) tombstone(ctx context.Context, id string, pub []byte, prevNB int64, notBefore, keepUntil time.Time, prevKeep int64) error {
 	defer s.forget(id)
 	nb := max(ms(notBefore), prevNB)
+	keepUntil = time.UnixMilli(max(ms(keepUntil), prevKeep))
 	for attempt := 0; ; attempt++ {
 		err := s.markDeleted(ctx, id, pub, nb, keepUntil)
 		if err == nil {
@@ -100,10 +105,12 @@ func (s *Store) markDeleted(ctx context.Context, id string, pub []byte, nb int64
 	vals := item{":p": avB(pub), ":now": avN(ms(s.now())), ":nb": avN(nb), ":due": avS(dueValue), ":keep": avN(ms(keepUntil))}
 	_, err := s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
-			TableName:                 &s.cfg.Table,
-			Key:                       key(mbPK(id), skAccount),
-			UpdateExpression:          aws.String("SET deleted = :now, nb = :nb, gpk = :due, gsk = :keep REMOVE preds"),
-			ConditionExpression:       aws.String("pub = :p"),
+			TableName:        &s.cfg.Table,
+			Key:              key(mbPK(id), skAccount),
+			UpdateExpression: aws.String("SET deleted = :now, nb = :nb, gpk = :due, gsk = :keep REMOVE preds"),
+			// gsk only grows: one raised since the read fails this, the
+			// API answers 500, and the owner's retry reads it again.
+			ConditionExpression:       aws.String("pub = :p AND (attribute_not_exists(gsk) OR gsk <= :keep)"),
 			ExpressionAttributeValues: vals,
 		}},
 		{Update: &types.Update{

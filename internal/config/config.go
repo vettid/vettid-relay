@@ -149,6 +149,12 @@ type Config struct {
 	EmptyHints   bool          // RELAY_EMPTY_HINTS
 	EmptySkipMax time.Duration // RELAY_EMPTY_SKIP_MAX
 
+	// RetentionLifetime is the high-water mark of the advertised token
+	// lifetimes (store.LifetimeMarker), set at start; not an environment
+	// setting. Tombstones and denylist entries are kept for the largest of
+	// it and the current limits (RELAY-PROTOCOL 0.12.0 §6.10, §5.5).
+	RetentionLifetime time.Duration
+
 	// RELAY_SERVES_VAULTS (default true): the relay serves VettID vaults,
 	// so RELAY-PROTOCOL 0.11.1's rules for such a relay are enforced at
 	// start: the rotation grace is exactly 14 days (§6.7) and

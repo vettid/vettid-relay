@@ -113,6 +113,11 @@ func Run(t *testing.T, h Harness) {
 		{"DeleteMailboxRotation", testDeleteRotation},
 		{"DeleteMailboxAcrossProcesses", testDeleteAcrossProcesses},
 		{"DeleteMailboxTombstoneExpires", testDeleteTombstoneExpires},
+		{"DeleteMailboxRepeatKeepsLongerTombstone", testDeleteRepeatKeepsLonger},
+		{"DeleteAgainAfterReRegisterKeepsLonger", testDeleteAgainAfterReRegister},
+		{"LifetimeMark", testLifetimeMark},
+		{"ReviveOnlyRaisesNotBefore", testReviveOnlyRaisesNB},
+		{"RotatedTombstoneUsesStoredMark", testRotatedTombstoneUsesMark},
 		{"RegisterAfterRotationGrace", testRegisterAfterGrace},
 		{"RotatedMailboxLeavesTombstone", testRotatedTombstone},
 		{"RotatedMailboxTombstoneAcrossProcesses", testRotatedTombstoneAcrossProcesses},
@@ -1607,5 +1612,142 @@ func testConcurrentBlobShare(t *testing.T, h Harness) {
 	wg.Wait()
 	if ok != 4 || quota != 6 {
 		t.Fatalf("%d stored, %d refused; want 4 and 6", ok, quota)
+	}
+}
+
+// A repeated deletion with a shorter retention (a lowered limit) never
+// shortens the tombstone (RELAY-PROTOCOL 0.12.0 §6.10): it lasts until the
+// longer expiry.
+func testDeleteRepeatKeepsLonger(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	nb, long := deleteTimes(c)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), nb, long); err != nil {
+		t.Fatal(err)
+	}
+	short := c.Now().Add(time.Hour)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), c.Now(), short); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(short.Sub(c.Now()) + h.SweepGrace + time.Minute)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "a", key(1)); err != nil {
+		t.Fatal(err)
+	}
+	if mb, err := s.Mailbox(ctx, "a"); err != nil || mb.TokensNotBefore.IsZero() {
+		t.Fatalf("the tombstone ended at the shorter expiry: %+v %v", mb, err)
+	}
+}
+
+// The lifetime mark only rises, and is shared by every process on the
+// store.
+func testLifetimeMark(t *testing.T, h Harness) {
+	s, _ := h.open(t)
+	m, ok := s.(store.LifetimeMarker)
+	if !ok {
+		t.Fatal("the backend keeps no lifetime mark")
+	}
+	day := 24 * time.Hour
+	for _, step := range []struct{ raise, want time.Duration }{
+		{30 * day, 30 * day},
+		{7 * day, 30 * day}, // lowered: kept
+		{400 * day, 400 * day},
+		{time.Minute, 400 * day},
+	} {
+		got, err := m.RaiseLifetimeMark(ctx, step.raise)
+		if err != nil || got != step.want {
+			t.Fatalf("raise %s: %s %v, want %s", step.raise, got, err, step.want)
+		}
+	}
+	if h.Pair != nil {
+		a, b := h.Pair(t, NewClock().Now)
+		if _, err := a.(store.LifetimeMarker).RaiseLifetimeMark(ctx, 50*day); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := b.(store.LifetimeMarker).RaiseLifetimeMark(ctx, day); err != nil || got != 50*day {
+			t.Fatalf("the other process: %s %v", got, err)
+		}
+	}
+}
+
+// A registration that revives a rotated-away mailbox past its grace (its
+// removal's tombstone) never lowers a not-before an earlier deletion set
+// higher.
+func testReviveOnlyRaisesNB(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	high := c.Now().Add(60 * 24 * time.Hour).Truncate(time.Second)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), high, high.Add(30*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "a", 1)
+	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + time.Minute) // past the grace, not swept
+	if _, _, err := s.Register(ctx, "a", key(1)); err != nil {
+		t.Fatal(err)
+	}
+	mb, err := s.Mailbox(ctx, "a")
+	if err != nil || mb.TokensNotBefore.Before(high) {
+		t.Fatalf("not-before %v lowered below %v: %v", mb.TokensNotBefore, high, err)
+	}
+}
+
+// A rotated mailbox removed at the end of its grace leaves a tombstone kept
+// for the lifetime mark stored then, even one raised after the store
+// opened (by another process): not only the policy it opened with.
+func testRotatedTombstoneUsesMark(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	day := 24 * time.Hour
+	if _, err := s.(store.LifetimeMarker).RaiseLifetimeMark(ctx, 800*day); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "a", 1)
+	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + h.SweepGrace + time.Minute)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Past the default policy's 400 days, within the mark's 800.
+	c.Add(500 * day)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "a", key(1)); err != nil {
+		t.Fatal(err)
+	}
+	if mb, err := s.Mailbox(ctx, "a"); err != nil || mb.TokensNotBefore.IsZero() {
+		t.Fatalf("the tombstone ended with the opening policy, not the stored mark: %+v %v", mb, err)
+	}
+}
+
+// Deleted, registered again, deleted again with a shorter retention: the
+// tombstone still lasts until the first deletion's longer expiry.
+func testDeleteAgainAfterReRegister(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	nb, long := deleteTimes(c)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), nb, long); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "a", 1)
+	short := c.Now().Add(time.Hour)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), c.Now(), short); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(short.Sub(c.Now()) + h.SweepGrace + time.Minute)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "a", key(1)); err != nil {
+		t.Fatal(err)
+	}
+	if mb, err := s.Mailbox(ctx, "a"); err != nil || mb.TokensNotBefore.IsZero() {
+		t.Fatalf("the tombstone ended at the shorter expiry: %+v %v", mb, err)
 	}
 }

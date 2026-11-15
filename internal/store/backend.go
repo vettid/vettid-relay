@@ -103,10 +103,37 @@ func (p TombstonePolicy) orDefault() TombstonePolicy {
 	return p
 }
 
+// LifetimeMarker keeps the high-water mark of the token lifetimes the
+// relay has advertised (RELAY-PROTOCOL 0.12.0 §6.10: tombstones are kept
+// for the largest limits ever advertised; §5.5's denylist the same).
+// RaiseLifetimeMark stores max(the mark, d) and returns the result; the
+// mark never goes down, across restarts and processes.
+type LifetimeMarker interface {
+	RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Duration, error)
+	// SetTombstones replaces the tombstone policy (before the store is in
+	// use: openStore calls it once the mark is known).
+	SetTombstones(p TombstonePolicy)
+}
+
+// WithMark returns p with its retention at least what the lifetime mark
+// asks: the mark plus the margin plus a minute, the api's denylist
+// retention for that lifetime.
+func (p TombstonePolicy) WithMark(mark time.Duration) TombstonePolicy {
+	p = p.orDefault()
+	p.Retention = max(p.Retention, mark+p.Margin+time.Minute)
+	return p
+}
+
 // Times returns the tombstone's not-before and expiry for a removal at now.
+// The not-before is rounded up to the whole second, so what the stores
+// keep (milliseconds) and what registration reports (whole seconds, §6.1)
+// are the same instant.
 func (p TombstonePolicy) Times(now time.Time) (notBefore, keepUntil time.Time) {
 	p = p.orDefault()
 	nb := now.Add(p.Margin)
+	if t := nb.Truncate(time.Second); !t.Equal(nb) {
+		nb = t.Add(time.Second)
+	}
 	return nb, nb.Add(p.Retention)
 }
 

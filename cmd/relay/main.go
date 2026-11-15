@@ -134,9 +134,15 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 	reg := metrics.New()
 	openCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	st, err := openStore(openCtx, cfg)
+	st, err := openStore(openCtx, &cfg)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
+	}
+	if limits := max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime); cfg.RetentionLifetime > limits {
+		// Tokens minted under the larger limit may still be live: their
+		// tombstones and revocations are kept that long (§6.10, §5.5).
+		log.WarnContext(lifecycle, "token lifetimes lowered: tombstones and denylist entries are kept for the larger limit advertised before",
+			"limits", limits.String(), "retention_lifetime", cfg.RetentionLifetime.String())
 	}
 	defer func() {
 		if err := st.Close(); err != nil {

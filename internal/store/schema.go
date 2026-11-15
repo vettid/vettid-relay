@@ -7,7 +7,7 @@ import (
 )
 
 // schemaVersion is bumped with every migration appended to migrations.
-const schemaVersion = 5
+const schemaVersion = 6
 
 // migrations[i] upgrades the schema from version i to i+1.
 //
@@ -118,6 +118,15 @@ CREATE INDEX idx_tombstones_expiry ON tombstones(expires_at);
 	`
 CREATE INDEX idx_blobs_sender ON blobs(mailbox_id, sender_sub);
 CREATE INDEX idx_blobs_list   ON blobs(mailbox_id, blob_id);
+`,
+	// v6 (protocol 0.12.0 §6.10): the high-water mark of the token
+	// lifetimes the relay has advertised, so a lowered limit doesn't
+	// shorten the retention of tombstones and denylist entries (one row).
+	`
+CREATE TABLE lifetime_mark (
+  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  lifetime_ms INTEGER NOT NULL
+);
 `,
 }
 

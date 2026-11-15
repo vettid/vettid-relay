@@ -92,11 +92,15 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 // meanwhile, so a stale cache cannot write either).
 func (s *Store) retire(ctx context.Context, mailbox string, it item, cutoff int64) (int64, bool, error) {
 	defer s.forget(mailbox)
+	p, err := s.tombstones(ctx) // first: a failed read wastes no purge
+	if err != nil {
+		return 0, false, err
+	}
 	msgs, err := s.purgeContents(ctx, mailbox)
 	if err != nil {
 		return 0, false, err
 	}
-	nb, keep := s.cfg.Tombstones.Times(s.now())
+	nb, keep := p.Times(s.now())
 	nbv := max(ms(nb), getN0(it, "nb"))
 	_, err = s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
