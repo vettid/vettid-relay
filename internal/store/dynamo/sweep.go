@@ -74,9 +74,12 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 		return 0, false, err
 	}
 	_, err = s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName:                 &s.cfg.Table,
-		Key:                       key(mbPK(mailbox), skAccount),
-		ConditionExpression:       aws.String("gpk = :due AND gsk <= :cut"),
+		TableName: &s.cfg.Table,
+		Key:       key(mbPK(mailbox), skAccount),
+		// Nor while a tomb_keep is still ahead: a writer that set gsk from
+		// an older read (a deletion racing a re-registration) can't end a
+		// tombstone the re-registration kept (§6.10).
+		ConditionExpression:       aws.String("gpk = :due AND gsk <= :cut AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :cut)"),
 		ExpressionAttributeValues: item{":due": avS(dueValue), ":cut": avN(cutoff)},
 	})
 	if isCCF(err) {

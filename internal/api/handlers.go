@@ -619,7 +619,8 @@ func denylistRetention(cfg config.Config) time.Duration {
 // rollout that raises the limits), and an entry written with this
 // process's older mark would expire while tokens minted under the new
 // limits still live (§6.10, §5.5). Deletions and revocations are rare, so
-// they pay one store read; a missing mark fails them closed. A store without a mark (tests) keeps s.cfg.
+// they pay one store read; a missing mark fails them closed. A store that
+// keeps no mark at all (not a LifetimeMarker) keeps s.cfg.
 func (s *Server) retentionCfg(ctx context.Context) (config.Config, error) {
 	cfg := s.cfg
 	if m, ok := s.st.(store.LifetimeMarker); ok {

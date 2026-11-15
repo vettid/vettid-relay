@@ -25,11 +25,6 @@ func TestConformanceDynamo(t *testing.T) {
 		if _, err := st.RaiseLifetimeMark(context.Background(), time.Millisecond); err != nil {
 			t.Fatal(err)
 		}
-		// As the relay does at every start: a mark is stored (1 ms, so
-		// the store's own tombstone policy decides).
-		if _, err := st.RaiseLifetimeMark(context.Background(), time.Millisecond); err != nil {
-			t.Fatal(err)
-		}
 		return st
 	}
 	var mu sync.Mutex
