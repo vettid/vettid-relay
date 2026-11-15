@@ -114,6 +114,7 @@ func Run(t *testing.T, h Harness) {
 		{"DeleteMailboxAcrossProcesses", testDeleteAcrossProcesses},
 		{"DeleteMailboxTombstoneExpires", testDeleteTombstoneExpires},
 		{"DeleteMailboxRepeatKeepsLongerTombstone", testDeleteRepeatKeepsLonger},
+		{"DeleteAgainAfterReRegisterKeepsLonger", testDeleteAgainAfterReRegister},
 		{"LifetimeMark", testLifetimeMark},
 		{"ReviveOnlyRaisesNotBefore", testReviveOnlyRaisesNB},
 		{"RotatedTombstoneUsesStoredMark", testRotatedTombstoneUsesMark},
@@ -1722,5 +1723,31 @@ func testRotatedTombstoneUsesMark(t *testing.T, h Harness) {
 	}
 	if mb, err := s.Mailbox(ctx, "a"); err != nil || mb.TokensNotBefore.IsZero() {
 		t.Fatalf("the tombstone ended with the opening policy, not the stored mark: %+v %v", mb, err)
+	}
+}
+
+// Deleted, registered again, deleted again with a shorter retention: the
+// tombstone still lasts until the first deletion's longer expiry.
+func testDeleteAgainAfterReRegister(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	mustRegister(t, s, "a", 1)
+	nb, long := deleteTimes(c)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), nb, long); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "a", 1)
+	short := c.Now().Add(time.Hour)
+	if _, err := s.DeleteMailbox(ctx, "a", key(1), c.Now(), short); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(short.Sub(c.Now()) + h.SweepGrace + time.Minute)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "a", key(1)); err != nil {
+		t.Fatal(err)
+	}
+	if mb, err := s.Mailbox(ctx, "a"); err != nil || mb.TokensNotBefore.IsZero() {
+		t.Fatalf("the tombstone ended at the shorter expiry: %+v %v", mb, err)
 	}
 }

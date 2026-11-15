@@ -50,9 +50,10 @@ func (s *Store) DeleteMailbox(ctx context.Context, id string, pub []byte, notBef
 		}
 		_, already := it["deleted"]
 		// A repeated deletion never shortens the tombstone (§6.10): its
-		// expiry is the larger of the new one and the stored gsk (a
-		// rotated mailbox's delete_after, or an earlier tombstone's).
-		if err := s.tombstone(ctx, j.id, getB(it, "pub"), getN0(it, "nb"), notBefore, keepUntil, getN0(it, "gsk")); err != nil {
+		// expiry is the larger of the new one, the stored gsk (a rotated
+		// mailbox's delete_after, or an earlier tombstone's) and tomb_keep
+		// (an earlier tombstone's, kept when the key registered again).
+		if err := s.tombstone(ctx, j.id, getB(it, "pub"), getN0(it, "nb"), notBefore, keepUntil, max(getN0(it, "gsk"), getN0(it, "tomb_keep"))); err != nil {
 			return deleted, err
 		}
 		if !already { // a repeat finishes an interrupted purge but reports nothing new

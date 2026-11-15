@@ -28,19 +28,28 @@ func openStore(ctx context.Context, cfg *config.Config) (store.Backend, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := applyLifetimeMark(ctx, st, cfg); err != nil {
+		st.Close()
+		return nil, err
+	}
+	return st, nil
+}
+
+// applyLifetimeMark raises st's lifetime mark to cfg's limits, sets
+// cfg.RetentionLifetime to it and st's tombstone policy from it. A store
+// without a mark, or a failing one, is an error: the relay doesn't start.
+func applyLifetimeMark(ctx context.Context, st store.Backend, cfg *config.Config) error {
 	m, ok := st.(store.LifetimeMarker)
 	if !ok {
-		st.Close()
-		return nil, fmt.Errorf("store %s keeps no lifetime mark", cfg.Store)
+		return fmt.Errorf("store %s keeps no lifetime mark", cfg.Store)
 	}
 	mark, err := m.RaiseLifetimeMark(ctx, max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime))
 	if err != nil {
-		st.Close()
-		return nil, fmt.Errorf("lifetime mark: %w", err)
+		return fmt.Errorf("lifetime mark: %w", err)
 	}
 	cfg.RetentionLifetime = mark
 	m.SetTombstones(api.TombstonePolicy(*cfg))
-	return st, nil
+	return nil
 }
 
 func openBackend(ctx context.Context, cfg config.Config) (store.Backend, error) {

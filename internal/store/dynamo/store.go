@@ -7,7 +7,7 @@
 // # Table layout (one table, pk/sk strings, TTL attribute "ttl_s")
 //
 //	pk            sk               what
-//	MB#<mailbox>  A                mailbox: pub, created, [delete_after, successor, preds, deleted, nb, gpk/gsk]
+//	MB#<mailbox>  A                mailbox: pub, created, [delete_after, successor, preds, deleted, nb, gpk/gsk, tomb_keep]
 //	MB#<mailbox>  S                counters: msgs, bytes, blob_bytes, deny; last_id; v; dead_at; nb; rec_*
 //	MB#<mailbox>  M#<ulid>         message: sz, dep, exp, sender, jti, payload (binary)
 //	MB#<mailbox>  L#<ulid>         lease of that message: lease_until
@@ -479,7 +479,7 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 	}
 	now := s.now()
 	setA, setS := "SET created = :now", "SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z, v = if_not_exists(v, :z) + :one"
-	valsA, valsS := item{":p": avB(pub), ":now": avN(ms(now))}, item{":z": avN(0), ":one": avN(1)}
+	valsA, valsS := item{":p": avB(pub), ":now": avN(ms(now)), ":zk": avN(0)}, item{":z": avN(0), ":one": avN(1)}
 	nb := seenNB
 	if setNB.After(nb) {
 		nb = setNB
@@ -498,9 +498,11 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 	}
 	_, err := s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
-			TableName:                 &s.cfg.Table,
-			Key:                       key(mbPK(id), skAccount),
-			UpdateExpression:          aws.String(setA + " REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
+			TableName: &s.cfg.Table,
+			Key:       key(mbPK(id), skAccount),
+			// tomb_keep keeps the tombstone's expiry (gsk, which leaves the
+			// sweep index here) so a later deletion never shortens it (§6.10).
+			UpdateExpression:          aws.String(setA + ", tomb_keep = if_not_exists(gsk, :zk) REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
 			ConditionExpression:       aws.String(cond),
 			ExpressionAttributeValues: valsA,
 		}},

@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/vettid/vettid-relay/internal/api"
 	"github.com/vettid/vettid-relay/internal/config"
+	"github.com/vettid/vettid-relay/internal/store"
 )
 
 // A restart with lowered token lifetimes keeps the retention of the larger
@@ -44,5 +46,32 @@ func TestOpenStoreKeepsLifetimeMark(t *testing.T) {
 	}
 	if cfg := open(500 * day); cfg.RetentionLifetime != 500*day {
 		t.Fatalf("raised: %s", cfg.RetentionLifetime)
+	}
+}
+
+// failingMark is a store whose lifetime mark can't be raised.
+type failingMark struct {
+	store.Backend
+	set bool
+}
+
+func (f *failingMark) RaiseLifetimeMark(context.Context, time.Duration) (time.Duration, error) {
+	return 0, errors.New("store down")
+}
+func (f *failingMark) SetTombstones(store.TombstonePolicy) { f.set = true }
+
+// A mark that can't be raised stops the start (fail closed): no retention
+// is guessed from the config alone.
+func TestApplyLifetimeMarkFailsClosed(t *testing.T) {
+	cfg := config.Defaults()
+	st := &failingMark{}
+	if err := applyLifetimeMark(context.Background(), st, &cfg); err == nil {
+		t.Fatal("started with a failing mark")
+	}
+	if st.set || cfg.RetentionLifetime != 0 {
+		t.Fatalf("policy set %v, retention %s", st.set, cfg.RetentionLifetime)
+	}
+	if err := applyLifetimeMark(context.Background(), struct{ store.Backend }{}, &cfg); err == nil {
+		t.Fatal("started with a store that keeps no mark")
 	}
 }
