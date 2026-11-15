@@ -206,7 +206,7 @@ func runHostSpread(t *testing.T, limits func(*config.Config), jitter bool, n int
 	vaults := make([]*simVault, n)
 	for i := range vaults {
 		vaults[i] = &simVault{p: simPrincipal("vault", i)}
-		if _, err := f.st.Register(ctx, vaults[i].p.mbx, vaults[i].p.pub); err != nil {
+		if _, _, err := f.st.Register(ctx, vaults[i].p.mbx, vaults[i].p.pub); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -134,6 +134,8 @@ type Store struct {
 
 	cacheMu sync.Mutex
 	cache   map[string]cachedMailbox
+
+	beforeRevive func() // tests only: runs between Register's read and its revive
 }
 
 type cachedMailbox struct {
@@ -357,8 +359,11 @@ func (s *Store) forget(ids ...string) {
 	s.cacheMu.Unlock()
 }
 
-// Register implements store.Backend.
-func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, error) {
+// Register implements store.Backend. tokensNotBefore comes from the
+// consistent read or the write that decided the answer, never the cache:
+// none for a mailbox item created new (a tombstone keeps its item, so a
+// new item means none is held).
+func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time.Time, error) {
 	for attempt := 0; attempt < 3; attempt++ {
 		_, err := s.cfg.DB.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: &s.cfg.Table,
@@ -370,63 +375,82 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, erro
 		})
 		if err == nil {
 			s.forget(id)
-			return true, nil
+			return true, time.Time{}, nil
 		}
 		if !isCCF(err) {
-			return false, err
+			return false, time.Time{}, err
 		}
 		mb, ok, err := s.getMailbox(ctx, id)
 		if err != nil {
-			return false, err
+			return false, time.Time{}, err
 		}
 		if !ok {
 			continue // purged in between; try again
 		}
 		if subtle.ConstantTimeCompare(mb.PubKey, pub) != 1 {
-			return false, fmt.Errorf("store: mailbox id collision")
+			return false, time.Time{}, fmt.Errorf("store: mailbox id collision")
 		}
 		if !dead(mb, s.now()) {
-			return false, nil
+			return false, mb.TokensNotBefore, nil
 		}
 		// Deleted, or past its rotation grace and not purged yet: the key
 		// starts a fresh, empty mailbox. A rotated-away one is removed now:
 		// its tokens get the tombstone it would have got from the sweep.
-		var nb time.Time
+		var setNB time.Time
 		if !mb.DeleteAfter.IsZero() { // not a deletion tombstone (parseMailbox)
-			nb, _ = s.cfg.Tombstones.Times(s.now())
+			setNB, _ = s.cfg.Tombstones.Times(s.now())
 		}
-		revived, err := s.revive(ctx, id, pub, nb)
-		if err != nil || revived {
-			return revived, err
+		if s.beforeRevive != nil {
+			s.beforeRevive()
+		}
+		nb, revived, err := s.revive(ctx, id, pub, mb.TokensNotBefore, setNB)
+		if err != nil {
+			return false, time.Time{}, err
+		}
+		if revived {
+			return true, nb, nil
 		}
 	}
-	return false, errors.New("dynamo: register: mailbox keeps disappearing")
+	return false, time.Time{}, errors.New("dynamo: register: mailbox kept changing (purged, deleted or retired meanwhile)")
 }
 
 // revive turns a dead mailbox item back into a fresh, empty, live mailbox:
 // its contents are purged first, then A and S are reset in one
-// transaction that requires the mailbox to be still dead (false: it
-// changed meanwhile, look again). nb stays: tokens minted before a
-// deletion remain refused. A non-zero setNB (a rotated-away mailbox
-// removed now) sets it.
-func (s *Store) revive(ctx context.Context, id string, pub []byte, setNB time.Time) (bool, error) {
+// transaction that requires the mailbox to be still dead, with the nb it
+// was read with (seenNB; false: it changed meanwhile, look again). nb
+// stays: tokens minted before a deletion remain refused. A non-zero setNB
+// (a rotated-away mailbox removed now) raises it, never lowers it. It
+// returns the nb the mailbox is left with, which registration reports.
+func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB time.Time) (time.Time, bool, error) {
 	defer s.forget(id)
 	if _, err := s.purgeContents(ctx, id); err != nil {
-		return false, err
+		return time.Time{}, false, err
 	}
 	now := s.now()
 	setA, setS := "SET created = :now", "SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z, v = if_not_exists(v, :z) + :one"
 	valsA, valsS := item{":p": avB(pub), ":now": avN(ms(now))}, item{":z": avN(0), ":one": avN(1)}
-	if !setNB.IsZero() {
+	nb := seenNB
+	if setNB.After(nb) {
+		nb = setNB
 		setA, setS = setA+", nb = :nb", setS+", nb = :nb"
-		valsA[":nb"], valsS[":nb"] = avN(ms(setNB)), avN(ms(setNB))
+		valsA[":nb"], valsS[":nb"] = avN(ms(nb)), avN(ms(nb))
+	}
+	// The nb read: a deletion or a retire since (which may raise it) sends
+	// the registration back to read again, so what it reports is what
+	// deposits are checked against.
+	cond := "pub = :p AND (attribute_exists(deleted) OR delete_after <= :now) AND "
+	if seenNB.IsZero() {
+		cond += "attribute_not_exists(nb)"
+	} else {
+		cond += "nb = :seen"
+		valsA[":seen"] = avN(ms(seenNB))
 	}
 	_, err := s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName:                 &s.cfg.Table,
 			Key:                       key(mbPK(id), skAccount),
 			UpdateExpression:          aws.String(setA + " REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
-			ConditionExpression:       aws.String("pub = :p AND (attribute_exists(deleted) OR delete_after <= :now)"),
+			ConditionExpression:       aws.String(cond),
 			ExpressionAttributeValues: valsA,
 		}},
 		{Update: &types.Update{
@@ -437,12 +461,12 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, setNB time.Ti
 		}},
 	}})
 	if err == nil {
-		return true, nil
+		return nb.Truncate(time.Millisecond), true, nil
 	}
 	if r := txReasons(err); r != nil && (reasonCode(r, 0) == "ConditionalCheckFailed" || isConflict(r)) {
-		return false, nil
+		return time.Time{}, false, nil
 	}
-	return false, err
+	return time.Time{}, false, err
 }
 
 // Mailbox implements store.Backend.

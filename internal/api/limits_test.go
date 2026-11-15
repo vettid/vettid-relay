@@ -381,7 +381,7 @@ func TestUnlockStormAtTheFloodGuard(t *testing.T) {
 	vaults := make([]principal, n)
 	for i := range vaults {
 		vaults[i] = simPrincipal("vault", i)
-		if _, err := f.st.Register(t.Context(), vaults[i].mbx, vaults[i].pub); err != nil {
+		if _, _, err := f.st.Register(t.Context(), vaults[i].mbx, vaults[i].pub); err != nil {
 			t.Fatal(err)
 		}
 	}

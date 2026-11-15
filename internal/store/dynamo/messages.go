@@ -42,13 +42,15 @@ func (q *quotaCond) room(attr string, delta, max int64) {
 
 // issuedAt requires a token issued at iat to be no older than the
 // mailbox's TokensNotBefore (nb on the counters item, set when a deletion
-// tombstoned the id, §6.10). Zero iat: no token, no condition.
+// tombstoned the id, §6.10). Zero iat: no token, no condition. iat is
+// taken in whole seconds: k < nb is k < nb rounded up, the value
+// registration reports (§6.1).
 func (q *quotaCond) issuedAt(iat time.Time) {
 	if iat.IsZero() {
 		return
 	}
 	q.parts = append(q.parts, "(attribute_not_exists(nb) OR nb <= :iat)")
-	q.vals[":iat"] = avN(ms(iat))
+	q.vals[":iat"] = avN(ms(iat.Truncate(time.Second)))
 }
 
 // deadOrRevoked explains a failed counters condition from the item's old
@@ -58,7 +60,7 @@ func deadOrRevoked(old item, now, iat time.Time) error {
 	if d, ok := getN(old, "dead_at"); ok && d <= ms(now) {
 		return store.ErrNotFound
 	}
-	if nb, ok := getN(old, "nb"); ok && !iat.IsZero() && ms(iat) < nb {
+	if nb, ok := getN(old, "nb"); ok && !iat.IsZero() && ms(iat.Truncate(time.Second)) < nb {
 		return store.ErrRevoked
 	}
 	return nil

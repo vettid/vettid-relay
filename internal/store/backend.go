@@ -25,8 +25,11 @@ type Backend interface {
 	Close() error
 
 	// Register creates the mailbox if absent; created is false when it
-	// already existed with the same key.
-	Register(ctx context.Context, id string, pub []byte) (created bool, err error)
+	// already existed with the same key. tokensNotBefore is the mailbox's
+	// TokensNotBefore as deposits are checked against it, read within the
+	// registration itself (never from a cache): zero when no tombstone
+	// for the id is held (§6.1, §6.10).
+	Register(ctx context.Context, id string, pub []byte) (created bool, tokensNotBefore time.Time, err error)
 	// Mailbox returns a live mailbox (not past its rotation grace period).
 	Mailbox(ctx context.Context, id string) (Mailbox, error)
 	// Rotate registers the successor (idempotent) and schedules the old

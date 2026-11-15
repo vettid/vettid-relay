@@ -103,11 +103,27 @@ type limitsBody struct {
 	MaxMailboxBlobBytes *int64 `json:"max_mailbox_blob_bytes,omitempty"`
 	MaxSenderBlobBytes  *int64 `json:"max_sender_blob_bytes,omitempty"`
 	MaxSenderBlobs      *int64 `json:"max_sender_blobs,omitempty"`
+	// 0.12.0 (§6.1): registration answers report tombstones.
+	ReportsTombstones bool `json:"reports_tombstones"`
 }
 
 type registerResponse struct {
 	MailboxID string     `json:"mailbox_id"`
 	Limits    limitsBody `json:"limits"`
+	// TokensNotBefore (0.12.0, §6.1): while a tombstone for the id is
+	// held, its tokens-not-before time, in whole seconds rounded up.
+	TokensNotBefore string `json:"tokens_not_before,omitempty"`
+}
+
+// wholeSecondUp is t rounded up to the whole second, as §6.1 reports a
+// tombstone's tokens-not-before. Deposits take a token's iat in whole
+// seconds (truncated) and compare it with the unrounded time (iat < t),
+// which is the same as comparing with this.
+func wholeSecondUp(t time.Time) time.Time {
+	if r := t.Truncate(time.Second); r.Before(t) {
+		return r.Add(time.Second)
+	}
+	return t
 }
 
 func (s *Server) limits() limitsBody {
@@ -120,6 +136,7 @@ func (s *Server) limits() limitsBody {
 		OpenTokenMaxLifetimeSeconds: int64(s.cfg.OpenTokenMaxLifetime / time.Second),
 		MaxClaimBytes:               s.cfg.MaxClaimBytes,
 		ClaimTTLSeconds:             int64(s.cfg.ClaimTTL / time.Second),
+		ReportsTombstones:           true,
 	}
 	if s.cfg.BlobsEnabled {
 		mb, ttl := s.cfg.MaxBlobBytes, int64(s.cfg.BlobTTL/time.Second)
@@ -174,7 +191,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	created, err := s.st.Register(r.Context(), id, pub)
+	// The tombstone comes from the registration itself, as deposits see
+	// it: never from a cache or another process's stale view (§6.1).
+	created, nb, err := s.st.Register(r.Context(), id, pub)
 	if err != nil {
 		s.log.Error("register failed", "err", err)
 		s.writeError(w, fail(CodeInternal))
@@ -185,7 +204,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 		s.m.registrations.Inc()
 	}
-	writeJSON(w, status, registerResponse{MailboxID: id, Limits: s.limits()})
+	resp := registerResponse{MailboxID: id, Limits: s.limits()}
+	if !nb.IsZero() {
+		resp.TokensNotBefore = wholeSecondUp(nb).UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, status, resp)
 }
 
 // ----------------------------------------------------------------- deposit
