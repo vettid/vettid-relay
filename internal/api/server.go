@@ -18,7 +18,7 @@ import (
 )
 
 // ProtocolVersion is the docs/RELAY-PROTOCOL.md version this relay implements.
-const ProtocolVersion = "0.7.0"
+const ProtocolVersion = "0.12.0"
 
 // Server is the relay API.
 type Server struct {

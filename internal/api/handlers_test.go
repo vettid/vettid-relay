@@ -540,3 +540,31 @@ func TestAckMalformedIDSkipsStore(t *testing.T) {
 		t.Fatalf("well-formed unknown id: %d, %d store calls", code, cs.acks.Load())
 	}
 }
+
+// With the defaults (RELAY-PROTOCOL 0.11.1 §6.7: exactly 14 days), a
+// rotated-away mailbox still takes deposits and collects on day 13, when
+// a vault stops collecting it, up to the end of day 14, and is gone after.
+func TestRotationGraceDefault(t *testing.T) {
+	f := newFixture(t, nil)
+	if f.cfg.RotationGrace != 14*24*time.Hour {
+		t.Fatalf("default grace %s", f.cfg.RotationGrace)
+	}
+	oldKey, newKey, sender := newPrincipal(1), newPrincipal(2), newPrincipal(3)
+	f.register(oldKey)
+	proof := base64.StdEncoding.EncodeToString(ed25519.Sign(newKey.priv, []byte(oldKey.mbx)))
+	body := []byte(fmt.Sprintf(`{"new_pubkey":%q,"new_key_proof":%q}`, newKey.b64, proof))
+	if code, b := f.do(req{method: "POST", path: "/v1/mailbox/rotate", body: body, signer: &oldKey}); code != 200 {
+		t.Fatalf("rotate: %d %s", code, b)
+	}
+	f.clk.add(13 * 24 * time.Hour)
+	id := f.mustDeposit(oldKey, sender, f.mint(oldKey, sender, nil), []byte("day 13"))
+	if got := f.collect(oldKey, ""); len(got.Messages) != 1 || got.Messages[0].MsgID != id {
+		t.Fatalf("day 13: the old mailbox doesn't collect: %+v", got)
+	}
+	f.clk.add(24*time.Hour - time.Second)
+	if got := f.collect(oldKey, ""); len(got.Messages) != 1 {
+		t.Fatalf("a second before day 14 ends: %+v", got)
+	}
+	f.clk.add(time.Second)
+	f.expectCode(req{method: "GET", path: "/v1/mailbox", signer: &oldKey}, 404, CodeMailboxUnknown)
+}
