@@ -70,6 +70,21 @@ type Option func(*Store)
 // removed at the end of their grace (default DefaultTombstonePolicy).
 func WithTombstones(p TombstonePolicy) Option { return func(s *Store) { s.tomb = p } }
 
+// SetTombstones implements LifetimeMarker.
+func (s *Store) SetTombstones(p TombstonePolicy) { s.tomb = p }
+
+// RaiseLifetimeMark implements LifetimeMarker.
+func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Duration, error) {
+	var v int64
+	err := s.w.QueryRowContext(ctx, `INSERT INTO lifetime_mark (id, lifetime_ms) VALUES (1, ?)
+		ON CONFLICT(id) DO UPDATE SET lifetime_ms=MAX(lifetime_ms, excluded.lifetime_ms)
+		RETURNING lifetime_ms`, d.Milliseconds()).Scan(&v)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(v) * time.Millisecond, nil
+}
+
 // WithClock overrides the clock (tests).
 func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = now } }
 

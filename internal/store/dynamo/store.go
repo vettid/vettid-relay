@@ -18,6 +18,7 @@
 //	MB#<mailbox>  BS#<sender>      a sender's share of the mailbox's blobs (0.9.2): e_<ulid> = {s: size, e: exp} per blob, b (bytes), n (blobs), v; no TTL
 //	MB#<mailbox>  C#<claim id>     claim marker (counts toward the storage cap)
 //	CL#<claim id> CL               claim: mb, sz, exp, body
+//	META          LIFETIME         the high-water mark of the advertised token lifetimes: life_ms (§6.10)
 //
 // The sparse GSI "due" (gpk = "due", gsk = delete_after ms) lists rotated
 // mailboxes so Sweep can purge them after their grace period. Attribute
@@ -170,6 +171,35 @@ func New(cfg Config) (*Store, error) {
 func (s *Store) Close() error { return nil }
 
 // Ping implements store.Backend: one cheap read.
+// SetTombstones implements store.LifetimeMarker.
+func (s *Store) SetTombstones(p store.TombstonePolicy) { s.cfg.Tombstones = p }
+
+// RaiseLifetimeMark implements store.LifetimeMarker: a conditional write
+// that only raises life_ms, then a consistent read of what is stored.
+func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Duration, error) {
+	_, err := s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 &s.cfg.Table,
+		Key:                       key("META", "LIFETIME"),
+		UpdateExpression:          aws.String("SET life_ms = :v"),
+		ConditionExpression:       aws.String("attribute_not_exists(life_ms) OR life_ms < :v"),
+		ExpressionAttributeValues: item{":v": avN(d.Milliseconds())},
+	})
+	if err != nil && !isCCF(err) {
+		return 0, err
+	}
+	out, err := s.cfg.DB.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &s.cfg.Table, Key: key("META", "LIFETIME"), ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return 0, err
+	}
+	v, ok := getN(out.Item, "life_ms")
+	if !ok {
+		return 0, errors.New("dynamo: lifetime mark missing after its write")
+	}
+	return time.Duration(v) * time.Millisecond, nil
+}
+
 func (s *Store) Ping(ctx context.Context) error {
 	_, err := s.cfg.DB.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: &s.cfg.Table,

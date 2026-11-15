@@ -20,7 +20,30 @@ import (
 
 // openStore opens the configured backend. SQLite creates the database file
 // in WAL mode before the relay listens; DynamoDB is checked with one read.
-func openStore(ctx context.Context, cfg config.Config) (store.Backend, error) {
+// It then raises the store's high-water mark of the advertised token
+// lifetimes to the current limits, sets cfg.RetentionLifetime to the mark,
+// and the store's tombstone policy from it (§6.10).
+func openStore(ctx context.Context, cfg *config.Config) (store.Backend, error) {
+	st, err := openBackend(ctx, *cfg)
+	if err != nil {
+		return nil, err
+	}
+	m, ok := st.(store.LifetimeMarker)
+	if !ok {
+		st.Close()
+		return nil, fmt.Errorf("store %s keeps no lifetime mark", cfg.Store)
+	}
+	mark, err := m.RaiseLifetimeMark(ctx, max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime))
+	if err != nil {
+		st.Close()
+		return nil, fmt.Errorf("lifetime mark: %w", err)
+	}
+	cfg.RetentionLifetime = mark
+	m.SetTombstones(api.TombstonePolicy(*cfg))
+	return st, nil
+}
+
+func openBackend(ctx context.Context, cfg config.Config) (store.Backend, error) {
 	if cfg.Store != "dynamodb" {
 		return store.Open(ctx, cfg.DBPath, store.WithTombstones(api.TombstonePolicy(cfg)))
 	}

@@ -651,14 +651,17 @@ implementation chooses as follows:
   once the tombstone is swept. With DynamoDB, a re-registered mailbox keeps
   its tokens-not-before for good (deposits keep checking it), so its `200`s
   keep reporting it.
-- **Don't lower the token lifetime limits.** Tombstones and denylist
-  entries are kept for the limits configured now
-  (`RELAY_MAX_TOKEN_LIFETIME`, `RELAY_OPEN_TOKEN_MAX_LIFETIME`), but
-  RELAY-PROTOCOL 0.12.0 §6.10 asks for the largest ever advertised: a
-  token minted under a larger limit can outlive a lowering. To shorten
-  them, keep the old values configured until every token minted under them
-  has expired (the old `RELAY_MAX_TOKEN_LIFETIME` after the change), then
-  lower them. Keeping a high-water mark is planned.
+- **Lowering the token lifetime limits.** Tombstones and denylist
+  entries are kept for the largest token lifetime the relay has ever
+  advertised (RELAY-PROTOCOL 0.12.0 §6.10), not only the limits configured
+  now (`RELAY_MAX_TOKEN_LIFETIME`, `RELAY_OPEN_TOKEN_MAX_LIFETIME`): a
+  token minted under a larger limit can outlive a lowering. The store
+  keeps that high-water mark (SQLite: the `lifetime_mark` table; DynamoDB:
+  the `META`/`LIFETIME` item), raised at every start and never lowered,
+  shared by every process. A start with lower limits logs so at WARN and
+  keeps the larger retention; the advertised limits are the configured
+  ones. A repeated deletion never shortens a tombstone. The SQLite schema
+  is version 6 from this change, so an older binary refuses that database.
 - **Open tokens and blobs.** One-shot open tokens are refused for
   `PUT /v1/blob` with `token_invalid`. §5.6 grants "exactly one deposit".
   §6.8 says blob authorization is "identical to deposit", but letting a
