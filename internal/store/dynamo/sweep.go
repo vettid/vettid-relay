@@ -92,13 +92,13 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 // meanwhile, so a stale cache cannot write either).
 func (s *Store) retire(ctx context.Context, mailbox string, it item, cutoff int64) (int64, bool, error) {
 	defer s.forget(mailbox)
-	msgs, err := s.purgeContents(ctx, mailbox)
+	p, err := s.tombstones(ctx) // first: a failed read wastes no purge
 	if err != nil {
 		return 0, false, err
 	}
-	p, err := s.tombstones(ctx)
+	msgs, err := s.purgeContents(ctx, mailbox)
 	if err != nil {
-		return msgs, false, err
+		return 0, false, err
 	}
 	nb, keep := p.Times(s.now())
 	nbv := max(ms(nb), getN0(it, "nb"))

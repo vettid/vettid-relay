@@ -15,7 +15,7 @@ func TestRetentionReadsStoredMark(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) { c.MaxTokenLifetime = 30 * 24 * time.Hour })
 	m, ok := f.s.st.(store.LifetimeMarker)
 	if !ok {
-		t.Skip("the fixture's store keeps no mark")
+		t.Fatal("the fixture's store keeps no mark")
 	}
 	before, err := f.s.retentionCfg(context.Background())
 	if err != nil {
@@ -46,7 +46,7 @@ func TestRevokeAndDeleteUseRaisedMark(t *testing.T) {
 	f := newFixture(t, func(c *config.Config) { c.MaxTokenLifetime = 30 * day })
 	m, ok := f.s.st.(store.LifetimeMarker)
 	if !ok {
-		t.Skip("the fixture's store keeps no mark")
+		t.Fatal("the fixture's store keeps no mark")
 	}
 	ctx := context.Background()
 	if _, err := m.RaiseLifetimeMark(ctx, 400*day); err != nil { // another process
