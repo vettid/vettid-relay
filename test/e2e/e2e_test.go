@@ -34,6 +34,10 @@ func startRelay(t *testing.T) string {
 	ts.Start()
 	cfg := config.Defaults()
 	cfg.BaseURL = ts.URL // tokens are minted for this exact audience
+	// As openStore does at start.
+	if _, err := st.RaiseLifetimeMark(context.Background(), max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime)); err != nil {
+		t.Fatal(err)
+	}
 	srv := api.New(cfg, st, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New())
 	ts.Config.Handler = srv.Handler()
 	t.Cleanup(func() {

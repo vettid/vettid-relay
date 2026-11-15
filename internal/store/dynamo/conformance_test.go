@@ -1,6 +1,7 @@
 package dynamo_test
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,11 @@ func TestConformanceDynamo(t *testing.T) {
 	mk := func(t *testing.T, table string, s3 *fakes3.Server, now func() time.Time) store.Backend {
 		st, err := dynamo.New(dynamo.Config{Table: table, Bucket: "blobs", DB: db, S3: s3.Client(), Now: now})
 		if err != nil {
+			t.Fatal(err)
+		}
+		// As the relay does at every start: a mark is stored (1 ms, so
+		// the store's own tombstone policy decides).
+		if _, err := st.RaiseLifetimeMark(context.Background(), time.Millisecond); err != nil {
 			t.Fatal(err)
 		}
 		return st

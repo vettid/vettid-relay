@@ -110,7 +110,7 @@ func (s *Store) markDeleted(ctx context.Context, id string, pub []byte, nb int64
 			UpdateExpression: aws.String("SET deleted = :now, nb = :nb, gpk = :due, gsk = :keep REMOVE preds"),
 			// gsk only grows: one raised since the read fails this, the
 			// API answers 500, and the owner's retry reads it again.
-			ConditionExpression:       aws.String("pub = :p AND (attribute_not_exists(gsk) OR gsk <= :keep)"),
+			ConditionExpression:       aws.String("pub = :p AND (attribute_not_exists(gsk) OR gsk <= :keep) AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :keep)"),
 			ExpressionAttributeValues: vals,
 		}},
 		{Update: &types.Update{

@@ -137,6 +137,7 @@ type Store struct {
 	cache   map[string]cachedMailbox
 
 	beforeRevive func() // tests only: runs between Register's read and its revive
+	beforeRotate func() // tests only: runs between Rotate's reads and its write
 }
 
 type cachedMailbox struct {
@@ -177,14 +178,45 @@ func (s *Store) SetTombstones(p store.TombstonePolicy) { s.cfg.Tombstones = p }
 // (another process may have raised it since this one started), for the
 // removals this store makes itself: a rotated mailbox past its grace.
 func (s *Store) tombstones(ctx context.Context) (store.TombstonePolicy, error) {
+	mark, err := s.LifetimeMark(ctx)
+	if err != nil {
+		return store.TombstonePolicy{}, err
+	}
+	return s.cfg.Tombstones.WithMark(mark), nil
+}
+
+// LifetimeMark implements store.LifetimeMarker: one consistent read. A
+// missing item (the relay raises it at every start) is an error.
+func (s *Store) LifetimeMark(ctx context.Context) (time.Duration, error) {
 	out, err := s.cfg.DB.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: &s.cfg.Table, Key: key("META", "LIFETIME"), ConsistentRead: aws.Bool(true),
 	})
 	if err != nil {
-		return store.TombstonePolicy{}, err
+		return 0, err
 	}
-	v, _ := getN(out.Item, "life_ms")
-	return s.cfg.Tombstones.WithMark(time.Duration(v) * time.Millisecond), nil
+	v, ok := getN(out.Item, "life_ms")
+	if !ok {
+		return 0, errors.New("dynamo: no lifetime mark stored")
+	}
+	return time.Duration(v) * time.Millisecond, nil
+}
+
+// heldKeep is the tombstone expiry an account item holds (ms): its gsk (a
+// deletion's or a retire's expiry; a rotated mailbox's delete_after) and
+// tomb_keep (an earlier tombstone's, kept when the key registered again).
+// Wherever gsk is removed or replaced, the larger is carried forward, so
+// no tombstone is shortened (§6.10).
+func heldKeep(it item) int64 { return max(getN0(it, "gsk"), getN0(it, "tomb_keep")) }
+
+// getAccount is the account item, read consistently (nil: none).
+func (s *Store) getAccount(ctx context.Context, id string) (item, error) {
+	out, err := s.cfg.DB.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &s.cfg.Table, Key: key(mbPK(id), skAccount), ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out.Item, nil
 }
 
 // RaiseLifetimeMark implements store.LifetimeMarker: a conditional write
@@ -427,13 +459,14 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time
 		if !isCCF(err) {
 			return false, time.Time{}, err
 		}
-		mb, ok, err := s.getMailbox(ctx, id)
+		it, err := s.getAccount(ctx, id)
 		if err != nil {
 			return false, time.Time{}, err
 		}
-		if !ok {
+		if len(it) == 0 {
 			continue // purged in between; try again
 		}
+		mb := parseMailbox(it)
 		if subtle.ConstantTimeCompare(mb.PubKey, pub) != 1 {
 			return false, time.Time{}, fmt.Errorf("store: mailbox id collision")
 		}
@@ -443,18 +476,23 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time
 		// Deleted, or past its rotation grace and not purged yet: the key
 		// starts a fresh, empty mailbox. A rotated-away one is removed now:
 		// its tokens get the tombstone it would have got from the sweep.
+		// The mark is read for the removal's expiry, which tomb_keep keeps
+		// even when setNB loses to the stored nb.
 		var setNB time.Time
+		keep := heldKeep(it)
 		if !mb.DeleteAfter.IsZero() { // not a deletion tombstone (parseMailbox)
 			p, err := s.tombstones(ctx)
 			if err != nil {
 				return false, time.Time{}, err
 			}
-			setNB, _ = p.Times(s.now())
+			var removed time.Time
+			setNB, removed = p.Times(s.now())
+			keep = max(keep, ms(removed))
 		}
 		if s.beforeRevive != nil {
 			s.beforeRevive()
 		}
-		nb, revived, err := s.revive(ctx, id, pub, mb.TokensNotBefore, setNB)
+		nb, revived, err := s.revive(ctx, id, pub, mb.TokensNotBefore, setNB, keep)
 		if err != nil {
 			return false, time.Time{}, err
 		}
@@ -472,14 +510,14 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time
 // stays: tokens minted before a deletion remain refused. A non-zero setNB
 // (a rotated-away mailbox removed now) raises it, never lowers it. It
 // returns the nb the mailbox is left with, which registration reports.
-func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB time.Time) (time.Time, bool, error) {
+func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB time.Time, keep int64) (time.Time, bool, error) {
 	defer s.forget(id)
 	if _, err := s.purgeContents(ctx, id); err != nil {
 		return time.Time{}, false, err
 	}
 	now := s.now()
 	setA, setS := "SET created = :now", "SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z, v = if_not_exists(v, :z) + :one"
-	valsA, valsS := item{":p": avB(pub), ":now": avN(ms(now)), ":zk": avN(0)}, item{":z": avN(0), ":one": avN(1)}
+	valsA, valsS := item{":p": avB(pub), ":now": avN(ms(now)), ":tk": avN(keep)}, item{":z": avN(0), ":one": avN(1)}
 	nb := seenNB
 	if setNB.After(nb) {
 		nb = setNB
@@ -489,7 +527,10 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 	// The nb read: a deletion or a retire since (which may raise it) sends
 	// the registration back to read again, so what it reports is what
 	// deposits are checked against.
-	cond := "pub = :p AND (attribute_exists(deleted) OR delete_after <= :now) AND "
+	// tomb_keep only grows: a gsk or tomb_keep raised since the read fails
+	// this, and the registration reads again.
+	cond := "pub = :p AND (attribute_exists(deleted) OR delete_after <= :now) AND " +
+		"(attribute_not_exists(gsk) OR gsk <= :tk) AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :tk) AND "
 	if seenNB.IsZero() {
 		cond += "attribute_not_exists(nb)"
 	} else {
@@ -500,9 +541,10 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 		{Update: &types.Update{
 			TableName: &s.cfg.Table,
 			Key:       key(mbPK(id), skAccount),
-			// tomb_keep keeps the tombstone's expiry (gsk, which leaves the
-			// sweep index here) so a later deletion never shortens it (§6.10).
-			UpdateExpression:          aws.String(setA + ", tomb_keep = if_not_exists(gsk, :zk) REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
+			// tomb_keep keeps the tombstone's expiry (heldKeep, and this
+			// removal's), as gsk leaves the sweep index here, so a later
+			// deletion never shortens it (§6.10).
+			UpdateExpression:          aws.String(setA + ", tomb_keep = :tk REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
 			ConditionExpression:       aws.String(cond),
 			ExpressionAttributeValues: valsA,
 		}},
@@ -568,12 +610,20 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 		}
 		// A successor id that was deleted before starts empty (its
 		// contents are normally purged already).
-		if nm, ok, err := s.getMailbox(ctx, newID); err != nil {
+		succ, err := s.getAccount(ctx, newID)
+		if err != nil {
 			return err
-		} else if ok && dead(nm, now) {
+		}
+		if len(succ) > 0 && dead(parseMailbox(succ), now) {
 			if _, err := s.purgeContents(ctx, newID); err != nil {
 				return err
 			}
+		}
+		// The successor's gsk is removed below: its tombstone's expiry
+		// stays as tomb_keep, which only grows (§6.10).
+		succKeep := heldKeep(succ)
+		if s.beforeRotate != nil {
+			s.beforeRotate()
 		}
 		da := deleteAfter
 		oldCond := "pub = :oldpub AND attribute_not_exists(delete_after) AND attribute_not_exists(deleted)"
@@ -595,12 +645,14 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 				ExpressionAttributeValues: vals,
 			}},
 			{Update: &types.Update{
-				TableName:           &s.cfg.Table,
-				Key:                 key(mbPK(newID), skAccount),
-				UpdateExpression:    aws.String("SET pub = if_not_exists(pub, :p), created = if_not_exists(created, :now) ADD preds :old REMOVE delete_after, deleted, gpk, gsk"),
-				ConditionExpression: aws.String("attribute_not_exists(pk) OR pub = :p"),
+				TableName:        &s.cfg.Table,
+				Key:              key(mbPK(newID), skAccount),
+				UpdateExpression: aws.String("SET pub = if_not_exists(pub, :p), created = if_not_exists(created, :now), tomb_keep = :tk ADD preds :old REMOVE delete_after, deleted, gpk, gsk"),
+				ConditionExpression: aws.String("(attribute_not_exists(pk) OR pub = :p) AND " +
+					"(attribute_not_exists(gsk) OR gsk <= :tk) AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :tk)"),
 				ExpressionAttributeValues: item{
 					":p": avB(newPub), ":now": avN(ms(now)), ":old": &types.AttributeValueMemberSS{Value: []string{oldID}},
+					":tk": avN(succKeep),
 				},
 			}},
 			{Update: &types.Update{
@@ -623,7 +675,22 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			return err
 		}
 		if reasonCode(r, 1) == "ConditionalCheckFailed" {
-			return fmt.Errorf("store: mailbox id collision")
+			// Another key's mailbox, or its tombstone raised since the read
+			// (then read again).
+			cur, gerr := s.getAccount(ctx, newID)
+			if gerr != nil {
+				return gerr
+			}
+			if len(cur) > 0 && subtle.ConstantTimeCompare(getB(cur, "pub"), newPub) != 1 {
+				return fmt.Errorf("store: mailbox id collision")
+			}
+			if attempt >= maxTxAttempts {
+				return fmt.Errorf("dynamo: rotate: %w", err)
+			}
+			if err := backoff(ctx, attempt); err != nil {
+				return err
+			}
+			continue
 		}
 		if attempt >= maxTxAttempts {
 			return fmt.Errorf("dynamo: rotate: %w", err)

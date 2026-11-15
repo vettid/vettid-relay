@@ -300,3 +300,202 @@ func TestRegisterRacingDeleteReportsRaisedNB(t *testing.T) {
 		t.Fatalf("a token between the two deletions: %v", err)
 	}
 }
+
+// Without a stored lifetime mark (the relay always raises it at start),
+// the store's own removals of a rotated mailbox fail closed rather than
+// fall back to the start-time policy.
+func TestMissingMarkFailsClosed(t *testing.T) {
+	db := ddblocal.Client(t)
+	table := ddblocal.Table(t, db)
+	c := storetest.NewClock()
+	s, err := dynamo.New(dynamo.Config{Table: table, DB: db, S3: fakes3.New(t).Client(), Bucket: "b", Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LifetimeMark(ctx); err == nil {
+		t.Fatal("a missing mark read as a value")
+	}
+	if _, _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "a", "b", append(make([]byte, 31), 2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + time.Minute)
+	if _, _, err := s.Register(ctx, "a", make([]byte, 32)); err == nil {
+		t.Fatal("a rotated mailbox was removed without a mark")
+	}
+}
+
+// newMarked is a store on a fresh table with the mark raised, as at start.
+func newMarked(t *testing.T) (*dynamo.Store, *storetest.Clock) {
+	t.Helper()
+	db := ddblocal.Client(t)
+	c := storetest.NewClock()
+	s, err := dynamo.New(dynamo.Config{Table: ddblocal.Table(t, db), DB: db, S3: fakes3.New(t).Client(), Bucket: "b", Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RaiseLifetimeMark(ctx, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	return s, c
+}
+
+func k(b byte) []byte { return bytes.Repeat([]byte{b}, 32) }
+
+// held reports whether id's tombstone holds once until has passed and the
+// sweep ran: the registration reports a not-before, and a token issued
+// before it is refused.
+func held(t *testing.T, s *dynamo.Store, c *storetest.Clock, id string, b byte, until time.Time) bool {
+	t.Helper()
+	c.Add(until.Sub(c.Now()) + 11*time.Minute)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, id, k(b)); err != nil {
+		t.Fatal(err)
+	}
+	mb, err := s.Mailbox(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mb.TokensNotBefore.IsZero() {
+		return false
+	}
+	_, err = s.Deposit(ctx, id, "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "old", TokenIssuedAt: mb.TokensNotBefore.Add(-time.Hour), TokenExpires: c.Now().Add(time.Hour)})
+	return errors.Is(err, store.ErrRevoked)
+}
+
+// A repeated deletion with a longer keep lands between Register's read
+// and its revive: the revive's guard refuses the stale keep, the
+// registration reads again, and the longer tombstone outlives a later
+// short deletion.
+func TestReviveGuardRace(t *testing.T) {
+	s, c := newMarked(t)
+	day := 24 * time.Hour
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(10*day)); err != nil {
+		t.Fatal(err)
+	}
+	long := c.Now().Add(1000 * day)
+	once := true
+	dynamo.SetBeforeRevive(s, func() {
+		if once {
+			once = false
+			if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), long); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	dynamo.SetBeforeRevive(s, nil)
+	short := c.Now().Add(time.Hour)
+	if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now(), short); err != nil {
+		t.Fatal(err)
+	}
+	if !held(t, s, c, "a", 1, c.Now().Add(500*day)) {
+		t.Fatal("the longer tombstone raised during the revive was lost")
+	}
+}
+
+// A repeated deletion of the rotation's successor id with a longer keep
+// lands between Rotate's reads and its write: the successor's guard
+// refuses the stale keep, Rotate reads again, and the longer tombstone
+// outlives a later short deletion.
+func TestRotateSuccessorGuardRace(t *testing.T) {
+	s, c := newMarked(t)
+	day := 24 * time.Hour
+	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteMailbox(ctx, "b", k(2), c.Now().Add(90*time.Second), c.Now().Add(10*day)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	long := c.Now().Add(1000 * day)
+	once := true
+	dynamo.SetBeforeRotate(s, func() {
+		if once {
+			once = false
+			if _, err := s.DeleteMailbox(ctx, "b", k(2), c.Now().Add(90*time.Second), long); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	if err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	dynamo.SetBeforeRotate(s, nil)
+	short := c.Now().Add(time.Hour)
+	if _, err := s.DeleteMailbox(ctx, "b", k(2), c.Now(), short); err != nil {
+		t.Fatal(err)
+	}
+	if !held(t, s, c, "b", 2, c.Now().Add(500*day)) {
+		t.Fatal("the longer tombstone raised during the rotation was lost")
+	}
+}
+
+// Rotating onto another key's id is a collision, not retried away.
+func TestRotateOntoAnotherKeyCollides(t *testing.T) {
+	s, _ := newMarked(t)
+	if _, _, err := s.Register(ctx, "b", k(3)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "a", "b", k(2), time.Now().Add(time.Hour)); err == nil || !strings.Contains(err.Error(), "collision") {
+		t.Fatalf("rotate onto another key's id: %v", err)
+	}
+}
+
+// retire folds an earlier, longer tomb_keep into the gsk it sets.
+func TestRetireFoldsTombKeep(t *testing.T) {
+	s, c := newMarked(t)
+	day := 24 * time.Hour
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	long := c.Now().Add(1000 * day)
+	if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), long); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + 11*time.Minute)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if g := dynamo.AccountN(s, "a", "gsk"); g < long.UnixMilli() {
+		t.Fatalf("retired with gsk %d, below the earlier tombstone %d", g, long.UnixMilli())
+	}
+}
+
+// A deleted item whose gsk passed while its tomb_keep is still ahead (a
+// state a deletion racing a re-registration can leave) isn't purged, and
+// its tokens-not-before still refuses old tokens.
+func TestSweepWaitsForTombKeep(t *testing.T) {
+	s, c := newMarked(t)
+	day := 24 * time.Hour
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	dynamo.SetAccountN(s, "a", map[string]int64{"tomb_keep": c.Now().Add(1000 * day).UnixMilli()})
+	if !held(t, s, c, "a", 1, c.Now().Add(500*day)) {
+		t.Fatal("purged while tomb_keep was still ahead")
+	}
+}

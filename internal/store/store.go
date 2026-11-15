@@ -85,6 +85,15 @@ func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Du
 	return time.Duration(v) * time.Millisecond, nil
 }
 
+// LifetimeMark implements LifetimeMarker.
+func (s *Store) LifetimeMark(ctx context.Context) (time.Duration, error) {
+	var v int64
+	if err := s.r.QueryRowContext(ctx, `SELECT lifetime_ms FROM lifetime_mark WHERE id = 1`).Scan(&v); err != nil {
+		return 0, fmt.Errorf("store: lifetime mark: %w", err)
+	}
+	return time.Duration(v) * time.Millisecond, nil
+}
+
 // WithClock overrides the clock (tests).
 func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = now } }
 
