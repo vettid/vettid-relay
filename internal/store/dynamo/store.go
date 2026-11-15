@@ -7,7 +7,7 @@
 // # Table layout (one table, pk/sk strings, TTL attribute "ttl_s")
 //
 //	pk            sk               what
-//	MB#<mailbox>  A                mailbox: pub, created, [delete_after, successor, preds, deleted, nb, gpk/gsk, tomb_keep]
+//	MB#<mailbox>  A                mailbox: pub, created, [delete_after, successor, preds, deleted, nb, gpk/gsk, tomb_keep, purging/purge_by (fence.go)]
 //	MB#<mailbox>  S                counters: msgs, bytes, blob_bytes, deny; last_id; v; dead_at; nb; rec_*
 //	MB#<mailbox>  M#<ulid>         message: sz, dep, exp, sender, jti, payload (binary)
 //	MB#<mailbox>  L#<ulid>         lease of that message: lease_until
@@ -140,6 +140,7 @@ type Store struct {
 	beforeRotate func() // tests only: runs between Rotate's reads and its write
 	beforePurge  func() // tests only: runs between the sweep's read of a tombstone and its purge
 	beforeMark   func() // tests only: runs between DeleteMailbox's read and markDeleted
+	duringPurge  func() // tests only: runs once a purge holds the fence, before it deletes
 }
 
 type cachedMailbox struct {
@@ -453,7 +454,7 @@ func (s *Store) forget(ids ...string) {
 // none for a mailbox item created new (a tombstone keeps its item, so a
 // new item means none is held).
 func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time.Time, error) {
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < maxTxAttempts; attempt++ {
 		_, err := s.cfg.DB.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: &s.cfg.Table,
 			Item: item{
@@ -509,6 +510,11 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time
 		if revived {
 			return true, nb, nil
 		}
+		// Changed since the read, or another purge holds the fence: wait
+		// for it rather than revive what it is deleting.
+		if err := backoff(ctx, attempt); err != nil {
+			return false, time.Time{}, err
+		}
 	}
 	return false, time.Time{}, errors.New("dynamo: register: mailbox kept changing (purged, deleted or retired meanwhile)")
 }
@@ -522,12 +528,19 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time
 // returns the nb the mailbox is left with, which registration reports.
 func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB time.Time, keep int64) (time.Time, bool, error) {
 	defer s.forget(id)
-	if _, err := s.purgeContents(ctx, id); err != nil {
+	now := s.now()
+	// The fence first: no other purge deletes while this one revives, and
+	// this one commits only while it holds the fence.
+	tok, ok, err := s.fence(ctx, id, deadCond, item{":p": avB(pub), ":now": avN(ms(now))})
+	if err != nil || !ok {
 		return time.Time{}, false, err
 	}
-	now := s.now()
+	if _, err := s.purgeFenced(ctx, id); err != nil {
+		s.unfence(ctx, id, tok)
+		return time.Time{}, false, err
+	}
 	setA, setS := "SET created = :now", "SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z, v = if_not_exists(v, :z) + :one"
-	valsA, valsS := item{":p": avB(pub), ":now": avN(ms(now)), ":tk": avN(keep)}, item{":z": avN(0), ":one": avN(1)}
+	valsA, valsS := item{":p": avB(pub), ":now": avN(ms(now)), ":tk": avN(keep), ":fby": avS(tok)}, item{":z": avN(0), ":one": avN(1)}
 	nb := seenNB
 	if setNB.After(nb) {
 		nb = setNB
@@ -546,7 +559,7 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 	// deposits are checked against.
 	// tomb_keep only grows: a gsk or tomb_keep raised since the read fails
 	// this, and the registration reads again.
-	cond := "pub = :p AND (attribute_exists(deleted) OR delete_after <= :now) AND " +
+	cond := "purge_by = :fby AND pub = :p AND (attribute_exists(deleted) OR delete_after <= :now) AND " +
 		"(attribute_not_exists(gsk) OR gsk <= :tk) AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :tk) AND "
 	if seenNB.IsZero() {
 		cond += "attribute_not_exists(nb)"
@@ -554,14 +567,14 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 		cond += "nb = :seen"
 		valsA[":seen"] = avN(ms(seenNB))
 	}
-	_, err := s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+	_, err = s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName: &s.cfg.Table,
 			Key:       key(mbPK(id), skAccount),
 			// tomb_keep keeps the tombstone's expiry (heldKeep, and this
 			// removal's), as gsk leaves the sweep index here, so a later
 			// deletion never shortens it (§6.10).
-			UpdateExpression:          aws.String(setA + ", tomb_keep = :tk REMOVE deleted, delete_after, successor, preds, gpk, gsk"),
+			UpdateExpression:          aws.String(setA + ", tomb_keep = :tk REMOVE deleted, delete_after, successor, preds, gpk, gsk, purging, purge_by"),
 			ConditionExpression:       aws.String(cond),
 			ExpressionAttributeValues: valsA,
 		}},
@@ -575,6 +588,7 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 	if err == nil {
 		return nb.Truncate(time.Millisecond), true, nil
 	}
+	s.unfence(ctx, id, tok)
 	if r := txReasons(err); r != nil && (reasonCode(r, 0) == "ConditionalCheckFailed" || isConflict(r)) {
 		return time.Time{}, false, nil
 	}
@@ -631,11 +645,7 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 		if err != nil {
 			return err
 		}
-		if len(succ) > 0 && dead(parseMailbox(succ), now) {
-			if _, err := s.purgeContents(ctx, newID); err != nil {
-				return err
-			}
-		}
+		succDead := len(succ) > 0 && dead(parseMailbox(succ), now)
 		// The successor's gsk is removed below: its tombstone's expiry
 		// stays as tomb_keep, which only grows (§6.10).
 		succKeep := heldKeep(succ)
@@ -670,6 +680,48 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			succNBCond = " AND (attribute_not_exists(nb) OR nb <= :snb)"
 			succValsA[":snb"] = avN(succNB)
 		}
+		// A live or new successor must not be under a purge by the write;
+		// a dead one is emptied under the fence (taken now, after the
+		// reads), and the write requires it still held.
+		succFence, succValsF, tok := " AND attribute_not_exists(purge_by)", item{}, ""
+		if succDead {
+			if subtle.ConstantTimeCompare(getB(succ, "pub"), newPub) != 1 {
+				return fmt.Errorf("store: mailbox id collision")
+			}
+			var fok bool
+			tok, fok, err = s.fence(ctx, newID, deadCond, item{":p": avB(newPub), ":now": avN(ms(now))})
+			if err != nil {
+				return err
+			}
+			if !fok { // changed since the read, or another purge holds it
+				if attempt >= maxTxAttempts {
+					return fmt.Errorf("dynamo: rotate: %w", errPurging)
+				}
+				if err := backoff(ctx, attempt); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := s.purgeFenced(ctx, newID); err != nil {
+				s.unfence(ctx, newID, tok)
+				return err
+			}
+			succFence, succValsF = " AND purge_by = :fby", item{":fby": avS(tok)}
+		}
+		// A dead successor becomes a fresh mailbox, as a revive leaves it:
+		// new counters and version, no links of the mailbox it was.
+		succExprA := "SET pub = if_not_exists(pub, :p), created = if_not_exists(created, :now), tomb_keep = :tk" + succSetA +
+			" ADD preds :old REMOVE delete_after, deleted, gpk, gsk"
+		if succDead {
+			succExprA = "SET created = :now, tomb_keep = :tk, preds = :old" + succSetA +
+				" REMOVE delete_after, deleted, successor, gpk, gsk, purging, purge_by"
+			succSetS = "SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z, v = if_not_exists(v, :z) + :one"
+			if succNB > 0 {
+				succSetS += ", nb = :snb"
+			}
+			succSetS += " REMOVE dead_at"
+			succValsS[":z"], succValsS[":one"] = avN(0), avN(1)
+		}
 		if s.beforeRotate != nil {
 			s.beforeRotate()
 		}
@@ -695,13 +747,13 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			{Update: &types.Update{
 				TableName:        &s.cfg.Table,
 				Key:              key(mbPK(newID), skAccount),
-				UpdateExpression: aws.String("SET pub = if_not_exists(pub, :p), created = if_not_exists(created, :now), tomb_keep = :tk" + succSetA + " ADD preds :old REMOVE delete_after, deleted, gpk, gsk"),
+				UpdateExpression: aws.String(succExprA),
 				ConditionExpression: aws.String("(attribute_not_exists(pk) OR pub = :p) AND " +
-					"(attribute_not_exists(gsk) OR gsk <= :tk) AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :tk)" + succNBCond),
-				ExpressionAttributeValues: withVals(item{
+					"(attribute_not_exists(gsk) OR gsk <= :tk) AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :tk)" + succNBCond + succFence),
+				ExpressionAttributeValues: withVals(withVals(item{
 					":p": avB(newPub), ":now": avN(ms(now)), ":old": &types.AttributeValueMemberSS{Value: []string{oldID}},
 					":tk": avN(succKeep),
-				}, succValsA),
+				}, succValsA), succValsF),
 			}},
 			{Update: &types.Update{
 				TableName:                 &s.cfg.Table,
@@ -718,6 +770,9 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 		}})
 		if err == nil {
 			return nil
+		}
+		if tok != "" {
+			s.unfence(ctx, newID, tok)
 		}
 		r := txReasons(err)
 		if r == nil {

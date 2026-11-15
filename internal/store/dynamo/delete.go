@@ -88,13 +88,21 @@ func (s *Store) tombstone(ctx context.Context, id string, pub []byte, prevNB int
 			return err
 		}
 	}
-	if _, err := s.purgeContents(ctx, id); err != nil {
+	// The contents go under the fence (fence.go). If another purge holds
+	// it, that purge empties the mailbox; if the key registered again
+	// since, there is nothing of this deletion's left to empty.
+	tok, ok, err := s.fence(ctx, id, "pub = :p AND attribute_exists(deleted)", item{":p": avB(pub)})
+	if err != nil || !ok {
+		return err
+	}
+	defer s.unfence(ctx, id, tok)
+	if _, err := s.purgeFenced(ctx, id); err != nil {
 		return err
 	}
 	// Zero the counters after the purge, so that acks racing it cannot
 	// leave them negative for a later re-registration (which zeroes them
 	// again anyway).
-	_, err := s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+	_, err = s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.cfg.Table,
 		Key:                       key(mbPK(id), skStats),
 		UpdateExpression:          aws.String("SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z"),

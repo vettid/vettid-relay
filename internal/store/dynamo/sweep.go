@@ -78,11 +78,20 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 	if s.beforePurge != nil {
 		s.beforePurge()
 	}
-	// The contents first; the account and counters items (which carry the
-	// tombstone and its nb) together, under the condition, so a deletion or
-	// re-registration since the read keeps both (§6.10).
-	msgs, err = s.purgeItems(ctx, mailbox, func(sk string) bool { return sk != skAccount && sk != skStats })
+	// The fence first, under the same condition: a re-registration since
+	// the read (the mailbox live again) fails it, and none can revive the
+	// mailbox while its contents go (fence.go).
+	due := item{":due": avS(dueValue), ":cut": avN(cutoff)}
+	tok, ok, err := s.fence(ctx, mailbox, "gpk = :due AND gsk <= :cut AND attribute_exists(deleted) AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :cut)", due)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	// The contents; then the account and counters items (which carry the
+	// tombstone and its nb) together, under the condition and the fence, so
+	// a deletion since the read keeps both (§6.10).
+	msgs, err = s.purgeFenced(ctx, mailbox)
 	if err != nil {
+		s.unfence(ctx, mailbox, tok)
 		return 0, false, err
 	}
 	_, err = s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
@@ -92,11 +101,14 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 			// Nor while a tomb_keep is still ahead: a writer that set gsk
 			// from an older read can't end a tombstone the re-registration
 			// kept.
-			ConditionExpression:       aws.String("gpk = :due AND gsk <= :cut AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :cut)"),
-			ExpressionAttributeValues: item{":due": avS(dueValue), ":cut": avN(cutoff)},
+			ConditionExpression:       aws.String("purge_by = :fby AND gpk = :due AND gsk <= :cut AND (attribute_not_exists(tomb_keep) OR tomb_keep <= :cut)"),
+			ExpressionAttributeValues: item{":due": avS(dueValue), ":cut": avN(cutoff), ":fby": avS(tok)},
 		}},
 		{Delete: &types.Delete{TableName: &s.cfg.Table, Key: key(mbPK(mailbox), skStats)}},
 	}})
+	if err != nil {
+		s.unfence(ctx, mailbox, tok)
+	}
 	if r := txReasons(err); r != nil {
 		return msgs, false, nil // changed since the read; the next sweep looks again
 	}
@@ -114,8 +126,14 @@ func (s *Store) retire(ctx context.Context, mailbox string, it item, cutoff int6
 	if err != nil {
 		return 0, false, err
 	}
-	msgs, err := s.purgeContents(ctx, mailbox)
+	tok, ok, err := s.fence(ctx, mailbox, "gpk = :due AND gsk <= :cut AND attribute_not_exists(deleted)",
+		item{":due": avS(dueValue), ":cut": avN(cutoff)})
+	if err != nil || !ok {
+		return 0, false, err // !ok: revived, deleted or being purged since the read
+	}
+	msgs, err := s.purgeFenced(ctx, mailbox)
 	if err != nil {
+		s.unfence(ctx, mailbox, tok)
 		return 0, false, err
 	}
 	nb, keep := p.Times(s.now())
@@ -127,10 +145,10 @@ func (s *Store) retire(ctx context.Context, mailbox string, it item, cutoff int6
 		{Update: &types.Update{
 			TableName:           &s.cfg.Table,
 			Key:                 key(mbPK(mailbox), skAccount),
-			UpdateExpression:    aws.String("SET deleted = :now, nb = :nb, gsk = :keep REMOVE preds"),
-			ConditionExpression: aws.String("gpk = :due AND gsk <= :cut AND attribute_not_exists(deleted)"),
+			UpdateExpression:    aws.String("SET deleted = :now, nb = :nb, gsk = :keep REMOVE preds, purging, purge_by"),
+			ConditionExpression: aws.String("purge_by = :fby AND gpk = :due AND gsk <= :cut AND attribute_not_exists(deleted)"),
 			ExpressionAttributeValues: item{":now": avN(ms(s.now())), ":nb": avN(nbv), ":keep": avN(keepv),
-				":due": avS(dueValue), ":cut": avN(cutoff)},
+				":due": avS(dueValue), ":cut": avN(cutoff), ":fby": avS(tok)},
 		}},
 		{Update: &types.Update{
 			TableName:                 &s.cfg.Table,
@@ -139,13 +157,17 @@ func (s *Store) retire(ctx context.Context, mailbox string, it item, cutoff int6
 			ExpressionAttributeValues: item{":zero": avN(0), ":nb": avN(nbv)},
 		}},
 	}})
+	if err != nil {
+		s.unfence(ctx, mailbox, tok)
+	}
 	if r := txReasons(err); r != nil {
-		return msgs, false, nil // revived or retired meanwhile; the next sweep looks again
+		return msgs, false, nil // deleted meanwhile; the next sweep looks again
 	}
 	return msgs, err == nil, err
 }
 
-// purgeContents deletes what a mailbox holds — messages, leases, denylist,
+// purgeContents deletes what a mailbox holds (callers hold the fence:
+// purgeFenced) — messages, leases, denylist,
 // token counters, consumed open tokens, blobs (with their bodies) and the
 // claims it created — and keeps the A and S items (a deletion's
 // tombstone).

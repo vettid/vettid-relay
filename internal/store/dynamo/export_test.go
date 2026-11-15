@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"context"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 
@@ -19,6 +20,44 @@ func SetBeforePurge(s *Store, f func()) { s.beforePurge = f }
 // SetBeforeMark sets a hook between DeleteMailbox's read and markDeleted
 // (tests only).
 func SetBeforeMark(s *Store, f func()) { s.beforeMark = f }
+
+// SetDuringPurge sets a hook that runs once a purge holds the fence,
+// before it deletes (tests only).
+func SetDuringPurge(s *Store, f func()) { s.duringPurge = f }
+
+// SetFence puts a purge fence on id's account item, taken at at (tests
+// only): a purge that holds it, or one that died.
+func SetFence(s *Store, id string, at time.Time) {
+	if _, err := s.cfg.DB.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
+		TableName: &s.cfg.Table, Key: key(mbPK(id), skAccount),
+		UpdateExpression:          aws.String("SET purging = :t, purge_by = :b"),
+		ExpressionAttributeValues: item{":t": avN(ms(at)), ":b": avS("other")},
+	}); err != nil {
+		panic(err)
+	}
+}
+
+// AccountHas reports whether id's account item has attr (tests only).
+func AccountHas(s *Store, id, attr string) bool {
+	it, err := s.getAccount(context.Background(), id)
+	if err != nil {
+		panic(err)
+	}
+	_, ok := it[attr]
+	return ok
+}
+
+// StatsN reads a number attribute of a mailbox's counters item (tests
+// only).
+func StatsN(s *Store, id, attr string) int64 {
+	out, err := s.cfg.DB.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: &s.cfg.Table, Key: key(mbPK(id), skStats), ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		panic(err)
+	}
+	return getN0(out.Item, attr)
+}
 
 // SetBeforeRotate sets a hook that runs between Rotate's reads and its
 // write (tests only).

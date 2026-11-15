@@ -523,12 +523,19 @@ func TestSweepPurgeRace(t *testing.T) {
 			}
 		}
 	})
-	if _, err := s.Sweep(ctx); err != nil {
+	st, err := s.Sweep(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
 	dynamo.SetBeforePurge(s, nil)
+	if st.Mailboxes != 0 {
+		t.Fatalf("a refused purge counted as purged: %+v", st)
+	}
 	if !dynamo.StatsExists(s, "a") {
 		t.Fatal("the refused purge still removed the counters item (and its nb)")
+	}
+	if !dynamo.AccountHas(s, "a", "deleted") || dynamo.AccountN(s, "a", "gsk") < c.Now().Add(999*day).UnixMilli() {
+		t.Fatalf("after the refused purge: deleted %v, gsk %d", dynamo.AccountHas(s, "a", "deleted"), dynamo.AccountN(s, "a", "gsk"))
 	}
 	if !held(t, s, c, "a", 1, c.Now().Add(500*day)) {
 		t.Fatal("the sweep purged a tombstone a deletion raised during it")
@@ -547,7 +554,10 @@ func TestMarkDeletedGuardRace(t *testing.T) {
 	dynamo.SetBeforeMark(s, func() { dynamo.SetAccountN(s, "a", map[string]int64{"tomb_keep": high}) })
 	_, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour))
 	dynamo.SetBeforeMark(s, nil)
-	if err == nil && dynamo.AccountN(s, "a", "gsk") < high {
+	switch {
+	case err != nil && !strings.Contains(err.Error(), "ConditionalCheckFailed"):
+		t.Fatalf("the deletion failed, but not as the guard's refusal: %v", err)
+	case err == nil && dynamo.AccountN(s, "a", "gsk") < high:
 		t.Fatalf("deleted with gsk %d below the tomb_keep %d raised meanwhile", dynamo.AccountN(s, "a", "gsk"), high)
 	}
 }
@@ -667,5 +677,282 @@ func TestRotateKeepsRaisedNB(t *testing.T) {
 	}
 	if _, err := s.Deposit(ctx, "b", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "mid", TokenIssuedAt: raised.Add(-time.Second), TokenExpires: c.Now().Add(time.Hour)}); !errors.Is(err, store.ErrRevoked) {
 		t.Fatalf("a token issued before the raised not-before: %v", err)
+	}
+}
+
+// dueTombstone registers id (key b), deletes it with a 1-hour keep and
+// moves the clock until its tombstone is due for the sweep.
+func dueTombstone(t *testing.T, s *dynamo.Store, c *storetest.Clock, id string, b byte) {
+	t.Helper()
+	if _, _, err := s.Register(ctx, id, k(b)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteMailbox(ctx, id, k(b), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + 11*time.Minute)
+}
+
+// fill gives a live mailbox contents a purge must not touch: a message
+// and a denylist entry.
+func fill(t *testing.T, s *dynamo.Store, c *storetest.Clock, id string) {
+	t.Helper()
+	if _, err := s.Deposit(ctx, id, "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "m1", TokenIssuedAt: c.Now(), TokenExpires: c.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDenylist(ctx, id, []store.DenyEntry{{Kind: "jti", Value: "J"}}, c.Now().Add(time.Hour), 10); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// filled reports whether id still has what fill gave it.
+func filled(t *testing.T, s *dynamo.Store, id string) bool {
+	t.Helper()
+	denied, err := s.IsDenied(ctx, id, "J", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, _, err := s.Collect(ctx, id, 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return denied && len(msgs) == 1
+}
+
+// The key registers again between the sweep's read of its expired
+// tombstone and the purge, and the revived mailbox gets contents: the
+// sweep leaves them (its revocation list above all) alone.
+func TestSweepSparesRevivedMailbox(t *testing.T) {
+	s, c := newMarked(t)
+	dueTombstone(t, s, c, "a", 1)
+	once := true
+	dynamo.SetBeforePurge(s, func() {
+		if once {
+			once = false
+			if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+				t.Fatal(err)
+			}
+			fill(t, s, c, "a")
+		}
+	})
+	st, err := s.Sweep(ctx)
+	dynamo.SetBeforePurge(s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mailboxes != 0 || !filled(t, s, "a") {
+		t.Fatalf("the sweep purged the revived mailbox: %+v, contents kept %v", st, filled(t, s, "a"))
+	}
+}
+
+// While the sweep purges a tombstone, neither a registration nor a
+// rotation onto it revives it (each gives up and is retried); after the
+// purge, both work.
+func TestNoReviveDuringPurge(t *testing.T) {
+	s, c := newMarked(t)
+	dueTombstone(t, s, c, "a", 1)
+	if _, _, err := s.Register(ctx, "x", k(3)); err != nil {
+		t.Fatal(err)
+	}
+	once := true
+	dynamo.SetDuringPurge(s, func() {
+		if once {
+			once = false
+			if _, _, err := s.Register(ctx, "a", k(1)); err == nil {
+				t.Error("a registration revived the mailbox the sweep is purging")
+			}
+			if err := s.Rotate(ctx, "x", "a", k(1), c.Now().Add(time.Hour)); err == nil {
+				t.Error("a rotation revived the mailbox the sweep is purging")
+			}
+		}
+	})
+	st, err := s.Sweep(ctx)
+	dynamo.SetDuringPurge(s, nil)
+	if err != nil || st.Mailboxes != 1 {
+		t.Fatalf("sweep: %+v %v", st, err)
+	}
+	if once {
+		t.Fatal("the purge hook never ran")
+	}
+	if dynamo.StatsExists(s, "a") || dynamo.AccountHas(s, "a", "pub") {
+		t.Fatal("the purge left the account or counters item")
+	}
+	if err := s.Rotate(ctx, "x", "a", k(1), c.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("rotation after the purge: %v", err)
+	}
+	fill(t, s, c, "a")
+	if !filled(t, s, "a") {
+		t.Fatal("the mailbox after the purge")
+	}
+}
+
+// A registration waits for a deletion's purge in the same way.
+func TestNoReviveDuringDeletionPurge(t *testing.T) {
+	s, c := newMarked(t)
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	once := true
+	dynamo.SetDuringPurge(s, func() {
+		if once {
+			once = false
+			if _, _, err := s.Register(ctx, "a", k(1)); err == nil {
+				t.Error("a registration revived the mailbox its deletion is purging")
+			}
+		}
+	})
+	_, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour))
+	dynamo.SetDuringPurge(s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if once {
+		t.Fatal("the purge hook never ran")
+	}
+	if dynamo.AccountHas(s, "a", "purge_by") {
+		t.Fatal("the deletion left its fence")
+	}
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatalf("registration after the deletion: %v", err)
+	}
+}
+
+// A fence older than the lease (its purge died) is taken over; a fresh
+// one is waited for.
+func TestStaleFence(t *testing.T) {
+	s, c := newMarked(t)
+	for _, id := range []string{"a", "b", "d"} {
+		if _, _, err := s.Register(ctx, id, k(1)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.DeleteMailbox(ctx, id, k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dynamo.SetFence(s, "a", c.Now().Add(-6*time.Minute))
+	dynamo.SetFence(s, "b", c.Now().Add(-time.Minute))
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatalf("a dead purge's fence held a registration: %v", err)
+	}
+	if dynamo.AccountHas(s, "a", "purge_by") {
+		t.Fatal("the revive left the fence")
+	}
+	if _, _, err := s.Register(ctx, "b", k(1)); err == nil {
+		t.Fatal("a registration revived a mailbox under a live fence")
+	}
+	c.Add(5 * time.Minute)
+	if _, _, err := s.Register(ctx, "b", k(1)); err != nil {
+		t.Fatalf("the fence after its lease: %v", err)
+	}
+	// The sweep carries on a dead purge of a due tombstone.
+	c.Add(time.Hour + 11*time.Minute)
+	dynamo.SetFence(s, "d", c.Now().Add(-6*time.Minute))
+	if st, err := s.Sweep(ctx); err != nil || st.Mailboxes != 1 || dynamo.AccountHas(s, "d", "pub") {
+		t.Fatalf("the sweep after a dead purge: %+v %v", st, err)
+	}
+}
+
+// Rotating onto a same-key id past its grace makes it a fresh mailbox,
+// as a registration would: counters reset, version raised, no links of
+// the mailbox it was, no fence left.
+func TestRotateOntoPastGraceResets(t *testing.T) {
+	s, c := newMarked(t)
+	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Deposit(ctx, "b", "s", []byte("x"), 3*time.Hour, store.Limits{TokenJTI: "m0", TokenIssuedAt: c.Now(), TokenExpires: c.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	v := dynamo.StatsN(s, "b", "v")
+	if dynamo.StatsN(s, "b", "msgs") != 1 || !dynamo.AccountHas(s, "b", "successor") {
+		t.Fatal("setup: b holds a message and names its successor")
+	}
+	c.Add(time.Hour + time.Minute)
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if n := dynamo.StatsN(s, "b", "msgs"); n != 0 {
+		t.Fatalf("b's message count %d after its removal", n)
+	}
+	if dynamo.StatsN(s, "b", "v") <= v {
+		t.Fatal("b's version not raised")
+	}
+	if dynamo.AccountHas(s, "b", "successor") || dynamo.AccountHas(s, "b", "purge_by") {
+		t.Fatal("b keeps its old successor link or the fence")
+	}
+	if msgs, _, err := s.Collect(ctx, "b", 10, time.Minute); err != nil || len(msgs) != 0 {
+		t.Fatalf("b's old messages: %d %v", len(msgs), err)
+	}
+}
+
+// While the sweep retires a rotated-away mailbox past its grace, its key
+// can't register it again; after the retire, it can, and the tombstone
+// holds.
+func TestNoReviveDuringRetire(t *testing.T) {
+	s, c := newMarked(t)
+	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour + 11*time.Minute)
+	once := true
+	dynamo.SetDuringPurge(s, func() {
+		if once {
+			once = false
+			if _, _, err := s.Register(ctx, "b", k(2)); err == nil {
+				t.Error("a registration revived the mailbox the sweep is retiring")
+			}
+		}
+	})
+	st, err := s.Sweep(ctx)
+	dynamo.SetDuringPurge(s, nil)
+	if err != nil || st.Mailboxes != 1 || once {
+		t.Fatalf("sweep: %+v %v (hook ran: %v)", st, err, !once)
+	}
+	if !dynamo.AccountHas(s, "b", "deleted") || dynamo.AccountHas(s, "b", "purge_by") {
+		t.Fatal("after the retire: not a tombstone, or the fence left")
+	}
+	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
+		t.Fatalf("registration after the retire: %v", err)
+	}
+}
+
+// The successor was live at Rotate's read; before its write, the grace
+// ends and a purge takes the fence. Rotate doesn't revive it under the
+// purge: it reads again and waits (here, until it gives up).
+func TestRotateWaitsForFenceTakenAfterRead(t *testing.T) {
+	s, c := newMarked(t)
+	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rotate(ctx, "b", "y", k(3), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, "x", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	once := true
+	dynamo.SetBeforeRotate(s, func() {
+		if once {
+			once = false
+			c.Add(time.Hour + 11*time.Minute)
+			dynamo.SetFence(s, "b", c.Now())
+		}
+	})
+	err := s.Rotate(ctx, "x", "b", k(2), c.Now().Add(2*time.Hour))
+	dynamo.SetBeforeRotate(s, nil)
+	if err == nil {
+		t.Fatal("the rotation revived its successor under a purge's fence")
+	}
+	if dynamo.AccountN(s, "b", "purging") != c.Now().UnixMilli() {
+		t.Fatal("the purge's fence was taken or removed")
 	}
 }
