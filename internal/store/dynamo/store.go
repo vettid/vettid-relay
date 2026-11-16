@@ -217,10 +217,14 @@ func markFrom(it item) (time.Duration, error) {
 	if v, ok := getN(it, "life_ms"); ok {
 		return store.MarkFromMillis(v)
 	}
-	if n, ok := it["life_ms"].(*types.AttributeValueMemberN); ok {
-		return 0, store.MarkUnreadable(n.Value)
+	switch v := it["life_ms"].(type) {
+	case *types.AttributeValueMemberN:
+		return 0, store.MarkUnreadable(v.Value)
+	case *types.AttributeValueMemberS:
+		return 0, store.MarkUnreadable(fmt.Sprintf("%q, a string; it must be a Number", v.Value))
+	default:
+		return 0, store.MarkUnreadable("not a Number; it must be a Number")
 	}
-	return 0, store.MarkUnreadable(fmt.Sprintf("a %T", it["life_ms"]))
 }
 
 // withVals returns it with o's entries added.

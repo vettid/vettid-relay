@@ -157,7 +157,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 	reg := metrics.New()
 	openCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	st, err := openStore(openCtx, &cfg)
+	st, err := openStore(openCtx, &cfg, log)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}

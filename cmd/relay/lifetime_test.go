@@ -31,7 +31,7 @@ func TestOpenStoreKeepsLifetimeMark(t *testing.T) {
 		cfg := config.Defaults()
 		cfg.DBPath = path
 		cfg.MaxTokenLifetime = max
-		st, err := openStore(ctx, &cfg)
+		st, err := openStore(ctx, &cfg, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -74,13 +74,13 @@ func (f *failingMark) LifetimeMark(context.Context) (time.Duration, error) {
 func TestApplyLifetimeMarkFailsClosed(t *testing.T) {
 	cfg := config.Defaults()
 	st := &failingMark{}
-	if err := applyLifetimeMark(context.Background(), st, &cfg); err == nil {
+	if err := applyLifetimeMark(context.Background(), st, &cfg, nil); err == nil {
 		t.Fatal("started with a failing mark")
 	}
 	if st.set || cfg.RetentionLifetime != 0 {
 		t.Fatalf("policy set %v, retention %s", st.set, cfg.RetentionLifetime)
 	}
-	if err := applyLifetimeMark(context.Background(), struct{ store.Backend }{}, &cfg); err == nil {
+	if err := applyLifetimeMark(context.Background(), struct{ store.Backend }{}, &cfg, nil); err == nil {
 		t.Fatal("started with a store that keeps no mark")
 	}
 }
@@ -152,7 +152,7 @@ func TestOpenStoreRefusesMarkOutOfRange(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "relay.db")
 		cfg := config.Defaults()
 		cfg.DBPath = path
-		st, err := openStore(ctx, &cfg)
+		st, err := openStore(ctx, &cfg, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -169,11 +169,49 @@ func TestOpenStoreRefusesMarkOutOfRange(t *testing.T) {
 		db.Close()
 		cfg = config.Defaults()
 		cfg.DBPath = path
-		if st, err := openStore(ctx, &cfg); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
+		if st, err := openStore(ctx, &cfg, nil); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
 			if st != nil {
 				st.Close()
 			}
 			t.Fatalf("started with the mark %s: %v", raw, err)
+		}
+	}
+}
+
+// A start that replaces an invalid mark smaller than its limits (negative,
+// a fraction) logs it at WARN with the value it had; a valid one, none.
+func TestOpenStoreWarnsReplacedMark(t *testing.T) {
+	ctx := context.Background()
+	for raw, want := range map[string]bool{"-1": true, "1.5": true, "1000": false} {
+		path := filepath.Join(t.TempDir(), "relay.db")
+		cfg := config.Defaults()
+		cfg.DBPath = path
+		st, err := openStore(ctx, &cfg, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE lifetime_mark SET lifetime_ms = ? WHERE id = 1`, raw); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		var buf bytes.Buffer
+		cfg = config.Defaults()
+		cfg.DBPath = path
+		st, err = openStore(ctx, &cfg, slog.New(slog.NewJSONHandler(&buf, nil)))
+		if err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		st.Close()
+		got := strings.Contains(buf.String(), "stored lifetime mark was invalid")
+		if got != want || (want && !strings.Contains(buf.String(), raw)) {
+			t.Fatalf("%s: warned %v, want %v: %s", raw, got, want, buf.String())
 		}
 	}
 }

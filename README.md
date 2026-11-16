@@ -668,21 +668,27 @@ implementation chooses as follows:
   repeated deletion never shortens a tombstone. So that a mistyped limit
   can't raise the mark, a limit over 400 days is refused at start unless
   `RELAY_ALLOW_LONG_TOKEN_LIFETIME` is `true`, and one over 100 years
-  always is (the retention arithmetic would overflow). A mark below zero
-  or over 100 years is never stored. A stored one (raised before this
-  check, or edited by hand), or one that isn't a whole number of
-  milliseconds, is refused wherever it is read: the relay doesn't start, and deletions,
+  always is (the retention arithmetic would overflow). Those two limits
+  are the config's, checked at start before the store opens; the store
+  itself enforces only its own bound: a mark below zero or over 100
+  years is never stored. A stored one (raised before this check, or
+  edited by hand), or one that isn't a whole number of milliseconds, is
+  refused wherever it is read: the relay doesn't start, and deletions,
   revocations and the removal of rotated mailboxes fail, until it is
-  reset. A stored mark over 400 days and over the limits configured now
+  reset. A start replaces a smaller one (negative, a fraction) with its
+  limits, and logs the old value at WARN. A stored mark over 400 days and over the limits configured now
   is logged at WARN at start.
   - **Resetting the mark** (after a mistaken huge limit): set the
-    `lifetime_mark` row (SQLite) or the `META`/`LIFETIME` item's `life_ms`
-    (DynamoDB), in milliseconds, to the largest limit under which
-    unexpired tokens can still exist, never below the larger of the two
-    limits configured now. For example: a 400-day limit, then a one-day
-    typo of 4000 days, then limits lowered to 30 days: reset to 400 days,
-    not 30, or tokens minted under the 400-day limit lose their
-    retention. Lower it further only once every token minted under the
+    `lifetime_mark` row (SQLite; stop the relay first) or the
+    `META`/`LIFETIME` item's `life_ms` (DynamoDB; it must stay a Number),
+    in milliseconds, to the largest limit under which unexpired tokens can
+    still exist, never below the larger of the two limits configured now.
+    For example: a 400-day limit, then a one-day typo of 4000 days, then
+    limits lowered to 30 days. If no owner registered while 4000 days
+    was advertised, reset to 400 days, not 30, or tokens minted under the
+    400-day limit lose their retention. If one did, its tokens may live
+    4000 days: keep the mark at 4000 days until they can have expired,
+    or a revoked one's denylist entry lapses early. Lower it further only once every token minted under the
     larger limit has expired; earlier, revoked or deleted keys' tokens
     could work again. Before you restart, make sure no task still runs
     with the larger limit and `RELAY_ALLOW_LONG_TOKEN_LIFETIME`, or with a

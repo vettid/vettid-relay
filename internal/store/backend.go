@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -134,16 +135,27 @@ const MaxLifetimeMark = 100 * 365 * 24 * time.Hour
 // is reset (README, "Resetting the mark").
 func MarkFromMillis(ms int64) (time.Duration, error) {
 	if ms < 0 || ms > MaxLifetimeMark.Milliseconds() {
-		return 0, fmt.Errorf("store: the stored lifetime mark (%d ms) is outside 0 to %s: reset it (README, \"Resetting the mark\")", ms, MaxLifetimeMark)
+		return 0, markError(fmt.Sprintf("store: the stored lifetime mark (%d ms) is outside 0 to %s: reset it (README, \"Resetting the mark\")", ms, MaxLifetimeMark))
 	}
 	return time.Duration(ms) * time.Millisecond, nil
 }
 
+// ErrMarkInvalid matches (errors.Is) the error for a stored lifetime mark
+// that can't be used: out of range or not a whole number of ms.
+var ErrMarkInvalid = errors.New("store: the stored lifetime mark is invalid")
+
+// markError is an invalid-mark error with its own message.
+type markError string
+
+func (e markError) Error() string        { return string(e) }
+func (e markError) Is(target error) bool { return target == ErrMarkInvalid }
+
 // CheckRaise refuses to store a lifetime mark below zero or over
-// MaxLifetimeMark: stored,
-// it would be refused wherever it is read, and every relay on the store
-// would stop until it is reset by hand. The stores call it before they
-// write; the relay validates its limits before that.
+// MaxLifetimeMark: stored, it would be refused wherever it is read, and
+// every relay on the store would stop until it is reset by hand. The
+// stores call it before they write. It is the only bound the store
+// enforces: the 400-day cap and RELAY_ALLOW_LONG_TOKEN_LIFETIME are the
+// config's, checked at start before the store opens.
 func CheckRaise(d time.Duration) error {
 	if d < 0 || d > MaxLifetimeMark {
 		return fmt.Errorf("store: a lifetime mark of %s is outside 0 to %s: not stored", d, MaxLifetimeMark)
@@ -155,7 +167,7 @@ func CheckRaise(d time.Duration) error {
 // whole number of milliseconds in int64 (stored as text or a fraction, or
 // too large, by hand): like one out of range, it must be reset.
 func MarkUnreadable(stored string) error {
-	return fmt.Errorf("store: the stored lifetime mark (%s) isn't a whole number of ms: reset it (README, \"Resetting the mark\")", stored)
+	return markError(fmt.Sprintf("store: the stored lifetime mark (%s) isn't a whole number of ms: reset it (README, \"Resetting the mark\")", stored))
 }
 
 // WithMark returns p with its retention at least what the lifetime mark

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,12 +25,12 @@ import (
 // It then raises the store's high-water mark of the advertised token
 // lifetimes to the current limits, sets cfg.RetentionLifetime to the mark,
 // and the store's tombstone policy from it (§6.10).
-func openStore(ctx context.Context, cfg *config.Config) (store.Backend, error) {
+func openStore(ctx context.Context, cfg *config.Config, log *slog.Logger) (store.Backend, error) {
 	st, err := openBackend(ctx, *cfg)
 	if err != nil {
 		return nil, err
 	}
-	if err := applyLifetimeMark(ctx, st, cfg); err != nil {
+	if err := applyLifetimeMark(ctx, st, cfg, log); err != nil {
 		st.Close()
 		return nil, err
 	}
@@ -38,14 +40,21 @@ func openStore(ctx context.Context, cfg *config.Config) (store.Backend, error) {
 // applyLifetimeMark raises st's lifetime mark to cfg's limits, sets
 // cfg.RetentionLifetime to it and st's tombstone policy from it. A store
 // without a mark, or a failing one, is an error: the relay doesn't start.
-func applyLifetimeMark(ctx context.Context, st store.Backend, cfg *config.Config) error {
+func applyLifetimeMark(ctx context.Context, st store.Backend, cfg *config.Config, log *slog.Logger) error {
 	m, ok := st.(store.LifetimeMarker)
 	if !ok {
 		return fmt.Errorf("store %s keeps no lifetime mark", cfg.Store)
 	}
+	_, before := m.LifetimeMark(ctx)
 	mark, err := m.RaiseLifetimeMark(ctx, max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime))
 	if err != nil {
 		return fmt.Errorf("lifetime mark: %w", err)
+	}
+	// An invalid mark smaller than the limits (negative, a fraction) is
+	// replaced by the raise: it leaves a trace, with the value it had.
+	if errors.Is(before, store.ErrMarkInvalid) && log != nil {
+		log.WarnContext(lifecycle, "stored lifetime mark was invalid; this start replaced it with its limits",
+			"stored", before.Error(), "mark", mark.String())
 	}
 	cfg.RetentionLifetime = mark
 	m.SetTombstones(api.TombstonePolicy(*cfg))

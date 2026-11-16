@@ -107,10 +107,7 @@ func markFromColumn(v any) (time.Duration, error) {
 	if ms, ok := v.(int64); ok {
 		return MarkFromMillis(ms)
 	}
-	if b, ok := v.([]byte); ok {
-		return 0, MarkUnreadable(fmt.Sprintf("%q", b))
-	}
-	return 0, MarkUnreadable(fmt.Sprintf("%v", v))
+	return 0, MarkUnreadable(fmt.Sprintf("%q", fmt.Sprint(v)))
 }
 
 // WithClock overrides the clock (tests).
@@ -396,7 +393,10 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 // matching where, removed at now.
 func (s *Store) tombstoneRotated(ctx context.Context, tx *sql.Tx, now time.Time, where string, arg any) error {
 	// The policy raised to the stored lifetime mark (§6.10), as the
-	// deletions and revocations the api makes are.
+	// deletions and revocations the api makes are. No row reads as 0,
+	// which only keeps s.tomb: the relay always stores a mark at start
+	// and sets s.tomb from it, and no row is ever deleted. (A store opened
+	// without a start, in the store's own tests, has none.)
 	var mark any
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(lifetime_ms), 0) FROM lifetime_mark`).Scan(&mark); err != nil {
 		return err
