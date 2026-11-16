@@ -668,10 +668,10 @@ implementation chooses as follows:
   repeated deletion never shortens a tombstone. So that a mistyped limit
   can't raise the mark, a limit over 400 days is refused at start unless
   `RELAY_ALLOW_LONG_TOKEN_LIFETIME` is `true`, and one over 100 years
-  always is (the retention arithmetic would overflow). A mark over 100
-  years is never stored. A stored one (raised before this check, or
-  edited by hand), or one that isn't a whole number of milliseconds, is
-  refused wherever it is read: the relay doesn't start, and deletions,
+  always is (the retention arithmetic would overflow). A mark below zero
+  or over 100 years is never stored. A stored one (raised before this
+  check, or edited by hand), or one that isn't a whole number of
+  milliseconds, is refused wherever it is read: the relay doesn't start, and deletions,
   revocations and the removal of rotated mailboxes fail, until it is
   reset. A stored mark over 400 days and over the limits configured now
   is logged at WARN at start.
@@ -688,12 +688,14 @@ implementation chooses as follows:
     with the larger limit and `RELAY_ALLOW_LONG_TOKEN_LIFETIME`, or with a
     version before this check: its next start raises the mark again. Then
     restart every relay task, so none keeps the old mark in memory.
-    - A stored mark over 100 years, or one that isn't a whole number of
-      milliseconds, is refused wherever it is read, and the error names
-      this section. A start replaces a smaller number with its own limits,
-      so the start stops only for a larger one, or one that isn't a
-      number. If no larger limit's tokens are left to keep, set it to
-      `3153600000000`: 100 years, the most the relay accepts.
+    - A stored mark below zero or over 100 years, or one that isn't a
+      whole number of milliseconds, is refused wherever it is read, and
+      the error names this section. A start replaces a smaller number
+      with its own limits, so the start stops only for a larger one, or
+      one that isn't a number. For a mark over 100 years: if tokens
+      minted under that limit may still be live, set it to
+      `3153600000000` (100 years, the most the relay accepts); otherwise
+      reset it as above.
     - Entries written while an overflowed mark was in effect, before this
       check existed, got a retention that had already run out. They
       expired at once, and a reset doesn't bring them back.

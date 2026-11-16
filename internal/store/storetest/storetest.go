@@ -1691,7 +1691,7 @@ func testLifetimeMark(t *testing.T, h Harness) {
 // reset, so the relay fails closed: no start, no removal with a retention
 // that would overflow. Up to the limit a mark reads as stored.
 func testLifetimeMarkOutOfRange(t *testing.T, h Harness) {
-	s, c := h.open(t)
+	s, _ := h.open(t)
 	m := s.(store.LifetimeMarker)
 	if got, err := m.RaiseLifetimeMark(ctx, store.MaxLifetimeMark); err != nil || got != store.MaxLifetimeMark {
 		t.Fatalf("at the limit: %s %v", got, err)
@@ -1701,6 +1701,15 @@ func testLifetimeMarkOutOfRange(t *testing.T, h Harness) {
 	}
 	if got, err := m.LifetimeMark(ctx); err != nil || got != store.MaxLifetimeMark {
 		t.Fatalf("after a refused raise: %s %v", got, err)
+	}
+	if got, err := m.RaiseLifetimeMark(ctx, -time.Hour); err == nil {
+		t.Fatalf("raised to a negative mark: %s", got)
+	}
+	if got, err := m.LifetimeMark(ctx); err != nil || got != store.MaxLifetimeMark {
+		t.Fatalf("after a refused negative raise: %s %v", got, err)
+	}
+	if h.PlantMark == nil {
+		t.Skip("the harness can't plant a mark")
 	}
 
 	over := strconv.FormatInt((store.MaxLifetimeMark + time.Millisecond).Milliseconds(), 10)
@@ -1717,20 +1726,26 @@ func testLifetimeMarkOutOfRange(t *testing.T, h Harness) {
 		if got, err := m.LifetimeMark(ctx); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
 			t.Fatalf("read %s: %s %v", raw, got, err)
 		}
-		// A start raises the mark: a larger valid one replaces a smaller
-		// number, which the reads below then don't see.
-		if raw != "-1" && raw != "1.5" {
-			if got, err := m.RaiseLifetimeMark(ctx, time.Hour); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
-				t.Fatalf("a later start with %s read %s %v", raw, got, err)
-			}
-		}
-		// The rotated mailbox's removal needs the mark: it fails.
 		c.Add(time.Hour + h.SweepGrace + time.Minute)
+		// A start raises the mark: a valid one replaces a smaller number,
+		// and the store works again. A larger one, or text, stays: the
+		// start fails, and so does the rotated mailbox's removal.
+		if raw == "-1" || raw == "1.5" {
+			if got, err := m.RaiseLifetimeMark(ctx, time.Hour); err != nil || got != time.Hour {
+				t.Fatalf("a later start with %s: %s %v", raw, got, err)
+			}
+			if _, err := s.Sweep(ctx); err != nil {
+				t.Fatalf("sweep after the mark %s was replaced: %v", raw, err)
+			}
+			continue
+		}
+		if got, err := m.RaiseLifetimeMark(ctx, time.Hour); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
+			t.Fatalf("a later start with %s read %s %v", raw, got, err)
+		}
 		if _, err := s.Sweep(ctx); err == nil {
 			t.Fatalf("swept with the mark %s", raw)
 		}
 	}
-	_ = c
 }
 
 // A registration that revives a rotated-away mailbox past its grace (its

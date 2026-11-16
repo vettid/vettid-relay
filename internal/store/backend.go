@@ -139,13 +139,14 @@ func MarkFromMillis(ms int64) (time.Duration, error) {
 	return time.Duration(ms) * time.Millisecond, nil
 }
 
-// CheckRaise refuses to store a lifetime mark over MaxLifetimeMark: stored,
+// CheckRaise refuses to store a lifetime mark below zero or over
+// MaxLifetimeMark: stored,
 // it would be refused wherever it is read, and every relay on the store
 // would stop until it is reset by hand. The stores call it before they
 // write; the relay validates its limits before that.
 func CheckRaise(d time.Duration) error {
-	if d > MaxLifetimeMark {
-		return fmt.Errorf("store: a lifetime mark of %s is over %s: not stored", d, MaxLifetimeMark)
+	if d < 0 || d > MaxLifetimeMark {
+		return fmt.Errorf("store: a lifetime mark of %s is outside 0 to %s: not stored", d, MaxLifetimeMark)
 	}
 	return nil
 }

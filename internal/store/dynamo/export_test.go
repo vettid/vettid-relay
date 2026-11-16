@@ -135,8 +135,6 @@ func AccountN(s *Store, id, attr string) int64 {
 	return getN0(it, attr)
 }
 
-// SetAccountN sets number attributes of an account item (tests only): a
-// state a race could leave.
 // PlantLifetimeMark stores raw as the lifetime mark as it is, past every
 // check (a mark stored by hand or by an older version): a number if it
 // parses as one, else a string.
@@ -153,6 +151,8 @@ func PlantLifetimeMark(s *Store, raw string) error {
 	return err
 }
 
+// SetAccountN sets number attributes of an account item (tests only): a
+// state a race could leave.
 func SetAccountN(s *Store, id string, attrs map[string]int64) {
 	expr, vals := "SET", item{}
 	i := 0

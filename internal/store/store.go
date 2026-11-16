@@ -107,6 +107,9 @@ func markFromColumn(v any) (time.Duration, error) {
 	if ms, ok := v.(int64); ok {
 		return MarkFromMillis(ms)
 	}
+	if b, ok := v.([]byte); ok {
+		return 0, MarkUnreadable(fmt.Sprintf("%q", b))
+	}
 	return 0, MarkUnreadable(fmt.Sprintf("%v", v))
 }
 

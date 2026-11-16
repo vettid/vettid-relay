@@ -151,9 +151,6 @@ func (w *syncBuffer) String() string {
 	return w.b.String()
 }
 
-// run refuses a configuration Validate refuses before it opens a store,
-// so the lifetime mark is never raised by it; an allowed long lifetime
-// starts, with its warning.
 // A start whose limits are under 400 days, on a store whose mark is over
 // it (raised earlier, with the override), logs the stored mark at WARN.
 func TestRunWarnsStoredMark(t *testing.T) {
@@ -196,6 +193,9 @@ func TestRunWarnsStoredMark(t *testing.T) {
 	}
 }
 
+// run refuses a configuration Validate refuses before it opens a store,
+// so the lifetime mark is never raised by it; an allowed long lifetime
+// starts, with its warning.
 func TestRunLongLifetime(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.ListenAddr = freeAddr(t)
