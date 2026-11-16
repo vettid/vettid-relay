@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,9 +30,9 @@ func (b *busyStore) Register(ctx context.Context, id string, pub []byte) (bool, 
 	return b.Backend.Register(ctx, id, pub)
 }
 
-func (b *busyStore) Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) error {
+func (b *busyStore) Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) (time.Time, error) {
 	if b.busy.Load() {
-		return fmt.Errorf("purging: %w", store.ErrBusy)
+		return time.Time{}, fmt.Errorf("purging: %w", store.ErrBusy)
 	}
 	return b.Backend.Rotate(ctx, oldID, newID, newPub, deleteAfter)
 }
@@ -82,5 +84,28 @@ func TestBusyIsRateLimited(t *testing.T) {
 func TestDeleteTimeoutOutlastsPurge(t *testing.T) {
 	if deleteTimeout <= dynamo.PurgeBudget {
 		t.Fatalf("deleteTimeout %s isn't longer than the purge budget %s", deleteTimeout, dynamo.PurgeBudget)
+	}
+}
+
+// failRotateStore fails every Rotate with a plain error.
+type failRotateStore struct{ store.Backend }
+
+func (failRotateStore) Rotate(context.Context, string, string, []byte, time.Time) (time.Time, error) {
+	return time.Time{}, errors.New("the store failed")
+}
+
+// A rotation the store failed is answered 500, never a 200: with the
+// marker, a 200 without tokens_not_before tells the owner that no
+// tombstone is held (§6.7).
+func TestRotateStoreErrorIs500(t *testing.T) {
+	f := newFixture(t, nil)
+	inner := f.newSt
+	f.newSt = func() store.Backend { return failRotateStore{inner()} }
+	f.restart()
+	owner := newPrincipal(1)
+	f.register(owner)
+	code, m := f.rotateAnswer(owner, newPrincipal(4))
+	if code != http.StatusInternalServerError || m["code"] != CodeInternal || m["reports_tombstones_at_rotation"] != nil {
+		t.Fatalf("rotate with a failing store: %d %v", code, m)
 	}
 }

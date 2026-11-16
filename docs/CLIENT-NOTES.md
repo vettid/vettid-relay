@@ -209,7 +209,17 @@ a claim `GET`: the first response may have consumed the claim.
 1. Sign the current `mailbox_id` (its ASCII bytes) with the new key to make
    the proof.
 2. With the current key, call `POST /v1/mailbox/rotate {new_pubkey,
-   new_key_proof}`. The response is the new `mailbox_id`.
+   new_key_proof}`. The response is the new `mailbox_id`. (Relay ≥ 0.13.0)
+   It also carries `reports_tombstones_at_rotation: true`, plus
+   `tokens_not_before` while the relay holds a tombstone for the new id,
+   as registration reports it (`relayclient.Rotate`, `Rotation.Tombstone`).
+   With a value T, mint no token for the new id until your own clock
+   reads at least T + 90 s, and never with `iat` before T. An answer
+   without the marker, for a key you have used before, means the
+   mailbox may have been deleted: treat it as one (§6.1's no-flag rule).
+   Use a fresh key. If you rotate onto a key you have used on this relay
+   before, register it first: a rotate answer can't show that the relay
+   lost its record of that mailbox (RELAY-PROTOCOL §6.7).
 3. Collect from both mailboxes during the grace period (default 14 days;
    7 days before RELAY-PROTOCOL 0.11.0).
 4. Mint new tokens under the new key, announce the new address over E2E,

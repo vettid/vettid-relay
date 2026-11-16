@@ -246,10 +246,15 @@ func TestKeyRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, newKey, _ := ed25519.GenerateKey(rand.Reader)
-	newID, err := vault.Rotate(ctx, newKey)
+	rot, err := vault.Rotate(ctx, newKey)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A fresh key: the answer reports that no tombstone is held (§6.7).
+	if nb, reported := rot.Tombstone(); !reported || !nb.IsZero() {
+		t.Fatalf("rotation onto a fresh key: tombstone %v, reported %v", nb, reported)
+	}
+	newID := rot.MailboxID
 	next := client.New(url, newKey)
 	if newID != next.MailboxID() {
 		t.Fatal("rotation returned the wrong mailbox id")

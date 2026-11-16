@@ -247,7 +247,7 @@ func TestRotate(t *testing.T) {
 	if _, err := s.Deposit(ctx, "old", "s", []byte("x"), time.Hour*24*30, Limits{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "old", "new", key(2), c.now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "old", "new", key(2), c.now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	// Both live during grace.
@@ -258,7 +258,7 @@ func TestRotate(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Idempotent.
-	if err := s.Rotate(ctx, "old", "new", key(2), c.now().Add(2*time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "old", "new", key(2), c.now().Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.add(time.Hour)
@@ -274,7 +274,7 @@ func TestRotate(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("cascade delete left %d messages", n)
 	}
-	if err := s.Rotate(ctx, "old", "x", key(3), c.now()); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Rotate(ctx, "old", "x", key(3), c.now()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("rotate dead mailbox: %v", err)
 	}
 }

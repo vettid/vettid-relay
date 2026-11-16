@@ -115,6 +115,15 @@ type registerResponse struct {
 	TokensNotBefore string `json:"tokens_not_before,omitempty"`
 }
 
+type rotateResponse struct {
+	MailboxID string `json:"mailbox_id"`
+	// ReportsTombstonesAtRotation (0.13.0, §6.7) is in every rotate 200:
+	// TokensNotBefore is then present exactly while a tombstone for the
+	// successor's id is held, as at registration.
+	ReportsTombstonesAtRotation bool   `json:"reports_tombstones_at_rotation"`
+	TokensNotBefore             string `json:"tokens_not_before,omitempty"`
+}
+
 // wholeSecondUp is t rounded up to the whole second, as §6.1 reports a
 // tombstone's tokens-not-before. Deposits take a token's iat in whole
 // seconds (truncated) and compare it with the unrounded time (iat < t),
@@ -756,7 +765,10 @@ func (s *Server) handleRotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	newID := auth.MailboxID(newPub)
-	switch err := s.st.Rotate(r.Context(), mb.ID, newID, newPub, s.now().Add(s.cfg.RotationGrace)); {
+	// The tombstone comes from the rotation itself, as deposits see it:
+	// never from a cache or another process's stale view (§6.7).
+	nb, err := s.st.Rotate(r.Context(), mb.ID, newID, newPub, s.now().Add(s.cfg.RotationGrace))
+	switch {
 	case errors.Is(err, store.ErrNotFound):
 		s.writeError(w, fail(CodeMailboxUnknown))
 		return
@@ -770,5 +782,9 @@ func (s *Server) handleRotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.m.rotations.Inc()
-	writeJSON(w, http.StatusOK, map[string]string{"mailbox_id": newID})
+	resp := rotateResponse{MailboxID: newID, ReportsTombstonesAtRotation: true}
+	if !nb.IsZero() {
+		resp.TokensNotBefore = wholeSecondUp(nb).UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
