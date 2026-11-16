@@ -3,13 +3,13 @@ package dynamo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/vettid/vettid-relay/internal/store"
 )
@@ -38,17 +38,24 @@ func (s *Store) Sweep(ctx context.Context) (store.SweepStats, error) {
 	if err != nil {
 		return st, err
 	}
+	var errs []error
 	for _, mb := range due {
 		n, purged, err := s.purge(ctx, mb, cutoff)
 		if err != nil {
-			return st, err
+			if ctx.Err() != nil {
+				return st, err
+			}
+			// One mailbox's failure (a purge past its budget, say) doesn't
+			// hold up the others; the next sweep comes back to it.
+			errs = append(errs, fmt.Errorf("mailbox %s: %w", mb, err))
+			continue
 		}
 		st.Messages += n
 		if purged {
 			st.Mailboxes++
 		}
 	}
-	return st, nil
+	return st, errors.Join(errs...)
 }
 
 // purge removes a due mailbox. A rotated-away one is emptied and turned
@@ -66,6 +73,9 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 	if len(it) == 0 || getS(it, "gpk") != dueValue || getN0(it, "gsk") > cutoff {
 		return 0, false, nil
 	}
+	if s.beforePurge != nil {
+		s.beforePurge()
+	}
 	if _, tomb := it["deleted"]; !tomb {
 		return s.retire(ctx, mailbox, it, cutoff) // folds tomb_keep into the gsk it sets
 	}
@@ -74,9 +84,6 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 	// before the tombstone ends (§6.10).
 	if getN0(it, "tomb_keep") > cutoff {
 		return 0, false, nil
-	}
-	if s.beforePurge != nil {
-		s.beforePurge()
 	}
 	// The fence first, under the same condition: a re-registration since
 	// the read (the mailbox live again) fails it, and none can revive the
@@ -89,9 +96,12 @@ func (s *Store) purge(ctx context.Context, mailbox string, cutoff int64) (msgs i
 	// The contents; then the account and counters items (which carry the
 	// tombstone and its nb) together, under the condition and the fence, so
 	// a deletion since the read keeps both (§6.10).
-	msgs, err = s.purgeFenced(ctx, mailbox)
+	msgs, err = s.purgeFenced(ctx, mailbox, tok)
 	if err != nil {
 		s.unfence(ctx, mailbox, tok)
+		if errors.Is(err, errFenceLost) {
+			return 0, false, nil // taken over; that purge carries on
+		}
 		return 0, false, err
 	}
 	_, err = s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
@@ -131,9 +141,12 @@ func (s *Store) retire(ctx context.Context, mailbox string, it item, cutoff int6
 	if err != nil || !ok {
 		return 0, false, err // !ok: revived, deleted or being purged since the read
 	}
-	msgs, err := s.purgeFenced(ctx, mailbox)
+	msgs, err := s.purgeFenced(ctx, mailbox, tok)
 	if err != nil {
 		s.unfence(ctx, mailbox, tok)
+		if errors.Is(err, errFenceLost) {
+			return 0, false, nil // taken over; that purge carries on
+		}
 		return 0, false, err
 	}
 	nb, keep := p.Times(s.now())
@@ -164,74 +177,6 @@ func (s *Store) retire(ctx context.Context, mailbox string, it item, cutoff int6
 		return msgs, false, nil // deleted meanwhile; the next sweep looks again
 	}
 	return msgs, err == nil, err
-}
-
-// purgeContents deletes what a mailbox holds (callers hold the fence:
-// purgeFenced) — messages, leases, denylist,
-// token counters, consumed open tokens, blobs (with their bodies) and the
-// claims it created — and keeps the A and S items (a deletion's
-// tombstone).
-func (s *Store) purgeContents(ctx context.Context, mailbox string) (msgs int64, err error) {
-	return s.purgeItems(ctx, mailbox, func(sk string) bool { return sk != skAccount && sk != skStats })
-}
-
-// purgeItems deletes the partition's items for which del(sk) holds, with
-// their blob bodies and claim items. It is idempotent.
-func (s *Store) purgeItems(ctx context.Context, mailbox string, del func(sk string) bool) (msgs int64, err error) {
-	var keys []item
-	err = s.queryAll(ctx, &dynamodb.QueryInput{
-		KeyConditionExpression:    aws.String("pk = :pk"),
-		ExpressionAttributeValues: item{":pk": avS(mbPK(mailbox))},
-		ProjectionExpression:      aws.String("pk, sk"),
-	}, func(it item) error {
-		sk := getS(it, "sk")
-		switch {
-		case !del(sk):
-			return nil
-		case strings.HasPrefix(sk, "M#"):
-			msgs++
-		case strings.HasPrefix(sk, "C#"):
-			keys = append(keys, key(claimPK(sk[2:]), "CL"))
-		case strings.HasPrefix(sk, "B#") && s.cfg.S3 != nil:
-			if _, err := s.cfg.S3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.cfg.Bucket, Key: aws.String(blobKey(mailbox, sk[2:]))}); err != nil {
-				return err
-			}
-		}
-		keys = append(keys, key(mbPK(mailbox), sk))
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	return msgs, s.batchDelete(ctx, keys)
-}
-
-func (s *Store) batchDelete(ctx context.Context, keys []item) error {
-	for len(keys) > 0 {
-		n := min(25, len(keys))
-		reqs := make([]types.WriteRequest, 0, n)
-		for _, k := range keys[:n] {
-			reqs = append(reqs, types.WriteRequest{DeleteRequest: &types.DeleteRequest{Key: k}})
-		}
-		keys = keys[n:]
-		pending := map[string][]types.WriteRequest{s.cfg.Table: reqs}
-		for attempt := 0; len(pending) > 0; attempt++ {
-			out, err := s.cfg.DB.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{RequestItems: pending})
-			if err != nil {
-				return err
-			}
-			pending = out.UnprocessedItems
-			if len(pending) > 0 {
-				if attempt > 10 {
-					return errors.New("dynamo: purge: unprocessed deletes")
-				}
-				if err := backoff(ctx, attempt); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
 }
 
 // CreateTable creates the relay table with the layout this package expects

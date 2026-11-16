@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/coder/websocket"
 
+	"github.com/vettid/vettid-relay/internal/store"
 	auth "github.com/vettid/vettid-relay/relayauth"
 )
 
@@ -56,6 +58,11 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 	ids, err := s.st.DeleteMailbox(ctx, auth.MailboxID(sr.Key), sr.Key, notBefore, keepUntil)
 	for _, id := range ids {
 		s.mailboxDeleted(ctx, id)
+	}
+	if errors.Is(err, store.ErrBusy) {
+		s.log.Warn("mailbox delete deferred: a purge holds it", "err", err)
+		s.writeError(w, busy())
+		return
 	}
 	if err != nil {
 		s.log.Error("mailbox delete failed", "err", err)

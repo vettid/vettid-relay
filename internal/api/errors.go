@@ -97,6 +97,11 @@ func (e *apiError) Error() string { return e.code }
 
 func fail(code string) *apiError { return &apiError{code: code} }
 
+// busy is a request the store gave up on because another operation held
+// the mailbox (store.ErrBusy): overload, so 429 rate_limited with a retry
+// hint (RELAY-PROTOCOL §7).
+func busy() *apiError { return &apiError{code: CodeRateLimited, retryAfter: 2} }
+
 // quotaFail is the quota_exceeded answer to a store quota error: its
 // quota member says which quota (none for a plain store.ErrQuota).
 func quotaFail(err error) *apiError {

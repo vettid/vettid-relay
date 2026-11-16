@@ -40,6 +40,9 @@ var (
 	// ErrRevoked is returned when a token was issued before the mailbox's
 	// TokensNotBefore (it predates a deletion of the mailbox, §6.10).
 	ErrRevoked = errors.New("store: token predates the mailbox")
+	// ErrBusy is a request that met another operation on the same mailbox
+	// (a purge of its contents) and gave up waiting: try again shortly.
+	ErrBusy = errors.New("store: busy, try again")
 	// ErrContended is returned by a collect that leased nothing because
 	// other collectors won every candidate it tried, while more messages
 	// past those may wait: the caller retries shortly and must not take

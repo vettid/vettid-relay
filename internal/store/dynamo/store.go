@@ -136,11 +136,14 @@ type Store struct {
 	cacheMu sync.Mutex
 	cache   map[string]cachedMailbox
 
-	beforeRevive func() // tests only: runs between Register's read and its revive
-	beforeRotate func() // tests only: runs between Rotate's reads and its write
-	beforePurge  func() // tests only: runs between the sweep's read of a tombstone and its purge
-	beforeMark   func() // tests only: runs between DeleteMailbox's read and markDeleted
-	duringPurge  func() // tests only: runs once a purge holds the fence, before it deletes
+	beforeRevive func()        // tests only: runs between Register's read and its revive
+	beforeRotate func()        // tests only: runs between Rotate's reads and its write
+	beforePurge  func()        // tests only: runs between the sweep's read of a tombstone and its purge
+	beforeMark   func()        // tests only: runs between DeleteMailbox's read and markDeleted
+	duringPurge  func()        // tests only: runs once a purge holds the fence, before it lists what to delete
+	afterPurge   func()        // tests only: runs once a purge deleted everything, before its holder commits
+	afterMark    func()        // tests only: runs between a deletion's mark and its purge
+	purgeBudget  time.Duration // tests only: overrides purgeBudget
 }
 
 type cachedMailbox struct {
@@ -516,7 +519,7 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time
 			return false, time.Time{}, err
 		}
 	}
-	return false, time.Time{}, errors.New("dynamo: register: mailbox kept changing (purged, deleted or retired meanwhile)")
+	return false, time.Time{}, fmt.Errorf("dynamo: register: the mailbox kept changing (purged, deleted or retired meanwhile): %w", store.ErrBusy)
 }
 
 // revive turns a dead mailbox item back into a fresh, empty, live mailbox:
@@ -535,8 +538,11 @@ func (s *Store) revive(ctx context.Context, id string, pub []byte, seenNB, setNB
 	if err != nil || !ok {
 		return time.Time{}, false, err
 	}
-	if _, err := s.purgeFenced(ctx, id); err != nil {
+	if _, err := s.purgeFenced(ctx, id, tok); err != nil {
 		s.unfence(ctx, id, tok)
+		if errors.Is(err, errFenceLost) {
+			return time.Time{}, false, nil // taken over: read again
+		}
 		return time.Time{}, false, err
 	}
 	setA, setS := "SET created = :now", "SET msgs = :z, bytes = :z, blob_bytes = :z, deny = :z, v = if_not_exists(v, :z) + :one"
@@ -705,9 +711,19 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 				}
 				continue
 			}
-			if _, err := s.purgeFenced(ctx, newID); err != nil {
+			if _, err := s.purgeFenced(ctx, newID, tok); err != nil {
 				s.unfence(ctx, newID, tok)
-				return err
+				if !errors.Is(err, errFenceLost) {
+					return err
+				}
+				// Taken over: read again.
+				if attempt >= maxTxAttempts {
+					return fmt.Errorf("dynamo: rotate: %w", errPurging)
+				}
+				if err := backoff(ctx, attempt); err != nil {
+					return err
+				}
+				continue
 			}
 			succFence, succValsF = " AND purge_by = :fby", item{":fby": avS(tok)}
 		}

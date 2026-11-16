@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 // SetBeforeRevive sets a hook that runs between Register's read of a dead
@@ -24,6 +25,39 @@ func SetBeforeMark(s *Store, f func()) { s.beforeMark = f }
 // SetDuringPurge sets a hook that runs once a purge holds the fence,
 // before it deletes (tests only).
 func SetDuringPurge(s *Store, f func()) { s.duringPurge = f }
+
+// SetAfterPurge sets a hook that runs once a purge deleted everything,
+// before its holder commits (tests only).
+func SetAfterPurge(s *Store, f func()) { s.afterPurge = f }
+
+// SetAfterMark sets a hook between a deletion's mark and its purge (tests
+// only).
+func SetAfterMark(s *Store, f func()) { s.afterMark = f }
+
+// SetPurgeBudget overrides a purge's budget (tests only).
+func SetPurgeBudget(s *Store, d time.Duration) { s.purgeBudget = d }
+
+// ClearFence removes any purge fence from id's account item (tests only).
+func ClearFence(s *Store, id string) {
+	if _, err := s.cfg.DB.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
+		TableName: &s.cfg.Table, Key: key(mbPK(id), skAccount),
+		UpdateExpression: aws.String("REMOVE purging, purge_by"),
+	}); err != nil {
+		panic(err)
+	}
+}
+
+// AccountSS reads a string-set attribute of an account item (tests only).
+func AccountSS(s *Store, id, attr string) []string {
+	it, err := s.getAccount(context.Background(), id)
+	if err != nil {
+		panic(err)
+	}
+	if v, ok := it[attr].(*types.AttributeValueMemberSS); ok {
+		return v.Value
+	}
+	return nil
+}
 
 // SetFence puts a purge fence on id's account item, taken at at (tests
 // only): a purge that holds it, or one that died.
