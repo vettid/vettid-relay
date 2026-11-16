@@ -661,7 +661,9 @@ implementation chooses as follows:
   the same way, and a repeated rotate answers the same. It is read within
   the rotation (SQLite: its transaction; DynamoDB: the value its write
   committed), never from a process's cache. `limits.reports_tombstones`
-  stays.
+  stays. In the Go client, `relayclient.Rotate` now returns a `Rotation`
+  (before: the new id as a string; it is `Rotation.MailboxID`), and
+  `Rotation.Tombstone()` reads the report.
 - **Lowering the token lifetime limits.** Tombstones and denylist
   entries are kept for the largest token lifetime the relay has ever
   advertised (RELAY-PROTOCOL 0.12.0 §6.10), not only the limits configured

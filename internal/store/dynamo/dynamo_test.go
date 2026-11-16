@@ -669,7 +669,7 @@ func TestRotateKeepsRaisedNB(t *testing.T) {
 			}
 		}
 	})
-	_, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+	got, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
 	dynamo.SetBeforeRotate(s, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -680,6 +680,10 @@ func TestRotateKeepsRaisedNB(t *testing.T) {
 	}
 	if mb.TokensNotBefore.Before(raised) {
 		t.Fatalf("tokens-not-before %v, want at least the raised %v", mb.TokensNotBefore, raised)
+	}
+	// The answer is what the retry committed, not the first read.
+	if !got.Equal(mb.TokensNotBefore) {
+		t.Fatalf("Rotate returned %v, stored %v", got, mb.TokensNotBefore)
 	}
 	if _, err := s.Deposit(ctx, "b", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "mid", TokenIssuedAt: raised.Add(-time.Second), TokenExpires: c.Now().Add(time.Hour)}); !errors.Is(err, store.ErrRevoked) {
 		t.Fatalf("a token issued before the raised not-before: %v", err)

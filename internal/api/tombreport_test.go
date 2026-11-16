@@ -243,6 +243,7 @@ func TestRotateReportsTombstones(t *testing.T) {
 	if v, _ := rotated("a live key with an older tombstone", h, g); v != gwant {
 		t.Fatalf("a live key with an older tombstone: %q, want %q", v, gwant)
 	}
+	accepted("live", g, gwant)
 
 	// A key rotated away whose grace has ended, not swept yet: the rotate
 	// removes its mailbox first (vettid-relay #29) and reports the

@@ -361,3 +361,31 @@ func TestGetClaimNotRetried(t *testing.T) {
 		t.Fatalf("%d requests, want 1", n)
 	}
 }
+
+// Rotate reads the tombstone report from the answer itself: a 0.12.0
+// relay's answer (no marker) reports nothing, even with a field; a 0.13.0
+// relay's is read.
+func TestRotateTombstoneReport(t *testing.T) {
+	ctx := context.Background()
+	_, newKey, _ := ed25519.GenerateKey(nil)
+	at := time.Date(2026, 11, 16, 15, 1, 30, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		body     string
+		want     time.Time
+		reported bool
+	}{
+		{"0.12.0", `{"mailbox_id":"m","tokens_not_before":"2026-11-16T15:01:30Z"}`, time.Time{}, false},
+		{"0.13.0, none", `{"mailbox_id":"m","reports_tombstones_at_rotation":true}`, time.Time{}, true},
+		{"0.13.0, a tombstone", `{"mailbox_id":"m","reports_tombstones_at_rotation":true,"tokens_not_before":"2026-11-16T15:01:30Z"}`, at, true},
+	} {
+		f := &fakeRelay{replies: []reply{{200, tc.body}}}
+		rot, err := f.start(t).Rotate(ctx, newKey)
+		if err != nil || rot.MailboxID != "m" {
+			t.Fatalf("%s: %+v %v", tc.name, rot, err)
+		}
+		if got, reported := rot.Tombstone(); reported != tc.reported || !got.Equal(tc.want) {
+			t.Errorf("%s: %v %v, want %v %v", tc.name, got, reported, tc.want, tc.reported)
+		}
+	}
+}

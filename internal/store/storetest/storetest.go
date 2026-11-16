@@ -2031,4 +2031,32 @@ func testRotateReturnsNotBefore(t *testing.T, h Harness) {
 	if got := rotate("a key past its grace", "r", "p", 7); !got.Equal(removed.Add(90 * time.Second).Truncate(time.Millisecond)) {
 		t.Fatalf("a key past its grace: %v, want %v", got, removed.Add(90*time.Second))
 	}
+
+	// Past its grace and carrying an older tombstone (deleted, registered
+	// again, rotated away): the removal's later not-before is the one
+	// returned, and deposits check that one, not the older.
+	mustRegister(t, s, "u", 10)
+	unb, ukeep := deleteTimes(c)
+	if _, err := s.DeleteMailbox(ctx, "u", key(10), unb, ukeep); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour)
+	mustRegister(t, s, "u", 10)
+	if _, err := s.Rotate(ctx, "u", "v", key(11), c.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(2 * time.Minute)
+	uremoved := c.Now()
+	mustRegister(t, s, "w", 12)
+	want := uremoved.Add(90 * time.Second).Truncate(time.Millisecond)
+	if got := rotate("past its grace with an older tombstone", "w", "u", 10); !got.Equal(want) {
+		t.Fatalf("past its grace with an older tombstone: %v, want %v", got, want)
+	}
+	between := unb.Add(time.Minute)
+	if _, err := s.Deposit(ctx, "u", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "between", TokenIssuedAt: between, TokenExpires: c.Now().Add(time.Hour)}); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("a token issued between the two not-befores: %v", err)
+	}
+	if _, err := s.Deposit(ctx, "u", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "after", TokenIssuedAt: want.Add(time.Second), TokenExpires: want.Add(time.Hour)}); err != nil {
+		t.Fatalf("a token issued after the reported not-before: %v", err)
+	}
 }
