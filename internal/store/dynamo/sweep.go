@@ -48,7 +48,8 @@ func (s *Store) Sweep(ctx context.Context) (store.SweepStats, error) {
 			// One mailbox's failure (a purge past its budget, say) doesn't
 			// hold up the others; the next sweep comes back to it. The
 			// error names no mailbox (RELAY-PROTOCOL §8: logs carry no
-			// mailbox ids).
+			// mailbox ids): the errors it joins are the store's own, whose
+			// AWS errors are scrubbed (scrub.go).
 			errs = append(errs, err)
 			continue
 		}

@@ -143,7 +143,7 @@ type Store struct {
 	duringPurge  func()        // tests only: runs once a purge holds the fence, before it lists what to delete
 	afterPurge   func()        // tests only: runs once a purge deleted everything, before its holder commits
 	afterMark    func()        // tests only: runs between a deletion's mark and its purge
-	purgeBudget  time.Duration // tests only: overrides purgeBudget
+	purgeBudget  time.Duration // tests only: overrides PurgeBudget
 }
 
 type cachedMailbox struct {
@@ -170,6 +170,11 @@ func New(cfg Config) (*Store, error) {
 	}
 	if cfg.ReconcileInterval == 0 {
 		cfg.ReconcileInterval = time.Minute
+	}
+	// The clients' errors are scrubbed of what they asked for (scrub.go).
+	cfg.DB = scrubDB{db: cfg.DB}
+	if cfg.S3 != nil {
+		cfg.S3 = scrubObjects{o: cfg.S3}
 	}
 	return &Store{cfg: cfg, now: cfg.Now, entropy: ulid.Monotonic(rand.Reader, 0), cache: map[string]cachedMailbox{}}, nil
 }
@@ -827,6 +832,9 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			continue
 		}
 		if attempt >= maxTxAttempts {
+			if isConflict(r) { // conflicts or throttling: busy (429)
+				return fmt.Errorf("dynamo: rotate: kept conflicting: %w (%w)", store.ErrBusy, err)
+			}
 			return fmt.Errorf("dynamo: rotate: %w", err)
 		}
 		if err := backoff(ctx, attempt); err != nil {

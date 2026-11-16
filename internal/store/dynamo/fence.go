@@ -40,8 +40,10 @@ import (
 // idempotent). A purge also gives up after its budget (purgeBudget), so a
 // live holder normally finishes or lets go well inside the lease.
 const (
-	purgeLease  = 5 * time.Minute
-	purgeBudget = 2 * time.Minute
+	purgeLease = 5 * time.Minute
+	// PurgeBudget is how long one purge may run (the API's deletion
+	// timeout is longer).
+	PurgeBudget = 2 * time.Minute
 	// purgeBatch deletes go in one transaction with the fence's check
 	// (DynamoDB allows 100 actions).
 	purgeBatch = 99
@@ -131,7 +133,7 @@ func (s *Store) fenceCheck(id, tok string) types.TransactWriteItem {
 // deleted once its item is. It stops at the budget; a later purge carries
 // on from what is left.
 func (s *Store) purgeFenced(ctx context.Context, id, tok string) (msgs int64, err error) {
-	budget := purgeBudget
+	budget := PurgeBudget
 	if s.purgeBudget > 0 {
 		budget = s.purgeBudget
 	}

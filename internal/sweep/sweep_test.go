@@ -59,6 +59,10 @@ func TestOnceError(t *testing.T) {
 	if !strings.Contains(b.String(), "relay_sweep_errors_total 1") {
 		t.Fatal("error not counted")
 	}
+	// A failed pass still ran (part of it may have done work).
+	if !strings.Contains(b.String(), "relay_sweep_runs_total 1") {
+		t.Fatalf("the failed pass isn't counted as a run:\n%s", b.String())
+	}
 }
 
 type partialStore struct{}
