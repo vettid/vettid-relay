@@ -3,15 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/vettid/vettid-relay/internal/api"
 	"github.com/vettid/vettid-relay/internal/config"
+	"github.com/vettid/vettid-relay/internal/logbudget"
 	"github.com/vettid/vettid-relay/internal/store"
 )
 
@@ -28,7 +31,7 @@ func TestOpenStoreKeepsLifetimeMark(t *testing.T) {
 		cfg := config.Defaults()
 		cfg.DBPath = path
 		cfg.MaxTokenLifetime = max
-		st, err := openStore(ctx, &cfg)
+		st, err := openStore(ctx, &cfg, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -71,13 +74,13 @@ func (f *failingMark) LifetimeMark(context.Context) (time.Duration, error) {
 func TestApplyLifetimeMarkFailsClosed(t *testing.T) {
 	cfg := config.Defaults()
 	st := &failingMark{}
-	if err := applyLifetimeMark(context.Background(), st, &cfg); err == nil {
+	if err := applyLifetimeMark(context.Background(), st, &cfg, nil); err == nil {
 		t.Fatal("started with a failing mark")
 	}
 	if st.set || cfg.RetentionLifetime != 0 {
 		t.Fatalf("policy set %v, retention %s", st.set, cfg.RetentionLifetime)
 	}
-	if err := applyLifetimeMark(context.Background(), struct{ store.Backend }{}, &cfg); err == nil {
+	if err := applyLifetimeMark(context.Background(), struct{ store.Backend }{}, &cfg, nil); err == nil {
 		t.Fatal("started with a store that keeps no mark")
 	}
 }
@@ -94,6 +97,9 @@ func TestWarnLongLifetime(t *testing.T) {
 		{b + time.Second, time.Minute, b + time.Second, []string{"token lifetime limit over 400 days"}},
 		{time.Hour, b + time.Second, b + time.Second, []string{"token lifetime limit over 400 days"}},
 		{time.Hour, time.Minute, b + time.Second, []string{"stored lifetime mark over 400 days"}},
+		// A mark above the limits but at or under the bound: no warning.
+		{time.Hour, time.Minute, b, nil},
+		{time.Hour, time.Minute, b - 24*time.Hour, nil},
 	} {
 		var buf bytes.Buffer
 		cfg := config.Defaults()
@@ -109,31 +115,103 @@ func TestWarnLongLifetime(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The warnings are the process's own lines: the log budget never drops
+// them, however often they repeat.
+func TestWarnLongLifetimeExempt(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(logbudget.New(slog.NewJSONHandler(&buf, nil), 0, 0))
+	cfg := config.Defaults()
+	b := config.MaxTokenLifetimeBound
+	cfg.MaxTokenLifetime, cfg.RetentionLifetime, cfg.AllowLongTokenLifetime = b+time.Second, b+2*time.Second, true
+	for range 3 {
+		warnLongLifetime(log, cfg)
+	}
+	if n := strings.Count(buf.String(), `"level":"WARN"`); n != 6 {
+		t.Fatalf("%d warnings of 6: %s", n, buf.String())
+	}
+}
+
+// The largest limit the config accepts is the largest mark the stores
+// read: a limit the relay starts with can always be read back.
+func TestLifetimeLimitIsMarkLimit(t *testing.T) {
 	if config.MaxTokenLifetimeLimit != store.MaxLifetimeMark {
 		t.Fatalf("the config's limit %s and the stores' %s differ", config.MaxTokenLifetimeLimit, store.MaxLifetimeMark)
 	}
 }
 
-// A mark stored over the limit stops the start, pointing to its reset.
+// A stored mark that can't be used (over the limit, too large for int64,
+// not a number; stored before the limit existed or by hand) stops the
+// start, pointing to its reset. The store refuses to write one, so it is
+// written here directly.
 func TestOpenStoreRefusesMarkOutOfRange(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "relay.db")
-	cfg := config.Defaults()
-	cfg.DBPath = path
-	st, err := openStore(ctx, &cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = st.(store.LifetimeMarker).RaiseLifetimeMark(ctx, store.MaxLifetimeMark+time.Hour)
-	if err := st.Close(); err != nil {
-		t.Fatal(err)
-	}
-	cfg = config.Defaults()
-	cfg.DBPath = path
-	if st, err := openStore(ctx, &cfg); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
-		if st != nil {
-			st.Close()
+	over := strconv.FormatInt((store.MaxLifetimeMark + time.Hour).Milliseconds(), 10)
+	for _, raw := range []string{over, "100000000000000000000", "soon"} {
+		path := filepath.Join(t.TempDir(), "relay.db")
+		cfg := config.Defaults()
+		cfg.DBPath = path
+		st, err := openStore(ctx, &cfg, nil)
+		if err != nil {
+			t.Fatal(err)
 		}
-		t.Fatalf("started with the mark out of range: %v", err)
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE lifetime_mark SET lifetime_ms = ? WHERE id = 1`, raw); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		cfg = config.Defaults()
+		cfg.DBPath = path
+		if st, err := openStore(ctx, &cfg, nil); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
+			if st != nil {
+				st.Close()
+			}
+			t.Fatalf("started with the mark %s: %v", raw, err)
+		}
+	}
+}
+
+// A start that replaces an invalid mark smaller than its limits (negative,
+// a fraction) logs it at WARN with the value it had; a valid one, none.
+func TestOpenStoreWarnsReplacedMark(t *testing.T) {
+	ctx := context.Background()
+	for raw, want := range map[string]bool{"-1": true, "1.5": true, "1000": false} {
+		path := filepath.Join(t.TempDir(), "relay.db")
+		cfg := config.Defaults()
+		cfg.DBPath = path
+		st, err := openStore(ctx, &cfg, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE lifetime_mark SET lifetime_ms = ? WHERE id = 1`, raw); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		var buf bytes.Buffer
+		cfg = config.Defaults()
+		cfg.DBPath = path
+		st, err = openStore(ctx, &cfg, slog.New(slog.NewJSONHandler(&buf, nil)))
+		if err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		st.Close()
+		got := strings.Contains(buf.String(), "stored lifetime mark was invalid")
+		if got != want || (want && !strings.Contains(buf.String(), raw)) {
+			t.Fatalf("%s: warned %v, want %v: %s", raw, got, want, buf.String())
+		}
 	}
 }

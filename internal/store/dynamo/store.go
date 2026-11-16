@@ -205,11 +205,26 @@ func (s *Store) LifetimeMark(ctx context.Context) (time.Duration, error) {
 	if err != nil {
 		return 0, err
 	}
-	v, ok := getN(out.Item, "life_ms")
-	if !ok {
+	if _, ok := out.Item["life_ms"]; !ok {
 		return 0, errors.New("dynamo: no lifetime mark stored")
 	}
-	return store.MarkFromMillis(v)
+	return markFrom(out.Item)
+}
+
+// markFrom reads life_ms: a number that is a whole int64 is checked by
+// store.MarkFromMillis; anything else stored there (by hand) can't be read.
+func markFrom(it item) (time.Duration, error) {
+	if v, ok := getN(it, "life_ms"); ok {
+		return store.MarkFromMillis(v)
+	}
+	switch v := it["life_ms"].(type) {
+	case *types.AttributeValueMemberN:
+		return 0, store.MarkUnreadable(v.Value)
+	case *types.AttributeValueMemberS:
+		return 0, store.MarkUnreadable(fmt.Sprintf("%q, a string; it must be a Number", v.Value))
+	default:
+		return 0, store.MarkUnreadable("not a Number; it must be a Number")
+	}
 }
 
 // withVals returns it with o's entries added.
@@ -241,6 +256,9 @@ func (s *Store) getAccount(ctx context.Context, id string) (item, error) {
 // RaiseLifetimeMark implements store.LifetimeMarker: a conditional write
 // that only raises life_ms, then a consistent read of what is stored.
 func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Duration, error) {
+	if err := store.CheckRaise(d); err != nil {
+		return 0, err
+	}
 	if d <= 0 {
 		d = time.Millisecond // nothing to raise: the read below reports the mark
 	}
@@ -260,11 +278,10 @@ func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Du
 	if err != nil {
 		return 0, err
 	}
-	v, ok := getN(out.Item, "life_ms")
-	if !ok {
+	if _, ok := out.Item["life_ms"]; !ok {
 		return 0, errors.New("dynamo: lifetime mark missing after its write")
 	}
-	return store.MarkFromMillis(v)
+	return markFrom(out.Item)
 }
 
 // Ping implements store.Backend: one cheap read.

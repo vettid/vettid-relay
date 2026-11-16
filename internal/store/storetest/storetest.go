@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -49,6 +50,9 @@ type Harness struct {
 	// SweepGrace is how long after a rotated mailbox's deletion time the
 	// backend's Sweep is guaranteed to have removed it.
 	SweepGrace time.Duration
+	// PlantMark stores raw as the lifetime mark as it is, past the
+	// store's checks (a mark stored by hand or by an older version).
+	PlantMark func(s store.Backend, raw string) error
 	// Bodies counts the blob bodies a backend made by New holds outside
 	// its database (staged or committed): S3 objects, staged files. Nil
 	// if it holds none there.
@@ -1681,34 +1685,67 @@ func testLifetimeMark(t *testing.T, h Harness) {
 	}
 }
 
-// A stored mark over store.MaxLifetimeMark (one stored before the limit
-// existed, or edited by hand) is an error wherever it is read, so the
-// relay fails closed: no start, no removal with a retention that would
-// overflow. Up to the limit it reads as stored.
+// A mark over store.MaxLifetimeMark is refused before it is stored, so
+// the stored one stays readable. A stored mark that can't be used (over
+// the limit or negative, stored before the limit existed or by hand; not a
+// whole number of ms) is an error wherever it is read, pointing to its
+// reset, so the relay fails closed: no start, no removal with a retention
+// that would overflow. Up to the limit a mark reads as stored.
 func testLifetimeMarkOutOfRange(t *testing.T, h Harness) {
-	s, c := h.open(t)
+	s, _ := h.open(t)
 	m := s.(store.LifetimeMarker)
 	if got, err := m.RaiseLifetimeMark(ctx, store.MaxLifetimeMark); err != nil || got != store.MaxLifetimeMark {
 		t.Fatalf("at the limit: %s %v", got, err)
 	}
-	mustRegister(t, s, "a", 1)
-	if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
-		t.Fatal(err)
+	if got, err := m.RaiseLifetimeMark(ctx, store.MaxLifetimeMark+time.Millisecond); err == nil {
+		t.Fatalf("raised over the limit: %s", got)
 	}
-	over := store.MaxLifetimeMark + time.Millisecond
-	if _, err := m.RaiseLifetimeMark(ctx, over); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
-		t.Fatalf("raised over the limit: %v", err)
+	if got, err := m.LifetimeMark(ctx); err != nil || got != store.MaxLifetimeMark {
+		t.Fatalf("after a refused raise: %s %v", got, err)
 	}
-	if got, err := m.LifetimeMark(ctx); err == nil {
-		t.Fatalf("read over the limit: %s", got)
+	if got, err := m.RaiseLifetimeMark(ctx, -time.Hour); err == nil {
+		t.Fatalf("raised to a negative mark: %s", got)
 	}
-	if got, err := m.RaiseLifetimeMark(ctx, time.Hour); err == nil {
-		t.Fatalf("a later start read %s", got)
+	if got, err := m.LifetimeMark(ctx); err != nil || got != store.MaxLifetimeMark {
+		t.Fatalf("after a refused negative raise: %s %v", got, err)
 	}
-	// The rotated mailbox's removal needs the mark: it fails.
-	c.Add(time.Hour + h.SweepGrace + time.Minute)
-	if _, err := s.Sweep(ctx); err == nil {
-		t.Fatal("swept with a mark out of range")
+	if h.PlantMark == nil {
+		t.Skip("the harness can't plant a mark")
+	}
+
+	over := strconv.FormatInt((store.MaxLifetimeMark + time.Millisecond).Milliseconds(), 10)
+	for _, raw := range []string{over, "-1", "100000000000000000000", "1.5", "soon"} {
+		s, c := h.open(t)
+		m := s.(store.LifetimeMarker)
+		mustRegister(t, s, "a", 1)
+		if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.PlantMark(s, raw); err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		if got, err := m.LifetimeMark(ctx); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
+			t.Fatalf("read %s: %s %v", raw, got, err)
+		}
+		c.Add(time.Hour + h.SweepGrace + time.Minute)
+		// A start raises the mark: a valid one replaces a smaller number,
+		// and the store works again. A larger one, or text, stays: the
+		// start fails, and so does the rotated mailbox's removal.
+		if raw == "-1" || raw == "1.5" {
+			if got, err := m.RaiseLifetimeMark(ctx, time.Hour); err != nil || got != time.Hour {
+				t.Fatalf("a later start with %s: %s %v", raw, got, err)
+			}
+			if _, err := s.Sweep(ctx); err != nil {
+				t.Fatalf("sweep after the mark %s was replaced: %v", raw, err)
+			}
+			continue
+		}
+		if got, err := m.RaiseLifetimeMark(ctx, time.Hour); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
+			t.Fatalf("a later start with %s read %s %v", raw, got, err)
+		}
+		if _, err := s.Sweep(ctx); err == nil {
+			t.Fatalf("swept with the mark %s", raw)
+		}
 	}
 }
 

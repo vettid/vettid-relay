@@ -78,23 +78,36 @@ func (s *Store) SetTombstones(p TombstonePolicy) { s.tomb = p }
 
 // RaiseLifetimeMark implements LifetimeMarker.
 func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Duration, error) {
-	var v int64
+	if err := CheckRaise(d); err != nil {
+		return 0, err
+	}
+	var v any
 	err := s.w.QueryRowContext(ctx, `INSERT INTO lifetime_mark (id, lifetime_ms) VALUES (1, ?)
 		ON CONFLICT(id) DO UPDATE SET lifetime_ms=MAX(lifetime_ms, excluded.lifetime_ms)
 		RETURNING lifetime_ms`, d.Milliseconds()).Scan(&v)
 	if err != nil {
 		return 0, err
 	}
-	return MarkFromMillis(v)
+	return markFromColumn(v)
 }
 
 // LifetimeMark implements LifetimeMarker.
 func (s *Store) LifetimeMark(ctx context.Context) (time.Duration, error) {
-	var v int64
+	var v any
 	if err := s.r.QueryRowContext(ctx, `SELECT lifetime_ms FROM lifetime_mark WHERE id = 1`).Scan(&v); err != nil {
 		return 0, fmt.Errorf("store: lifetime mark: %w", err)
 	}
-	return MarkFromMillis(v)
+	return markFromColumn(v)
+}
+
+// markFromColumn reads the lifetime_ms column as SQLite holds it: an
+// integer is checked by MarkFromMillis; a real or text one (written by
+// hand, or an integer too large for int64) can't be read.
+func markFromColumn(v any) (time.Duration, error) {
+	if ms, ok := v.(int64); ok {
+		return MarkFromMillis(ms)
+	}
+	return 0, MarkUnreadable(fmt.Sprintf("%q", fmt.Sprint(v)))
 }
 
 // WithClock overrides the clock (tests).
@@ -392,12 +405,15 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 // matching where, removed at now.
 func (s *Store) tombstoneRotated(ctx context.Context, tx *sql.Tx, now time.Time, where string, arg any) error {
 	// The policy raised to the stored lifetime mark (§6.10), as the
-	// deletions and revocations the api makes are.
-	var mark int64
+	// deletions and revocations the api makes are. No row reads as 0,
+	// which only keeps s.tomb: the relay always stores a mark at start
+	// and sets s.tomb from it, and no row is ever deleted. (A store opened
+	// without a start, in the store's own tests, has none.)
+	var mark any
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(lifetime_ms), 0) FROM lifetime_mark`).Scan(&mark); err != nil {
 		return err
 	}
-	d, err := MarkFromMillis(mark)
+	d, err := markFromColumn(mark)
 	if err != nil {
 		return err
 	}
