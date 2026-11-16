@@ -668,18 +668,38 @@ implementation chooses as follows:
   repeated deletion never shortens a tombstone. So that a mistyped limit
   can't raise the mark, a limit over 400 days is refused at start unless
   `RELAY_ALLOW_LONG_TOKEN_LIFETIME` is `true`, and one over 100 years
-  always is (the retention arithmetic would overflow). A stored mark over
-  100 years (one raised before this check, or edited by hand) is refused
-  wherever it is read: the relay doesn't start, and deletions,
+  always is (the retention arithmetic would overflow). A mark over 100
+  years is never stored. A stored one (raised before this check, or
+  edited by hand), or one that isn't a whole number of milliseconds, is
+  refused wherever it is read: the relay doesn't start, and deletions,
   revocations and the removal of rotated mailboxes fail, until it is
   reset. A stored mark over 400 days and over the limits configured now
   is logged at WARN at start.
   - **Resetting the mark** (after a mistaken huge limit): set the
     `lifetime_mark` row (SQLite) or the `META`/`LIFETIME` item's `life_ms`
-    (DynamoDB) to the configured limit, in milliseconds, but only once every
-    token minted under the larger limit has expired; earlier, revoked or
-    deleted keys' tokens could work again. Then restart every relay task, so
-    none keeps the old mark in memory.
+    (DynamoDB), in milliseconds, to the largest limit under which
+    unexpired tokens can still exist, never below the larger of the two
+    limits configured now. For example: a 400-day limit, then a one-day
+    typo of 4000 days, then limits lowered to 30 days: reset to 400 days,
+    not 30, or tokens minted under the 400-day limit lose their
+    retention. Lower it further only once every token minted under the
+    larger limit has expired; earlier, revoked or deleted keys' tokens
+    could work again. Before you restart, make sure no task still runs
+    with the larger limit and `RELAY_ALLOW_LONG_TOKEN_LIFETIME`, or with a
+    version before this check: its next start raises the mark again. Then
+    restart every relay task, so none keeps the old mark in memory.
+    - A stored mark over 100 years, or one that isn't a whole number of
+      milliseconds, is refused wherever it is read, and the error names
+      this section. A start replaces a smaller number with its own limits,
+      so the start stops only for a larger one, or one that isn't a
+      number. If no larger limit's tokens are left to keep, set it to
+      `3153600000000`: 100 years, the most the relay accepts.
+    - Entries written while an overflowed mark was in effect, before this
+      check existed, got a retention that had already run out. They
+      expired at once, and a reset doesn't bring them back.
+    - While the mark is bad, SQLite's sweep fails too. It fails closed:
+      nothing is removed early, but expired content stays on disk until
+      the mark is reset.
   - **Limits lowered before this version:** the mark starts at the limits
     configured at the first start with this version. If they were lowered
     earlier, start once with the old (larger) limits, or set the mark by

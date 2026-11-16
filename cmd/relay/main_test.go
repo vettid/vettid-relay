@@ -154,6 +154,48 @@ func (w *syncBuffer) String() string {
 // run refuses a configuration Validate refuses before it opens a store,
 // so the lifetime mark is never raised by it; an allowed long lifetime
 // starts, with its warning.
+// A start whose limits are under 400 days, on a store whose mark is over
+// it (raised earlier, with the override), logs the stored mark at WARN.
+func TestRunWarnsStoredMark(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.ListenAddr = freeAddr(t)
+	cfg.MetricsAddr = freeAddr(t)
+	cfg.BaseURL = "http://" + cfg.ListenAddr
+	cfg.DBPath = filepath.Join(t.TempDir(), "relay.db")
+	cfg.ShutdownTimeout = 5 * time.Second
+	st, err := store.Open(context.Background(), cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RaiseLifetimeMark(context.Background(), 500*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), ready) }()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("run exited early: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("relay not ready")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "stored lifetime mark over 400 days") {
+		t.Fatalf("no warning: %s", logs.String())
+	}
+}
+
 func TestRunLongLifetime(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.ListenAddr = freeAddr(t)

@@ -31,6 +31,9 @@ func TestConformanceSQLite(t *testing.T) {
 			mu.Unlock()
 			return s
 		},
+		PlantMark: func(s store.Backend, raw string) error {
+			return store.PlantLifetimeMark(s.(*store.Store), raw)
+		},
 		// Staged bodies are files next to the database.
 		Bodies: func(s store.Backend) int {
 			mu.Lock()

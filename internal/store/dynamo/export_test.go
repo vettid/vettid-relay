@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -136,6 +137,22 @@ func AccountN(s *Store, id, attr string) int64 {
 
 // SetAccountN sets number attributes of an account item (tests only): a
 // state a race could leave.
+// PlantLifetimeMark stores raw as the lifetime mark as it is, past every
+// check (a mark stored by hand or by an older version): a number if it
+// parses as one, else a string.
+func PlantLifetimeMark(s *Store, raw string) error {
+	var v types.AttributeValue = &types.AttributeValueMemberS{Value: raw}
+	if _, err := strconv.ParseFloat(raw, 64); err == nil {
+		v = &types.AttributeValueMemberN{Value: raw}
+	}
+	_, err := s.cfg.DB.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
+		TableName: &s.cfg.Table, Key: key("META", "LIFETIME"),
+		UpdateExpression:          aws.String("SET life_ms = :v"),
+		ExpressionAttributeValues: item{":v": v},
+	})
+	return err
+}
+
 func SetAccountN(s *Store, id string, attrs map[string]int64) {
 	expr, vals := "SET", item{}
 	i := 0

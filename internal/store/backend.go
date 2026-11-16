@@ -139,6 +139,24 @@ func MarkFromMillis(ms int64) (time.Duration, error) {
 	return time.Duration(ms) * time.Millisecond, nil
 }
 
+// CheckRaise refuses to store a lifetime mark over MaxLifetimeMark: stored,
+// it would be refused wherever it is read, and every relay on the store
+// would stop until it is reset by hand. The stores call it before they
+// write; the relay validates its limits before that.
+func CheckRaise(d time.Duration) error {
+	if d > MaxLifetimeMark {
+		return fmt.Errorf("store: a lifetime mark of %s is over %s: not stored", d, MaxLifetimeMark)
+	}
+	return nil
+}
+
+// MarkUnreadable is the error for a stored lifetime mark that isn't a
+// whole number of milliseconds in int64 (stored as text or a fraction, or
+// too large, by hand): like one out of range, it must be reset.
+func MarkUnreadable(stored string) error {
+	return fmt.Errorf("store: the stored lifetime mark (%s) isn't a whole number of ms: reset it (README, \"Resetting the mark\")", stored)
+}
+
 // WithMark returns p with its retention at least what the lifetime mark
 // asks: the mark plus the margin plus a minute, the api's denylist
 // retention for that lifetime.

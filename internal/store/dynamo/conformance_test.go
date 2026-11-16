@@ -50,5 +50,8 @@ func TestConformanceDynamo(t *testing.T) {
 			return mk(t, table, s3, now), mk(t, table, s3, now)
 		},
 		SweepGrace: 10 * time.Minute,
+		PlantMark: func(s store.Backend, raw string) error {
+			return dynamo.PlantLifetimeMark(s.(*dynamo.Store), raw)
+		},
 	})
 }
