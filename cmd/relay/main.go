@@ -126,11 +126,23 @@ func newLogger(cfg config.Config) *slog.Logger {
 	return slog.New(logbudget.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}), cfg.LogInfoPerSec, cfg.LogInfoBurst))
 }
 
+// warnLongLifetime logs at WARN a token lifetime limit above
+// config.MaxTokenLifetimeBound, which config.Load accepts only with
+// RELAY_ALLOW_LONG_TOKEN_LIFETIME: the stored lifetime mark is raised to
+// it and never lowered.
+func warnLongLifetime(ctx context.Context, log *slog.Logger, cfg config.Config) {
+	if limits := max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime); limits > config.MaxTokenLifetimeBound {
+		log.WarnContext(ctx, "token lifetime limit over 400 days, allowed by RELAY_ALLOW_LONG_TOKEN_LIFETIME: tombstones and denylist entries are kept that long, and the stored lifetime mark is never lowered",
+			"limits", limits.String(), "bound", config.MaxTokenLifetimeBound.String())
+	}
+}
+
 // run serves until ctx is cancelled (SIGTERM/SIGINT in production), then
 // drains and shuts down within cfg.ShutdownTimeout. ready, if non-nil, is
 // closed once both listeners are accepting.
 func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- struct{}) error {
 
+	warnLongLifetime(ctx, log, cfg)
 	reg := metrics.New()
 	openCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

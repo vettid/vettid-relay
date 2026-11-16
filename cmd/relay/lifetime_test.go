@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,5 +79,27 @@ func TestApplyLifetimeMarkFailsClosed(t *testing.T) {
 	}
 	if err := applyLifetimeMark(context.Background(), struct{ store.Backend }{}, &cfg); err == nil {
 		t.Fatal("started with a store that keeps no mark")
+	}
+}
+
+// A limit over the bound, allowed by RELAY_ALLOW_LONG_TOKEN_LIFETIME, is
+// logged at WARN; one at the bound isn't.
+func TestWarnLongLifetime(t *testing.T) {
+	for _, c := range []struct {
+		max, open time.Duration
+		warn      bool
+	}{
+		{config.MaxTokenLifetimeBound, config.MaxTokenLifetimeBound, false},
+		{config.MaxTokenLifetimeBound + time.Second, time.Minute, true},
+		{time.Hour, config.MaxTokenLifetimeBound + time.Second, true},
+	} {
+		var buf bytes.Buffer
+		cfg := config.Defaults()
+		cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime, cfg.AllowLongTokenLifetime = c.max, c.open, true
+		warnLongLifetime(context.Background(), slog.New(slog.NewJSONHandler(&buf, nil)), cfg)
+		got := buf.String()
+		if warned := strings.Contains(got, `"level":"WARN"`) && strings.Contains(got, "RELAY_ALLOW_LONG_TOKEN_LIFETIME"); warned != c.warn {
+			t.Errorf("max %s, open %s: warned %v: %q", c.max, c.open, warned, got)
+		}
 	}
 }
