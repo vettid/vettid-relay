@@ -379,6 +379,9 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 	if err != nil {
 		return time.Time{}, err
 	}
+	// The value is returned only once the transaction commits: a failed
+	// commit is an error, and the handler answers 500, not a report.
+	// (No test injects a commit failure.)
 	if err := tx.Commit(); err != nil {
 		return time.Time{}, err
 	}

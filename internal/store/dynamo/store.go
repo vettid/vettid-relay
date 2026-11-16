@@ -700,7 +700,10 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			succValsS[":snb"] = avN(succNB)
 		}
 		// nb only grows: one raised since the read (a deletion) fails the
-		// write, and Rotate reads again.
+		// write, and Rotate reads again. With no nb read, a deletion since
+		// the read also raises gsk past :tk, so the gsk condition would
+		// fail the write too; attribute_not_exists(nb) states the rule
+		// directly, so the nb returned is the nb committed.
 		succNBCond := " AND attribute_not_exists(nb)"
 		succValsA := item{}
 		if succNB > 0 {
