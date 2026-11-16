@@ -60,3 +60,23 @@ func TestOnceError(t *testing.T) {
 		t.Fatal("error not counted")
 	}
 }
+
+type partialStore struct{}
+
+func (partialStore) Sweep(context.Context) (store.SweepStats, error) {
+	return store.SweepStats{Mailboxes: 1, Messages: 2}, errors.New("1 of 2 due mailboxes failed")
+}
+
+// A pass where one mailbox failed still counts what the rest removed.
+func TestOncePartial(t *testing.T) {
+	reg := metrics.New()
+	s := New(partialStore{}, time.Minute, slog.New(slog.NewTextHandler(io.Discard, nil)), reg)
+	s.Once(context.Background())
+	var b strings.Builder
+	reg.WriteTo(&b)
+	for _, want := range []string{"relay_sweep_errors_total 1", `relay_sweep_removed_total{kind="mailboxes"} 1`, `relay_sweep_removed_total{kind="messages"} 2`} {
+		if !strings.Contains(b.String(), want) {
+			t.Fatalf("missing %s in:\n%s", want, b.String())
+		}
+	}
+}

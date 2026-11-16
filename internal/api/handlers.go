@@ -194,6 +194,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// The tombstone comes from the registration itself, as deposits see
 	// it: never from a cache or another process's stale view (§6.1).
 	created, nb, err := s.st.Register(r.Context(), id, pub)
+	if errors.Is(err, store.ErrBusy) {
+		s.log.Warn("register deferred: the mailbox is busy", "err", err)
+		s.writeError(w, busy())
+		return
+	}
 	if err != nil {
 		s.log.Error("register failed", "err", err)
 		s.writeError(w, fail(CodeInternal))
@@ -754,6 +759,10 @@ func (s *Server) handleRotate(w http.ResponseWriter, r *http.Request) {
 	switch err := s.st.Rotate(r.Context(), mb.ID, newID, newPub, s.now().Add(s.cfg.RotationGrace)); {
 	case errors.Is(err, store.ErrNotFound):
 		s.writeError(w, fail(CodeMailboxUnknown))
+		return
+	case errors.Is(err, store.ErrBusy):
+		s.log.Warn("rotate deferred: the successor is busy", "err", err)
+		s.writeError(w, busy())
 		return
 	case err != nil:
 		s.log.Error("rotate failed", "err", err)

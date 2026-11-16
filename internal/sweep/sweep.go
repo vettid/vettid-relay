@@ -65,14 +65,15 @@ func (s *Sweeper) Run(ctx context.Context) {
 func (s *Sweeper) Once(ctx context.Context) {
 	start := time.Now()
 	st, err := s.st.Sweep(ctx)
-	if err != nil {
-		if ctx.Err() == nil {
+	// What a pass removed is counted even when part of it failed (one
+	// mailbox's purge, say): the rest was done.
+	if ctx.Err() == nil {
+		s.runs.Inc()
+		if err != nil {
 			s.errs.Inc()
 			s.log.Error("sweep failed", "err", err)
 		}
-		return
 	}
-	s.runs.Inc()
 	s.deleted.With("messages").Add(st.Messages)
 	s.deleted.With("leases").Add(st.Leases)
 	s.deleted.With("denylist").Add(st.Denylist)
