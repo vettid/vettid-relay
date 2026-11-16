@@ -28,9 +28,9 @@ func (b *busyStore) Register(ctx context.Context, id string, pub []byte) (bool, 
 	return b.Backend.Register(ctx, id, pub)
 }
 
-func (b *busyStore) Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) error {
+func (b *busyStore) Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) (time.Time, error) {
 	if b.busy.Load() {
-		return fmt.Errorf("purging: %w", store.ErrBusy)
+		return time.Time{}, fmt.Errorf("purging: %w", store.ErrBusy)
 	}
 	return b.Backend.Rotate(ctx, oldID, newID, newPub, deleteAfter)
 }

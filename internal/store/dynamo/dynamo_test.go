@@ -324,7 +324,7 @@ func TestMissingMarkFailsClosed(t *testing.T) {
 	if _, _, err := s.Register(ctx, "a", make([]byte, 32)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "a", "b", append(make([]byte, 31), 2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", append(make([]byte, 31), 2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + time.Minute)
@@ -435,7 +435,7 @@ func TestRotateSuccessorGuardRace(t *testing.T) {
 			}
 		}
 	})
-	if err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 	dynamo.SetBeforeRotate(s, nil)
@@ -457,7 +457,7 @@ func TestRotateOntoAnotherKeyCollides(t *testing.T) {
 	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "a", "b", k(2), time.Now().Add(time.Hour)); err == nil || !strings.Contains(err.Error(), "collision") {
+	if _, err := s.Rotate(ctx, "a", "b", k(2), time.Now().Add(time.Hour)); err == nil || !strings.Contains(err.Error(), "collision") {
 		t.Fatalf("rotate onto another key's id: %v", err)
 	}
 }
@@ -476,7 +476,7 @@ func TestRetireFoldsTombKeep(t *testing.T) {
 	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + 11*time.Minute)
@@ -583,7 +583,7 @@ func TestRotateRetriesExhausted(t *testing.T) {
 	}
 	g := c.Now().Add(2 * time.Hour).UnixMilli()
 	dynamo.SetBeforeRotate(s, func() { g += 1000; dynamo.SetAccountN(s, "b", map[string]int64{"gsk": g}) })
-	err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+	_, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
 	dynamo.SetBeforeRotate(s, nil)
 	if !errors.Is(err, store.ErrBusy) || !strings.Contains(err.Error(), "dynamo: rotate:") || strings.Contains(err.Error(), "%!") {
 		t.Fatalf("rotate: %v", err)
@@ -619,7 +619,7 @@ func pastGrace(t *testing.T, s *dynamo.Store, c *storetest.Clock) {
 	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + time.Minute)
@@ -634,7 +634,7 @@ func TestRotatePastGraceKeepsRemoval(t *testing.T) {
 	s, c := newMarked(t)
 	pastGrace(t, s, c)
 	_, removedKeep := store.DefaultTombstonePolicy.WithMark(time.Millisecond).Times(c.Now())
-	if err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.DeleteMailbox(ctx, "b", k(2), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
@@ -669,7 +669,7 @@ func TestRotateKeepsRaisedNB(t *testing.T) {
 			}
 		}
 	})
-	err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+	_, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
 	dynamo.SetBeforeRotate(s, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -767,7 +767,7 @@ func TestNoReviveDuringPurge(t *testing.T) {
 			if _, _, err := s.Register(ctx, "a", k(1)); !errors.Is(err, store.ErrBusy) {
 				t.Errorf("a registration during the sweep's purge: %v, want ErrBusy", err)
 			}
-			if err := s.Rotate(ctx, "x", "a", k(1), c.Now().Add(time.Hour)); !errors.Is(err, store.ErrBusy) {
+			if _, err := s.Rotate(ctx, "x", "a", k(1), c.Now().Add(time.Hour)); !errors.Is(err, store.ErrBusy) {
 				t.Errorf("a rotation during the sweep's purge: %v, want ErrBusy", err)
 			}
 		}
@@ -783,7 +783,7 @@ func TestNoReviveDuringPurge(t *testing.T) {
 	if dynamo.StatsExists(s, "a") || dynamo.AccountHas(s, "a", "pub") {
 		t.Fatal("the purge left the account or counters item")
 	}
-	if err := s.Rotate(ctx, "x", "a", k(1), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "x", "a", k(1), c.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("rotation after the purge: %v", err)
 	}
 	fill(t, s, c, "a")
@@ -869,7 +869,7 @@ func TestRotateOntoPastGraceResets(t *testing.T) {
 	if _, err := s.Deposit(ctx, "b", "s", []byte("x"), 3*time.Hour, store.Limits{TokenJTI: "m0", TokenIssuedAt: c.Now(), TokenExpires: c.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	v := dynamo.StatsN(s, "b", "v")
@@ -880,7 +880,7 @@ func TestRotateOntoPastGraceResets(t *testing.T) {
 	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if n := dynamo.StatsN(s, "b", "msgs"); n != 0 {
@@ -905,7 +905,7 @@ func TestNoReviveDuringRetire(t *testing.T) {
 	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + 11*time.Minute)
@@ -939,7 +939,7 @@ func TestRotateWaitsForFenceTakenAfterRead(t *testing.T) {
 	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "b", "y", k(3), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "b", "y", k(3), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s.Register(ctx, "x", k(1)); err != nil {
@@ -953,7 +953,7 @@ func TestRotateWaitsForFenceTakenAfterRead(t *testing.T) {
 			dynamo.SetFence(s, "b", c.Now())
 		}
 	})
-	err := s.Rotate(ctx, "x", "b", k(2), c.Now().Add(2*time.Hour))
+	_, err := s.Rotate(ctx, "x", "b", k(2), c.Now().Add(2*time.Hour))
 	dynamo.SetBeforeRotate(s, nil)
 	if err == nil {
 		t.Fatal("the rotation revived its successor under a purge's fence")
@@ -1009,7 +1009,7 @@ func TestNoCommitAfterTakeover(t *testing.T) {
 		if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+		if _, err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 		c.Add(time.Hour + 11*time.Minute)
@@ -1032,7 +1032,7 @@ func TestNoCommitAfterTakeover(t *testing.T) {
 			t.Fatal(err)
 		}
 		takeover(s, c, "b")
-		err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+		_, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
 		dynamo.SetDuringPurge(s, nil)
 		if err == nil || !dynamo.AccountHas(s, "b", "deleted") {
 			t.Fatalf("rotated onto b after its fence was taken over: %v", err)
@@ -1125,7 +1125,7 @@ func TestRotateOntoRevivedSuccessor(t *testing.T) {
 			fill(t, s, c, "b")
 		}
 	})
-	err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+	_, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
 	dynamo.SetBeforeRotate(s, nil)
 	if err != nil || once {
 		t.Fatalf("rotate: %v (hook ran: %v)", err, !once)
@@ -1143,7 +1143,7 @@ func TestSweepSparesRevivedRetire(t *testing.T) {
 	if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + 11*time.Minute)
@@ -1216,7 +1216,7 @@ func TestRotateRetriesThroughFence(t *testing.T) {
 			dynamo.ClearFence(s, "b")
 		}
 	})
-	err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+	_, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
 	dynamo.SetBeforeRotate(s, nil)
 	if err != nil || n < 3 {
 		t.Fatalf("rotate: %v after %d tries", err, n)
@@ -1362,7 +1362,7 @@ func TestDeletionFailureKeepsPredecessors(t *testing.T) {
 	if _, _, err := s.Register(ctx, "p", k(1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "p", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "p", "b", k(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	dynamo.SetPurgeBudget(s, time.Nanosecond)
@@ -1389,17 +1389,17 @@ func TestRotateReplacesPreds(t *testing.T) {
 	if _, _, err := s.Register(ctx, "p", k(2)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "p", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "p", "b", k(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + time.Minute)
 	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if got := dynamo.AccountSS(s, "b", "preds"); len(got) != 1 || got[0] != "a" {
@@ -1613,7 +1613,7 @@ func TestReReadAfterFenceLost(t *testing.T) {
 		if _, err := s.Deposit(ctx, "b", "s", []byte("x"), 3*time.Hour, store.Limits{TokenJTI: "m0", TokenIssuedAt: c.Now(), TokenExpires: c.Now().Add(time.Hour)}); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+		if _, err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 		c.Add(time.Hour + time.Minute) // b past its grace, not swept
@@ -1636,7 +1636,7 @@ func TestReReadAfterFenceLost(t *testing.T) {
 		var err error
 		if rotate {
 			dynamo.SetBeforeRotate(s, release)
-			err = s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+			_, err = s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
 		} else {
 			dynamo.SetBeforeRevive(s, release)
 			_, _, err = s.Register(ctx, "b", k(2))
@@ -1763,7 +1763,7 @@ func TestTransportErrorsNameNoMailbox(t *testing.T) {
 		}
 		blobs[id] = b.ID
 	}
-	if err := s.Rotate(ctx, "MBXMARKERret", "MBXMARKERnew", k(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "MBXMARKERret", "MBXMARKERnew", k(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	sw.down.Store(true)
@@ -1818,7 +1818,7 @@ func TestRotateConflictsAreBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.txConflicts = 1000
-	err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+	_, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
 	f.txConflicts = 0
 	if !errors.Is(err, store.ErrBusy) {
 		t.Fatalf("a rotation that kept conflicting: %v, want ErrBusy", err)
@@ -1833,7 +1833,7 @@ func TestRotateOtherCancellationsAreNotBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.txConflicts, f.txCode = 1000, "ValidationError"
-	err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+	_, err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
 	f.txConflicts = 0
 	if err == nil || errors.Is(err, store.ErrBusy) {
 		t.Fatalf("a rotation that kept failing validation: %v, want a plain error", err)

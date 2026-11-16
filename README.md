@@ -7,7 +7,7 @@ keys to payload content: a compromised relay can drop or delay messages, but
 can't read or forge them.
 
 - **Protocol:** [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md)
-  (**v0.12.0**, reported by `relay -version` and `/healthz`). This repository
+  (**v0.13.0**, reported by `relay -version` and `/healthz`). This repository
   implements all of it:
   - registration
   - deposit tokens (PASETO v4.public, sender-bound), plus one-shot open
@@ -534,7 +534,7 @@ other process sees, refuses or is woken by.
 | `GET /v1/mailbox/ws` | owner (at upgrade) | WebSocket: server frames are messages, client frames are `{"ack": "<msg_id>"}` |
 | `DELETE /v1/mailbox/{msg_id}` | owner | always `204`, including for another mailbox's message (a no-op) |
 | `POST /v1/mailbox/denylist` | owner | `204` |
-| `POST /v1/mailbox/rotate` | owner (current key) | `200 {mailbox_id}` |
+| `POST /v1/mailbox/rotate` | owner (current key) | `200 {mailbox_id, reports_tombstones_at_rotation, tokens_not_before?}`: the marker is `true`, and `tokens_not_before` is there while a tombstone for the new id is held (0.13.0, §6.7) |
 | `DELETE /v1/mailbox` | owner, no body | always `204` (idempotent): the mailbox, its contents and rotated predecessors are deleted |
 | `PUT /v1/blob/{mailbox_id}` | deposit token + signed by `sub` | `201 {blob_id, expires_at}` |
 | `GET /v1/blob/{blob_id}` | owner of the recipient mailbox | `200 application/octet-stream` |
@@ -653,6 +653,15 @@ implementation chooses as follows:
   once the tombstone is swept. With DynamoDB, a re-registered mailbox keeps
   its tokens-not-before for good (deposits keep checking it), so its `200`s
   keep reporting it.
+- **Tombstones at rotation** (0.13.0, §6.7): every rotate `200` carries
+  `reports_tombstones_at_rotation: true`, and `tokens_not_before` while a
+  tombstone for the successor's id is held: a deleted key, a live key that
+  carries an older one, or a key past its rotation grace that the rotate
+  removes first. The value is the one registration reports, rounded up
+  the same way, and a repeated rotate answers the same. It is read within
+  the rotation (SQLite: its transaction; DynamoDB: the value its write
+  committed), never from a process's cache. `limits.reports_tombstones`
+  stays.
 - **Lowering the token lifetime limits.** Tombstones and denylist
   entries are kept for the largest token lifetime the relay has ever
   advertised (RELAY-PROTOCOL 0.12.0 §6.10), not only the limits configured

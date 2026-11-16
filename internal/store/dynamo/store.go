@@ -652,23 +652,25 @@ func (s *Store) Mailbox(ctx context.Context, id string) (store.Mailbox, error) {
 // Rotate implements store.Backend in one transaction: schedule the old
 // mailbox (never later than an existing schedule), create or revive the
 // successor, and mark the old mailbox's counters item dead at the same time
-// so a deposit racing the deadline fails.
-func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) error {
+// so a deposit racing the deadline fails. It returns the successor's nb as
+// the transaction wrote it (the condition on nb makes the item's nb exactly
+// succNB when it commits): zero when the successor has none.
+func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) (time.Time, error) {
 	defer s.forget(oldID, newID)
 	for attempt := 0; ; attempt++ {
 		now := s.now()
 		old, ok, err := s.getMailbox(ctx, oldID)
 		if err != nil {
-			return err
+			return time.Time{}, err
 		}
 		if !ok || dead(old, now) {
-			return store.ErrNotFound
+			return time.Time{}, store.ErrNotFound
 		}
 		// A successor id that was deleted before starts empty (its
 		// contents are normally purged already).
 		succ, err := s.getAccount(ctx, newID)
 		if err != nil {
-			return err
+			return time.Time{}, err
 		}
 		succDead := len(succ) > 0 && dead(parseMailbox(succ), now)
 		// The successor's gsk is removed below: its tombstone's expiry
@@ -683,7 +685,7 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 				if _, deleted := succ["deleted"]; !deleted {
 					p, err := s.tombstones(ctx)
 					if err != nil {
-						return err
+						return time.Time{}, err
 					}
 					rnb, rkeep := p.Times(now)
 					succNB, succKeep = max(succNB, ms(rnb)), max(succKeep, ms(rkeep))
@@ -714,33 +716,33 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 		succFence, succValsF, tok := " AND attribute_not_exists(purge_by)", item{}, ""
 		if succDead {
 			if subtle.ConstantTimeCompare(getB(succ, "pub"), newPub) != 1 {
-				return fmt.Errorf("store: mailbox id collision")
+				return time.Time{}, fmt.Errorf("store: mailbox id collision")
 			}
 			var fok bool
 			tok, fok, err = s.fence(ctx, newID, deadCond, item{":p": avB(newPub), ":now": avN(ms(now))})
 			if err != nil {
-				return err
+				return time.Time{}, err
 			}
 			if !fok { // changed since the read, or another purge holds it
 				if attempt >= maxTxAttempts {
-					return fmt.Errorf("dynamo: rotate: %w", errPurging)
+					return time.Time{}, fmt.Errorf("dynamo: rotate: %w", errPurging)
 				}
 				if err := backoff(ctx, attempt); err != nil {
-					return err
+					return time.Time{}, err
 				}
 				continue
 			}
 			if _, err := s.purgeFenced(ctx, newID, tok); err != nil {
 				s.unfence(ctx, newID, tok)
 				if !errors.Is(err, errFenceLost) {
-					return err
+					return time.Time{}, err
 				}
 				// Taken over: read again.
 				if attempt >= maxTxAttempts {
-					return fmt.Errorf("dynamo: rotate: %w", errPurging)
+					return time.Time{}, fmt.Errorf("dynamo: rotate: %w", errPurging)
 				}
 				if err := backoff(ctx, attempt); err != nil {
-					return err
+					return time.Time{}, err
 				}
 				continue
 			}
@@ -804,43 +806,51 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 			}},
 		}})
 		if err == nil {
-			return nil
+			return committedNB(succNB), nil
 		}
 		if tok != "" {
 			s.unfence(ctx, newID, tok)
 		}
 		r := txReasons(err)
 		if r == nil {
-			return err
+			return time.Time{}, err
 		}
 		if reasonCode(r, 1) == "ConditionalCheckFailed" {
 			// Another key's mailbox, or its tombstone raised since the read
 			// (then read again).
 			cur, gerr := s.getAccount(ctx, newID)
 			if gerr != nil {
-				return gerr
+				return time.Time{}, gerr
 			}
 			if len(cur) > 0 && subtle.ConstantTimeCompare(getB(cur, "pub"), newPub) != 1 {
-				return fmt.Errorf("store: mailbox id collision")
+				return time.Time{}, fmt.Errorf("store: mailbox id collision")
 			}
 			if attempt >= maxTxAttempts {
-				return fmt.Errorf("dynamo: rotate: the successor kept changing: %w (%w)", store.ErrBusy, err)
+				return time.Time{}, fmt.Errorf("dynamo: rotate: the successor kept changing: %w (%w)", store.ErrBusy, err)
 			}
 			if err := backoff(ctx, attempt); err != nil {
-				return err
+				return time.Time{}, err
 			}
 			continue
 		}
 		if attempt >= maxTxAttempts {
 			if isConflict(r) { // conflicts or throttling: busy (429)
-				return fmt.Errorf("dynamo: rotate: kept conflicting: %w (%w)", store.ErrBusy, err)
+				return time.Time{}, fmt.Errorf("dynamo: rotate: kept conflicting: %w (%w)", store.ErrBusy, err)
 			}
-			return fmt.Errorf("dynamo: rotate: %w", err)
+			return time.Time{}, fmt.Errorf("dynamo: rotate: %w", err)
 		}
 		if err := backoff(ctx, attempt); err != nil {
-			return err
+			return time.Time{}, err
 		}
 	}
+}
+
+// committedNB is the tokens-not-before a write of nb (ms; 0: none) left.
+func committedNB(nb int64) time.Time {
+	if nb <= 0 {
+		return time.Time{}
+	}
+	return fromMS(nb)
 }
 
 // --------------------------------------------------------------- counters
