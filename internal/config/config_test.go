@@ -105,6 +105,58 @@ func TestLoadRejects(t *testing.T) {
 	}
 }
 
+// A token lifetime limit over 400 days is refused at start, naming the
+// variable, unless RELAY_ALLOW_LONG_TOKEN_LIFETIME is true: the retention
+// it sets is never lowered again.
+func TestTokenLifetimeBound(t *testing.T) {
+	if MaxTokenLifetimeBound != 400*24*time.Hour || MaxTokenLifetimeLimit != 876000*time.Hour {
+		t.Fatalf("bound %s, limit %s", MaxTokenLifetimeBound, MaxTokenLifetimeLimit)
+	}
+	if c, err := Load(env(map[string]string{"RELAY_MAX_TOKEN_LIFETIME": "9600h", "RELAY_OPEN_TOKEN_MAX_LIFETIME": "9600h"})); err != nil || c.MaxTokenLifetime != MaxTokenLifetimeBound || c.OpenTokenMaxLifetime != MaxTokenLifetimeBound {
+		t.Errorf("both at the bound: %v", err)
+	}
+	for _, key := range []string{"RELAY_MAX_TOKEN_LIFETIME", "RELAY_OPEN_TOKEN_MAX_LIFETIME"} {
+		if c, err := Load(env(map[string]string{key: "9600h"})); err != nil || max(c.MaxTokenLifetime, c.OpenTokenMaxLifetime) != MaxTokenLifetimeBound {
+			t.Errorf("%s at the bound: %v", key, err)
+		}
+		for _, v := range []string{"34560001", "72000h"} {
+			_, err := Load(env(map[string]string{key: v}))
+			if err == nil || !strings.Contains(err.Error(), key+" is ") || !strings.Contains(err.Error(), "RELAY_ALLOW_LONG_TOKEN_LIFETIME=true") || !strings.Contains(err.Error(), "9600h0m0s") ||
+				!strings.Contains(err.Error(), map[string]string{"34560001": "9600h0m1s", "72000h": "72000h0m0s"}[v]) {
+				t.Errorf("%s=%s: %v", key, v, err)
+			}
+			for _, allow := range []string{"true", "1"} {
+				if c, err := Load(env(map[string]string{key: v, "RELAY_ALLOW_LONG_TOKEN_LIFETIME": allow})); err != nil || !c.AllowLongTokenLifetime {
+					t.Errorf("%s=%s with the override %s: %v", key, v, allow, err)
+				}
+			}
+			for _, allow := range []string{"false", "0"} {
+				if _, err := Load(env(map[string]string{key: v, "RELAY_ALLOW_LONG_TOKEN_LIFETIME": allow})); err == nil {
+					t.Errorf("%s=%s with RELAY_ALLOW_LONG_TOKEN_LIFETIME=%s accepted", key, v, allow)
+				}
+			}
+		}
+	}
+	// Even with the override, at most 100 years: retention adds margins
+	// to the limit and must not overflow.
+	for _, key := range []string{"RELAY_MAX_TOKEN_LIFETIME", "RELAY_OPEN_TOKEN_MAX_LIFETIME"} {
+		if c, err := Load(env(map[string]string{key: "876000h", "RELAY_ALLOW_LONG_TOKEN_LIFETIME": "true"})); err != nil || max(c.MaxTokenLifetime, c.OpenTokenMaxLifetime) != MaxTokenLifetimeLimit {
+			t.Errorf("%s at the limit: %v", key, err)
+		}
+		for _, v := range []string{"3153600001", "9223372036"} {
+			if _, err := Load(env(map[string]string{key: v, "RELAY_ALLOW_LONG_TOKEN_LIFETIME": "true"})); err == nil || !strings.Contains(err.Error(), key+" is ") || !strings.Contains(err.Error(), "876000h0m0s (100 years)") {
+				t.Errorf("%s=%s with the override: %v", key, v, err)
+			}
+		}
+	}
+	if _, err := Load(env(map[string]string{"RELAY_ALLOW_LONG_TOKEN_LIFETIME": "yes"})); err == nil {
+		t.Error("RELAY_ALLOW_LONG_TOKEN_LIFETIME=yes accepted")
+	}
+	if Defaults().AllowLongTokenLifetime {
+		t.Error("the override is on by default")
+	}
+}
+
 func TestLifetimePolicyConfig(t *testing.T) {
 	c, err := Load(env(map[string]string{
 		"RELAY_MAX_TOKEN_LIFETIME":      "34560000", // 400 days, integer seconds
@@ -413,9 +465,9 @@ func TestDurationSecondsRange(t *testing.T) {
 		}
 	}
 	// The largest that fits is still read as seconds.
-	c, err := Load(env(map[string]string{"RELAY_SERVES_VAULTS": "false", "RELAY_MAX_TOKEN_LIFETIME": "9223372036"}))
-	if err != nil || c.MaxTokenLifetime != 9223372036*time.Second {
-		t.Fatalf("%v %v", c.MaxTokenLifetime, err)
+	c, err := Load(env(map[string]string{"RELAY_SERVES_VAULTS": "false", "RELAY_CLAIM_TTL": "9223372036"}))
+	if err != nil || c.ClaimTTL != 9223372036*time.Second {
+		t.Fatalf("%v %v", c.ClaimTTL, err)
 	}
 	// A message TTL under a second is refused: it would advertise 0.
 	if _, err := Load(env(map[string]string{"RELAY_MESSAGE_TTL": "500ms"})); err == nil || !strings.Contains(err.Error(), "RELAY_MESSAGE_TTL must be at least 1s") {

@@ -209,7 +209,7 @@ func (s *Store) LifetimeMark(ctx context.Context) (time.Duration, error) {
 	if !ok {
 		return 0, errors.New("dynamo: no lifetime mark stored")
 	}
-	return time.Duration(v) * time.Millisecond, nil
+	return store.MarkFromMillis(v)
 }
 
 // withVals returns it with o's entries added.
@@ -264,7 +264,7 @@ func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Du
 	if !ok {
 		return 0, errors.New("dynamo: lifetime mark missing after its write")
 	}
-	return time.Duration(v) * time.Millisecond, nil
+	return store.MarkFromMillis(v)
 }
 
 // Ping implements store.Backend: one cheap read.

@@ -79,6 +79,9 @@ type Config struct {
 	RotationGrace        time.Duration
 	MaxTokenLifetime     time.Duration // RELAY_MAX_TOKEN_LIFETIME
 	OpenTokenMaxLifetime time.Duration // RELAY_OPEN_TOKEN_MAX_LIFETIME
+	// RELAY_ALLOW_LONG_TOKEN_LIFETIME: accept a token lifetime limit above
+	// MaxTokenLifetimeBound. Without it such a limit is refused at start.
+	AllowLongTokenLifetime bool
 
 	MaxClaimBytes int64         // RELAY_MAX_CLAIM_BYTES
 	ClaimTTL      time.Duration // RELAY_CLAIM_TTL (max TTL a creator may request)
@@ -169,6 +172,22 @@ type Config struct {
 // shorter grace loses deposits it still collects and a longer one only
 // accepts more it doesn't.
 const VaultRotationGrace = 14 * 24 * time.Hour
+
+// MaxTokenLifetimeBound is the largest RELAY_MAX_TOKEN_LIFETIME and
+// RELAY_OPEN_TOKEN_MAX_LIFETIME accepted without
+// RELAY_ALLOW_LONG_TOKEN_LIFETIME: 400 days. Tombstones and denylist
+// entries are kept for the largest limit ever advertised, and the stored
+// lifetime mark is never lowered (§6.10), so a mistyped limit (72000h for
+// 7200h) would hold them for years, and only a hand edit of the store
+// would undo it. The relay doesn't start rather than raise the mark.
+const MaxTokenLifetimeBound = 400 * 24 * time.Hour
+
+// MaxTokenLifetimeLimit is the largest token lifetime limit accepted even
+// with RELAY_ALLOW_LONG_TOKEN_LIFETIME: 100 years. Retention adds margins
+// to the limit, and a time.Duration holds about 292 years, so a larger
+// one could overflow into a negative retention, and revocations and
+// tombstones would expire at once.
+const MaxTokenLifetimeLimit = 100 * 365 * 24 * time.Hour
 
 // VaultMaxMessageTTL bounds message_ttl_seconds for a relay serving
 // VettID vaults (RELAY-PROTOCOL 0.11.1 §6.1): a vault's dedupe of
@@ -470,6 +489,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	dur("RELAY_SHUTDOWN_TIMEOUT", &c.ShutdownTimeout)
 	boolean("RELAY_EMPTY_HINTS", &c.EmptyHints)
 	boolean("RELAY_SERVES_VAULTS", &c.ServesVaults)
+	boolean("RELAY_ALLOW_LONG_TOKEN_LIFETIME", &c.AllowLongTokenLifetime)
 	dur("RELAY_EMPTY_SKIP_MAX", &c.EmptySkipMax)
 
 	if err := c.Validate(); err != nil {
@@ -525,6 +545,17 @@ func (c Config) Validate() error {
 	}
 	if c.MaxTokenLifetime < time.Second || c.OpenTokenMaxLifetime < time.Second || c.ClaimTTL < time.Second {
 		errs = append(errs, errors.New("token lifetimes and claim TTL must be at least 1s"))
+	}
+	for _, l := range []struct {
+		key string
+		d   time.Duration
+	}{{"RELAY_MAX_TOKEN_LIFETIME", c.MaxTokenLifetime}, {"RELAY_OPEN_TOKEN_MAX_LIFETIME", c.OpenTokenMaxLifetime}} {
+		switch {
+		case l.d > MaxTokenLifetimeLimit:
+			errs = append(errs, fmt.Errorf("%s is %s, over %s (100 years), the most even RELAY_ALLOW_LONG_TOKEN_LIFETIME allows", l.key, l.d, MaxTokenLifetimeLimit))
+		case l.d > MaxTokenLifetimeBound && !c.AllowLongTokenLifetime:
+			errs = append(errs, fmt.Errorf("%s is %s, over %s (400 days): tombstones and denylist entries would be kept that long, and the stored lifetime mark is never lowered; fix the value, or set RELAY_ALLOW_LONG_TOKEN_LIFETIME=true if it is meant", l.key, l.d, MaxTokenLifetimeBound))
+		}
 	}
 	if c.RotationGrace <= 0 {
 		errs = append(errs, errors.New("RELAY_ROTATION_GRACE must be > 0"))

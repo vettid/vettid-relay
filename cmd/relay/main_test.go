@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -10,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,5 +130,67 @@ func TestLifecycle(t *testing.T) {
 	defer st.Close()
 	if _, err := st.Mailbox(context.Background(), c.MailboxID()); err != nil {
 		t.Fatalf("registration lost: %v", err)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the relay's goroutines.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *syncBuffer) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *syncBuffer) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
+}
+
+// run refuses a configuration Validate refuses before it opens a store,
+// so the lifetime mark is never raised by it; an allowed long lifetime
+// starts, with its warning.
+func TestRunLongLifetime(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.ListenAddr = freeAddr(t)
+	cfg.MetricsAddr = freeAddr(t)
+	cfg.BaseURL = "http://" + cfg.ListenAddr
+	cfg.DBPath = filepath.Join(t.TempDir(), "relay.db")
+	cfg.ShutdownTimeout = 5 * time.Second
+	cfg.MaxTokenLifetime = config.MaxTokenLifetimeBound + time.Hour
+
+	refusedCtx, stopRefused := context.WithTimeout(context.Background(), 5*time.Second) // a run that starts ends here
+	defer stopRefused()
+	if err := run(refusedCtx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil); err == nil || !strings.Contains(err.Error(), "RELAY_ALLOW_LONG_TOKEN_LIFETIME") {
+		t.Fatalf("run with a refused limit: %v", err)
+	}
+	if _, err := os.Stat(cfg.DBPath); !os.IsNotExist(err) {
+		t.Fatalf("the store was opened: %v", err)
+	}
+
+	cfg.AllowLongTokenLifetime = true
+	var logs syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), ready) }()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("run exited early: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("relay not ready")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "token lifetime limit over 400 days") {
+		t.Fatalf("no warning: %s", logs.String())
 	}
 }
