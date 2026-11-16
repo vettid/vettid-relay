@@ -126,6 +126,143 @@ func TestRegisterReportsRotationTombstone(t *testing.T) {
 	}
 }
 
+// rotateAnswer rotates from's mailbox onto to's key and returns the status
+// and the answer.
+func (f *fixture) rotateAnswer(from, to principal) (int, map[string]any) {
+	f.t.Helper()
+	proof := ed25519.Sign(to.priv, []byte(from.mbx))
+	body, _ := json.Marshal(map[string]any{"new_pubkey": to.b64, "new_key_proof": proof})
+	code, b := f.do(req{method: "POST", path: "/v1/mailbox/rotate", body: body, signer: &from})
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		f.t.Fatalf("rotate: %d %s", code, b)
+	}
+	return code, m
+}
+
+// The rotate answer reports the successor's tombstone (§6.7, 0.13.0): the
+// marker in every 200; tokens_not_before, as at registration, while a
+// tombstone for the successor's id is held, and never otherwise; a repeat
+// answers the same. Each case is checked against the registration answer
+// for the same key, and the value against the deposit check.
+func TestRotateReportsTombstones(t *testing.T) {
+	f := newFixture(t, nil)
+	sender := newPrincipal(20)
+	// rotated rotates and checks the marker, and that the field matches a
+	// registration of the successor's key just after.
+	rotated := func(what string, from, to principal) (string, bool) {
+		t.Helper()
+		code, m := f.rotateAnswer(from, to)
+		if code != http.StatusOK || m["mailbox_id"] != to.mbx || m["reports_tombstones_at_rotation"] != true {
+			t.Fatalf("%s: %d %v", what, code, m)
+		}
+		v, ok := tombField(m)
+		rcode, rm := f.registerAnswer(to)
+		if rv, rok := tombField(rm); rcode != http.StatusOK || rv != v || rok != ok {
+			t.Fatalf("%s: rotate said %q %v, registration %d %v", what, v, ok, rcode, rm)
+		}
+		return v, ok
+	}
+	// accepted checks the deposit check against a reported value.
+	accepted := func(what string, owner principal, v string) {
+		t.Helper()
+		want, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			t.Fatalf("%s: %q: %v", what, v, err)
+		}
+		if f.clk.now().Before(want.Add(time.Second)) {
+			f.clk.set(want.Add(time.Second))
+		}
+		before := f.mint(owner, sender, func(c *auth.Claims) {
+			c.Iat = want.Add(-time.Second)
+			c.Exp = want.Add(time.Hour)
+			c.Jti = what + "-before"
+		})
+		f.expectCode(req{method: "POST", path: "/v1/mailbox/" + owner.mbx, body: depositBody([]byte("x")), signer: &sender, token: before}, 403, CodeTokenRevoked)
+		at := f.mint(owner, sender, func(c *auth.Claims) { c.Iat = want; c.Exp = want.Add(time.Hour); c.Jti = what + "-at" })
+		f.mustDeposit(owner, sender, at, []byte("x"))
+	}
+
+	// A fresh key: no field, also on a repeat.
+	a, b := newPrincipal(1), newPrincipal(2)
+	f.register(a)
+	if v, ok := rotated("a fresh key", a, b); ok {
+		t.Fatalf("a fresh key: tokens_not_before %q", v)
+	}
+	if v, ok := rotated("a repeat onto a fresh key", a, b); ok {
+		t.Fatalf("a repeat onto a fresh key: tokens_not_before %q", v)
+	}
+
+	// A deleted key, at a fractional second: rounded up; a repeat answers
+	// the same.
+	d, e := newPrincipal(3), newPrincipal(4)
+	f.register(d)
+	f.clk.set(f.clk.now().Truncate(time.Second).Add(400 * time.Millisecond))
+	deleted := f.clk.now()
+	if code, b := f.deleteMailbox(d); code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", code, b)
+	}
+	f.register(e)
+	want := wholeSecondUp(deleted.Add(auth.FreshnessWindow)).UTC().Format(time.RFC3339)
+	if v, _ := rotated("a deleted key", e, d); v != want {
+		t.Fatalf("a deleted key: %q, want %q", v, want)
+	}
+	f.clk.add(time.Minute)
+	if v, _ := rotated("a repeat onto a deleted key", e, d); v != want {
+		t.Fatalf("a repeat onto a deleted key: %q, want %q", v, want)
+	}
+	accepted("deleted", d, want)
+
+	// A tombstone written before 0.12.0, at a fractional second (the store
+	// directly; the api rounds it up when it deletes): reported rounded up,
+	// and that is the value deposits compare with.
+	o, o2 := newPrincipal(10), newPrincipal(11)
+	f.register(o)
+	onb := f.clk.now().Truncate(time.Second).Add(90*time.Second + 400*time.Millisecond)
+	if _, err := f.st.DeleteMailbox(context.Background(), o.mbx, o.pub, onb, onb.Add(denylistRetention(f.cfg))); err != nil {
+		t.Fatal(err)
+	}
+	f.register(o2)
+	owant := wholeSecondUp(onb).UTC().Format(time.RFC3339)
+	if v, _ := rotated("a fractional tombstone", o2, o); v != owant {
+		t.Fatalf("a fractional tombstone: %q, want %q", v, owant)
+	}
+	accepted("fractional", o, owant)
+
+	// A live key that carries an older tombstone.
+	g, h := newPrincipal(5), newPrincipal(6)
+	f.register(g)
+	gdel := f.clk.now()
+	if code, b := f.deleteMailbox(g); code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", code, b)
+	}
+	f.clk.add(time.Hour)
+	f.register(g)
+	f.register(h)
+	gwant := wholeSecondUp(gdel.Add(auth.FreshnessWindow)).UTC().Format(time.RFC3339)
+	if v, _ := rotated("a live key with an older tombstone", h, g); v != gwant {
+		t.Fatalf("a live key with an older tombstone: %q, want %q", v, gwant)
+	}
+	accepted("live", g, gwant)
+
+	// A key rotated away whose grace has ended, not swept yet: the rotate
+	// removes its mailbox first (vettid-relay #29) and reports the
+	// removal's tombstone.
+	p, q, r := newPrincipal(7), newPrincipal(8), newPrincipal(9)
+	f.register(p)
+	if code, m := f.rotateAnswer(p, q); code != http.StatusOK {
+		t.Fatalf("rotate away: %d %v", code, m)
+	}
+	f.clk.add(f.cfg.RotationGrace + time.Minute)
+	removed := f.clk.now()
+	f.register(r)
+	pwant := wholeSecondUp(removed.Add(auth.FreshnessWindow)).UTC().Format(time.RFC3339)
+	if v, _ := rotated("a key past its grace", r, p); v != pwant {
+		t.Fatalf("a key past its grace: %q, want %q", v, pwant)
+	}
+	accepted("removed", p, pwant)
+}
+
 func TestWholeSecondUp(t *testing.T) {
 	at := time.Date(2026, 11, 14, 15, 0, 0, 0, time.UTC)
 	for in, want := range map[time.Duration]time.Duration{0: 0, time.Millisecond: time.Second, 999 * time.Millisecond: time.Second, time.Second: time.Second} {

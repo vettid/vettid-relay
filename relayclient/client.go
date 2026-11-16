@@ -265,15 +265,21 @@ type Registration struct {
 // relay holds no tombstone for the id. A tokens_not_before without the
 // flag, or one that can't be parsed, counts as neither being there.
 func (r Registration) Tombstone() (notBefore time.Time, reported bool) {
+	return readTombstone(r.Limits.ReportsTombstones, r.TokensNotBefore)
+}
+
+// readTombstone reads a tombstone report: flag (only true counts) and
+// field, tokens_not_before (RFC 3339, a fractional second rounded up).
+func readTombstone(flagJSON, field json.RawMessage) (notBefore time.Time, reported bool) {
 	var flag bool
-	if json.Unmarshal(r.Limits.ReportsTombstones, &flag) != nil || !flag {
+	if json.Unmarshal(flagJSON, &flag) != nil || !flag {
 		return time.Time{}, false
 	}
-	if len(r.TokensNotBefore) == 0 {
+	if len(field) == 0 {
 		return time.Time{}, true
 	}
 	var s string
-	if json.Unmarshal(r.TokensNotBefore, &s) != nil {
+	if json.Unmarshal(field, &s) != nil {
 		return time.Time{}, false
 	}
 	t, err := time.Parse(time.RFC3339Nano, s)
@@ -426,19 +432,42 @@ func (c *Client) Revoke(ctx context.Context, entries ...Revocation) error {
 	return err
 }
 
-// Rotate moves this mailbox to newKey and returns the new mailbox id. The
-// client keeps using the old key until the caller swaps c.Key.
-func (c *Client) Rotate(ctx context.Context, newKey ed25519.PrivateKey) (string, error) {
+// Rotation is the rotate response.
+type Rotation struct {
+	MailboxID string `json:"mailbox_id"`
+	// Protocol >= 0.13.0 (§6.7): the relay reports tombstones in this
+	// answer. Only true counts (Rotation.Tombstone).
+	ReportsTombstonesAtRotation json.RawMessage `json:"reports_tombstones_at_rotation,omitempty"`
+	// TokensNotBefore is the answer's tokens_not_before as sent; read it
+	// with Tombstone.
+	TokensNotBefore json.RawMessage `json:"tokens_not_before,omitempty"`
+}
+
+// Tombstone reads the answer's tombstone report for the successor's id
+// (RELAY-PROTOCOL 0.13.0 §6.7), as Registration.Tombstone reads a
+// registration's: reported is false when the answer has no
+// reports_tombstones_at_rotation, or any value but true, and then says
+// nothing about tombstones (for a key used before, the rotation counts as
+// a possible deletion). When reported, notBefore is the tombstone's
+// tokens-not-before, rounded up to the whole second, or zero when the
+// relay holds no tombstone for the id. A tokens_not_before without the
+// marker, or one that can't be parsed, counts as neither being there.
+func (r Rotation) Tombstone() (notBefore time.Time, reported bool) {
+	return readTombstone(r.ReportsTombstonesAtRotation, r.TokensNotBefore)
+}
+
+// Rotate moves this mailbox to newKey and returns the answer: the new
+// mailbox id and its tombstone report. The client keeps using the old key
+// until the caller swaps c.Key.
+func (c *Client) Rotate(ctx context.Context, newKey ed25519.PrivateKey) (Rotation, error) {
 	proof := ed25519.Sign(newKey, []byte(c.MailboxID()))
 	body, _ := json.Marshal(map[string]any{
 		"new_pubkey":    auth.EncodeKey(newKey.Public().(ed25519.PublicKey)),
 		"new_key_proof": proof,
 	})
-	var out struct {
-		MailboxID string `json:"mailbox_id"`
-	}
+	var out Rotation
 	_, err := c.doJSON(ctx, request{method: "POST", path: "/v1/mailbox/rotate", body: body}, &out)
-	return out.MailboxID, err
+	return out, err
 }
 
 // PutBlob uploads ciphertext to mailboxID (claim-check, spec §6.8).

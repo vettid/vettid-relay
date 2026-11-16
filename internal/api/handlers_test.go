@@ -433,7 +433,7 @@ func TestRotate(t *testing.T) {
 	f.expectCode(req{method: "POST", path: "/v1/mailbox/rotate", body: mk(proof), signer: &newKey}, 404, CodeMailboxUnknown)
 
 	code, b := f.do(req{method: "POST", path: "/v1/mailbox/rotate", body: mk(proof), signer: &oldKey})
-	if code != 200 || string(b) != `{"mailbox_id":"`+newKey.mbx+`"}`+"\n" {
+	if code != 200 || string(b) != `{"mailbox_id":"`+newKey.mbx+`","reports_tombstones_at_rotation":true}`+"\n" {
 		t.Fatalf("rotate: %d %s", code, b)
 	}
 	// During the grace period both mailboxes collect.

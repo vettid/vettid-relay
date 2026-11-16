@@ -337,15 +337,17 @@ func (s *Store) mailbox(ctx context.Context, q querier, id string, includeDead b
 
 // Rotate registers the successor mailbox (idempotent) and schedules the old
 // one for deletion at deleteAfter (never later than an existing schedule).
-func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) error {
+// tokensNotBefore is read in the same transaction, after its writes, from
+// the row deposits are checked against.
+func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) (tokensNotBefore time.Time, err error) {
 	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	defer tx.Rollback()
 	now := s.now()
 	if _, err := s.mailbox(ctx, tx, oldID, false); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	// A successor of the same key past its rotation grace (not swept yet)
 	// is removed now, as Register does: its tombstone first, so the
@@ -355,38 +357,48 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 	switch err := tx.QueryRowContext(ctx, `SELECT pubkey, delete_after FROM mailboxes WHERE mailbox_id=?`, newID).Scan(&succPub, &succAfter); {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
-		return err
+		return time.Time{}, err
 	case succAfter.Valid && succAfter.Int64 <= ms(now) && subtle.ConstantTimeCompare(succPub, newPub) == 1:
 		if err := s.tombstoneRotated(ctx, tx, now, `mailbox_id=?`, newID); err != nil {
-			return err
+			return time.Time{}, err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM mailboxes WHERE mailbox_id=?`, newID); err != nil {
-			return err
+			return time.Time{}, err
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO mailboxes(mailbox_id, pubkey, created_at) VALUES(?,?,?)
 		 ON CONFLICT(mailbox_id) DO NOTHING`, newID, newPub, ms(now)); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	var existing []byte
 	if err := tx.QueryRowContext(ctx, `SELECT pubkey FROM mailboxes WHERE mailbox_id=?`, newID).Scan(&existing); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if subtle.ConstantTimeCompare(existing, newPub) != 1 {
-		return fmt.Errorf("store: mailbox id collision")
+		return time.Time{}, fmt.Errorf("store: mailbox id collision")
 	}
 	// A successor that was itself scheduled for deletion is revived.
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE mailboxes SET delete_after=NULL WHERE mailbox_id=?`, newID); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE mailboxes SET delete_after=MIN(COALESCE(delete_after, ?1), ?1), successor_id=?2
 		 WHERE mailbox_id=?3`, ms(deleteAfter), newID, oldID); err != nil {
-		return err
+		return time.Time{}, err
 	}
-	return tx.Commit()
+	succ, err := s.mailbox(ctx, tx, newID, true)
+	if err != nil {
+		return time.Time{}, err
+	}
+	// The value is returned only once the transaction commits: a failed
+	// commit is an error, and the handler answers 500, not a report.
+	// (No test injects a commit failure.)
+	if err := tx.Commit(); err != nil {
+		return time.Time{}, err
+	}
+	return succ.TokensNotBefore, nil
 }
 
 // tombstoneRotated writes (or extends) the tombstone of every mailbox row

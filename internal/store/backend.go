@@ -36,8 +36,11 @@ type Backend interface {
 	Mailbox(ctx context.Context, id string) (Mailbox, error)
 	// Rotate registers the successor (idempotent) and schedules the old
 	// mailbox for deletion at deleteAfter (never later than an existing
-	// schedule).
-	Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) error
+	// schedule). tokensNotBefore is the successor's TokensNotBefore as
+	// the rotation committed it, the value deposits are checked against,
+	// read within the rotation itself (never from a cache): zero when no
+	// tombstone for its id is held (§6.7, §6.10).
+	Rotate(ctx context.Context, oldID, newID string, newPub []byte, deleteAfter time.Time) (tokensNotBefore time.Time, err error)
 	// DeleteMailbox deletes mailbox id (registered with pub) and everything
 	// it holds — messages, leases, denylist, token counters, consumed open
 	// tokens, blobs (bodies included) and the claims it created — together

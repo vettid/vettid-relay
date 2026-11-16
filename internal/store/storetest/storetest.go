@@ -126,6 +126,7 @@ func Run(t *testing.T, h Harness) {
 		{"RevivePastGraceKeepsRemovalTombstone", testRevivePastGraceKeeps},
 		{"RotateOntoReRegisteredKeepsTombstone", testRotateOntoReRegisteredKeeps},
 		{"RotateOntoSameKeyPastGrace", testRotateOntoSameKeyPastGrace},
+		{"RotateReturnsNotBefore", testRotateReturnsNotBefore},
 		{"LifetimeMark", testLifetimeMark},
 		{"LifetimeMarkOutOfRange", testLifetimeMarkOutOfRange},
 		{"ReviveOnlyRaisesNotBefore", testReviveOnlyRaisesNB},
@@ -482,7 +483,7 @@ func testRotate(t *testing.T, h Harness) {
 	if _, err := s.Deposit(ctx, "old", "s", []byte("x"), time.Hour*24*30, store.Limits{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Mailbox(ctx, "old"); err != nil {
@@ -492,7 +493,7 @@ func testRotate(t *testing.T, h Harness) {
 		t.Fatal(mb, err)
 	}
 	// Idempotent, and never later than the existing schedule.
-	if err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(2*time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	// Both collect during grace.
@@ -501,7 +502,7 @@ func testRotate(t *testing.T, h Harness) {
 	}
 	// A successor id owned by another key is a collision.
 	mustRegister(t, s, "taken", 3)
-	if err := s.Rotate(ctx, "new", "taken", key(4), c.Now().Add(time.Hour)); err == nil || errors.Is(err, store.ErrNotFound) {
+	if _, err := s.Rotate(ctx, "new", "taken", key(4), c.Now().Add(time.Hour)); err == nil || errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("rotate onto another key's id: %v", err)
 	}
 	c.Add(time.Hour)
@@ -511,7 +512,7 @@ func testRotate(t *testing.T, h Harness) {
 	if _, err := s.Deposit(ctx, "old", "s", []byte("late"), time.Hour, store.Limits{}); err == nil {
 		t.Fatal("deposit into a mailbox past its deletion time must fail")
 	}
-	if err := s.Rotate(ctx, "old", "x", key(5), c.Now()); !errors.Is(err, store.ErrNotFound) {
+	if _, err := s.Rotate(ctx, "old", "x", key(5), c.Now()); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("rotate dead mailbox: %v", err)
 	}
 	if _, err := s.Mailbox(ctx, "new"); err != nil {
@@ -534,7 +535,7 @@ func testRotatedMailboxPurged(t *testing.T, h Harness) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
+	if _, err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Minute + h.SweepGrace)
@@ -1059,10 +1060,10 @@ func testDeleteRotation(t *testing.T, h Harness) {
 	s, c := h.open(t)
 	nb, keep := deleteTimes(c)
 	mustRegister(t, s, "o1", 1)
-	if err := s.Rotate(ctx, "o1", "n1", key(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "o1", "n1", key(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "n1", "n2", key(3), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "n1", "n2", key(3), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Deposit(ctx, "o1", "s", []byte("x"), time.Hour, store.Limits{}); err != nil {
@@ -1082,7 +1083,7 @@ func testDeleteRotation(t *testing.T, h Harness) {
 	}
 
 	mustRegister(t, s, "o2", 4)
-	if err := s.Rotate(ctx, "o2", "n3", key(5), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "o2", "n3", key(5), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	ids, err = s.DeleteMailbox(ctx, "o2", key(4), nb, keep)
@@ -1093,7 +1094,7 @@ func testDeleteRotation(t *testing.T, h Harness) {
 		t.Fatal("the successor must survive its predecessor's deletion:", err)
 	}
 	// A rotation back onto a deleted key revives it with its TokensNotBefore.
-	if err := s.Rotate(ctx, "n3", "o2", key(4), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "n3", "o2", key(4), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if mb, err := s.Mailbox(ctx, "o2"); err != nil || mb.TokensNotBefore.IsZero() {
@@ -1159,7 +1160,7 @@ func testRegisterAfterGrace(t *testing.T, h Harness) {
 	if _, err := s.Deposit(ctx, "old", "s", []byte("x"), 30*24*time.Hour, store.Limits{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
+	if _, err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	oldIat := c.Now().Add(-time.Minute)
@@ -1197,7 +1198,7 @@ func testRotatedTombstone(t *testing.T, h Harness) {
 	if err := s.AddDenylist(ctx, "old", []store.DenyEntry{{Kind: "jti", Value: "revoked"}}, exp, 10); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
+	if _, err := s.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Minute + h.SweepGrace)
@@ -1238,7 +1239,7 @@ func testRotatedTombstoneAcrossProcesses(t *testing.T, h Harness) {
 	a, b, c := h.pair(t)
 	mustRegister(t, a, "old", 1)
 	oldIat := c.Now().Add(-time.Minute)
-	if err := a.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
+	if _, err := a.Rotate(ctx, "old", "new", key(2), c.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Minute + h.SweepGrace)
@@ -1717,7 +1718,7 @@ func testLifetimeMarkOutOfRange(t *testing.T, h Harness) {
 		s, c := h.open(t)
 		m := s.(store.LifetimeMarker)
 		mustRegister(t, s, "a", 1)
-		if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 		if err := h.PlantMark(s, raw); err != nil {
@@ -1759,7 +1760,7 @@ func testReviveOnlyRaisesNB(t *testing.T, h Harness) {
 		t.Fatal(err)
 	}
 	mustRegister(t, s, "a", 1)
-	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + time.Minute) // past the grace, not swept
@@ -1782,7 +1783,7 @@ func testRotatedTombstoneUsesMark(t *testing.T, h Harness) {
 		t.Fatal(err)
 	}
 	mustRegister(t, s, "a", 1)
-	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + h.SweepGrace + time.Minute)
@@ -1868,7 +1869,7 @@ func testRotateAfterReRegisterKeeps(t *testing.T, h Harness) {
 		t.Fatal(err)
 	}
 	mustRegister(t, s, "a", 1)
-	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + time.Minute)
@@ -1893,7 +1894,7 @@ func testRotateOntoDeletedKeeps(t *testing.T, h Harness) {
 		t.Fatal(err)
 	}
 	mustRegister(t, s, "a", 1)
-	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	short := c.Now().Add(time.Hour)
@@ -1917,7 +1918,7 @@ func testRetireKeepsEarlier(t *testing.T, h Harness) {
 		t.Fatal(err)
 	}
 	mustRegister(t, s, "a", 1)
-	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + h.SweepGrace + time.Minute)
@@ -1936,7 +1937,7 @@ func testRetireKeepsEarlier(t *testing.T, h Harness) {
 func testRevivePastGraceKeeps(t *testing.T, h Harness) {
 	s, c := h.open(t)
 	mustRegister(t, s, "a", 1)
-	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	c.Add(time.Hour + time.Minute)
@@ -1963,7 +1964,7 @@ func testRotateOntoReRegisteredKeeps(t *testing.T, h Harness) {
 	}
 	mustRegister(t, s, "b", 2)
 	mustRegister(t, s, "a", 1)
-	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	short := c.Now().Add(time.Hour)
@@ -1981,13 +1982,13 @@ func testRotateOntoReRegisteredKeeps(t *testing.T, h Harness) {
 func testRotateOntoSameKeyPastGrace(t *testing.T, h Harness) {
 	s, c := h.open(t)
 	mustRegister(t, s, "b", 2)
-	if err := s.Rotate(ctx, "b", "x", key(3), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "b", "x", key(3), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	before := c.Now()
 	c.Add(time.Hour + time.Minute) // b past its grace, not swept
 	mustRegister(t, s, "a", 1)
-	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+	if _, err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	mb, err := s.Mailbox(ctx, "b")
@@ -1996,5 +1997,103 @@ func testRotateOntoSameKeyPastGrace(t *testing.T, h Harness) {
 	}
 	if _, err := s.Deposit(ctx, "b", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "old", TokenIssuedAt: before, TokenExpires: c.Now().Add(time.Hour)}); !errors.Is(err, store.ErrRevoked) {
 		t.Fatalf("a token issued before the removal: %v", err)
+	}
+}
+
+// Rotate returns the successor's tokens-not-before as the rotation
+// committed it, the value deposits are checked against (§6.7, 0.13.0):
+// none for a fresh key, also on a repeat; a deleted key's, the same again
+// on a repeat; the older one a live successor carries; and the removal's,
+// for a successor past its rotation grace.
+func testRotateReturnsNotBefore(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	nb, keep := deleteTimes(c)
+	// rotate checks the answer against the successor's stored value.
+	rotate := func(what, oldID, newID string, b byte) time.Time {
+		t.Helper()
+		got, err := s.Rotate(ctx, oldID, newID, key(b), c.Now().Add(time.Hour))
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		mb, err := s.Mailbox(ctx, newID)
+		if err != nil || !got.Equal(mb.TokensNotBefore) {
+			t.Fatalf("%s: returned %v, stored %v (%v)", what, got, mb.TokensNotBefore, err)
+		}
+		return got
+	}
+
+	mustRegister(t, s, "a", 1)
+	if got := rotate("a fresh key", "a", "b", 2); !got.IsZero() {
+		t.Fatalf("a fresh key: %v", got)
+	}
+	if got := rotate("a repeat onto a fresh key", "a", "b", 2); !got.IsZero() {
+		t.Fatalf("a repeat onto a fresh key: %v", got)
+	}
+
+	mustRegister(t, s, "d", 3)
+	if _, err := s.DeleteMailbox(ctx, "d", key(3), nb, keep); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "e", 4)
+	got := rotate("a deleted key", "e", "d", 3)
+	if !got.Equal(nb.Truncate(time.Millisecond)) {
+		t.Fatalf("a deleted key: %v, want %v", got, nb)
+	}
+	c.Add(time.Minute)
+	if again := rotate("a repeat onto a deleted key", "e", "d", 3); !again.Equal(got) {
+		t.Fatalf("a repeat onto a deleted key: %v, want %v", again, got)
+	}
+
+	// Live, with an older tombstone: deleted, then registered again.
+	mustRegister(t, s, "f", 5)
+	fnb, fkeep := deleteTimes(c)
+	if _, err := s.DeleteMailbox(ctx, "f", key(5), fnb, fkeep); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour)
+	mustRegister(t, s, "f", 5)
+	mustRegister(t, s, "g", 6)
+	if got := rotate("a live key with an older tombstone", "g", "f", 5); !got.Equal(fnb.Truncate(time.Millisecond)) {
+		t.Fatalf("a live key with an older tombstone: %v, want %v", got, fnb)
+	}
+
+	// Past its rotation grace, not swept: the rotation removes it first.
+	mustRegister(t, s, "p", 7)
+	if _, err := s.Rotate(ctx, "p", "q", key(8), c.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(2 * time.Minute)
+	removed := c.Now()
+	mustRegister(t, s, "r", 9)
+	if got := rotate("a key past its grace", "r", "p", 7); !got.Equal(removed.Add(90 * time.Second).Truncate(time.Millisecond)) {
+		t.Fatalf("a key past its grace: %v, want %v", got, removed.Add(90*time.Second))
+	}
+
+	// Past its grace and carrying an older tombstone (deleted, registered
+	// again, rotated away): the removal's later not-before is the one
+	// returned, and deposits check that one, not the older.
+	mustRegister(t, s, "u", 10)
+	unb, ukeep := deleteTimes(c)
+	if _, err := s.DeleteMailbox(ctx, "u", key(10), unb, ukeep); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(time.Hour)
+	mustRegister(t, s, "u", 10)
+	if _, err := s.Rotate(ctx, "u", "v", key(11), c.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(2 * time.Minute)
+	uremoved := c.Now()
+	mustRegister(t, s, "w", 12)
+	want := uremoved.Add(90 * time.Second).Truncate(time.Millisecond)
+	if got := rotate("past its grace with an older tombstone", "w", "u", 10); !got.Equal(want) {
+		t.Fatalf("past its grace with an older tombstone: %v, want %v", got, want)
+	}
+	between := unb.Add(time.Minute)
+	if _, err := s.Deposit(ctx, "u", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "between", TokenIssuedAt: between, TokenExpires: c.Now().Add(time.Hour)}); !errors.Is(err, store.ErrRevoked) {
+		t.Fatalf("a token issued between the two not-befores: %v", err)
+	}
+	if _, err := s.Deposit(ctx, "u", "s", []byte("x"), time.Hour, store.Limits{TokenJTI: "after", TokenIssuedAt: want.Add(time.Second), TokenExpires: want.Add(time.Hour)}); err != nil {
+		t.Fatalf("a token issued after the reported not-before: %v", err)
 	}
 }
