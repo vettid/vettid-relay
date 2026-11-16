@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vettid/vettid-relay/internal/store"
+	"github.com/vettid/vettid-relay/internal/store/dynamo"
 )
 
 // busyStore answers store.ErrBusy (another operation holds the mailbox)
@@ -72,5 +73,14 @@ func TestBusyIsRateLimited(t *testing.T) {
 	}
 	if code, b := f.deleteMailbox(owner); code != 204 {
 		t.Fatalf("delete after: %d %s", code, b)
+	}
+}
+
+// A deletion is given longer than one purge may run in the DynamoDB
+// store, so a large mailbox's purge isn't cut short by the deletion's own
+// deadline.
+func TestDeleteTimeoutOutlastsPurge(t *testing.T) {
+	if deleteTimeout <= dynamo.PurgeBudget {
+		t.Fatalf("deleteTimeout %s isn't longer than the purge budget %s", deleteTimeout, dynamo.PurgeBudget)
 	}
 }

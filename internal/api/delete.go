@@ -18,9 +18,13 @@ const wsStatusMailboxUnknown = websocket.StatusCode(4404)
 
 // deleteTimeout bounds one deletion. It runs detached from the request:
 // a client that disconnects mid-way must not leave it half done. It is
-// longer than a purge's budget in the DynamoDB store (2 min), so a large
-// mailbox's purge isn't cut short by it; a long chain of predecessors may
-// still need a repeat (which reaches them through the tombstone's preds).
+// longer than a purge's budget in the DynamoDB store (dynamo.PurgeBudget,
+// 2 min), so a large mailbox's purge isn't cut short by it; a long chain
+// of predecessors may still need a repeat (which reaches them through the
+// tombstone's preds). The load balancer in front of the relay gives up
+// sooner (its idle timeout is 75 s): a deletion that runs longer reaches
+// the client as a 504 while it carries on here, and the client's retry
+// gets 429 rate_limited until it is done, then 204.
 const deleteTimeout = 3 * time.Minute
 
 // DELETE /v1/mailbox (spec §6.10, 0.5.0). Owner-signed and bodiless; the

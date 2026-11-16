@@ -6,14 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/vettid/vettid-relay/internal/store"
 	"github.com/vettid/vettid-relay/internal/store/dynamo"
@@ -1428,9 +1432,26 @@ func TestLargePurge(t *testing.T) {
 type flakyDB struct {
 	dynamo.DB
 	mu             sync.Mutex
-	putConflicts   int  // PutItem: TransactionConflictException this many times
-	fenceConflicts int  // the fence's UpdateItem: the same
-	lostFence      bool // the next fence write applies, then errors
+	putConflicts   int    // PutItem: TransactionConflictException this many times
+	fenceConflicts int    // the fence's UpdateItem: the same
+	lostFence      bool   // the next fence write applies, then errors
+	unfenceConfl   int    // the unfence's UpdateItem: TransactionConflictException this many times
+	txConflicts    int    // TransactWriteItems: cancelled for a conflict this many times
+	txCode         string // the cancellation reason txConflicts uses ("": TransactionConflict)
+}
+
+func (f *flakyDB) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, o ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
+	if f.take(&f.txConflicts) {
+		r := make([]types.CancellationReason, len(in.TransactItems))
+		for i := range r {
+			r[i].Code = aws.String("TransactionConflict")
+			if f.txCode != "" {
+				r[i].Code = aws.String(f.txCode)
+			}
+		}
+		return nil, &types.TransactionCanceledException{Message: aws.String("cancelled"), CancellationReasons: r}
+	}
+	return f.DB.TransactWriteItems(ctx, in, o...)
 }
 
 func (f *flakyDB) take(n *int) bool {
@@ -1457,6 +1478,9 @@ func (f *flakyDB) PutItem(ctx context.Context, in *dynamodb.PutItemInput, o ...f
 func (f *flakyDB) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, o ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
 	isFence := in.UpdateExpression != nil && strings.HasPrefix(*in.UpdateExpression, "SET purging")
 	if isFence && f.take(&f.fenceConflicts) {
+		return nil, conflict()
+	}
+	if in.UpdateExpression != nil && *in.UpdateExpression == "REMOVE purging, purge_by" && f.take(&f.unfenceConfl) {
 		return nil, conflict()
 	}
 	out, err := f.DB.UpdateItem(ctx, in, o...)
@@ -1497,6 +1521,9 @@ func TestTxConflictIsRetried(t *testing.T) {
 	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
 		t.Fatalf("a registration meeting a transaction: %v", err)
 	}
+	if _, err := s.Mailbox(ctx, "a"); err != nil || f.putConflicts != 0 {
+		t.Fatalf("after the conflicted registration: %v, %d conflicts unused", err, f.putConflicts)
+	}
 	if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -1504,6 +1531,9 @@ func TestTxConflictIsRetried(t *testing.T) {
 	f.fenceConflicts = 2
 	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
 		t.Fatalf("a revive whose fence met a transaction: %v", err)
+	}
+	if _, err := s.Mailbox(ctx, "a"); err != nil || f.fenceConflicts != 0 {
+		t.Fatalf("after the conflicted revive: %v, %d conflicts unused", err, f.fenceConflicts)
 	}
 }
 
@@ -1650,5 +1680,162 @@ func TestSweepGoesOnPastAFailure(t *testing.T) {
 	}
 	if msg := err.Error(); !strings.Contains(msg, "1 of 2") || strings.Contains(msg, "mbx-") {
 		t.Fatalf("the sweep's error: %q", msg)
+	}
+}
+
+// An unfence that meets a transaction in flight is retried: the deletion
+// leaves no fence behind.
+func TestUnfenceRetriesConflict(t *testing.T) {
+	s, c, f := newFlaky(t)
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	f.unfenceConfl = 2
+	if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if dynamo.AccountHas(s, "a", "purge_by") || f.unfenceConfl != 0 {
+		t.Fatalf("after the deletion: fence left %v, %d conflicts unused", dynamo.AccountHas(s, "a", "purge_by"), f.unfenceConfl)
+	}
+}
+
+// switchS3 is the fake S3 until down is set, then a client whose
+// endpoint is closed: every call fails at the transport, with the
+// request's URL in the SDK's error text.
+type switchS3 struct {
+	up, dead *s3.Client
+	down     atomic.Bool
+}
+
+func (x *switchS3) c() *s3.Client {
+	if x.down.Load() {
+		return x.dead
+	}
+	return x.up
+}
+
+func (x *switchS3) PutObject(ctx context.Context, in *s3.PutObjectInput, o ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	return x.c().PutObject(ctx, in, o...)
+}
+
+func (x *switchS3) GetObject(ctx context.Context, in *s3.GetObjectInput, o ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+	return x.c().GetObject(ctx, in, o...)
+}
+
+func (x *switchS3) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, o ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	return x.c().DeleteObject(ctx, in, o...)
+}
+
+// deadEndpoint is the URL of a server that has stopped.
+func deadEndpoint() string {
+	ts := httptest.NewServer(http.NotFoundHandler())
+	u := ts.URL
+	ts.Close()
+	return u
+}
+
+// A transport failure of the blob store reaches the store's errors (and
+// so the logs) without the mailbox or blob id its URL holds: a deletion,
+// a blob read, the sweep's retire. Likewise a DynamoDB transport failure.
+func TestTransportErrorsNameNoMailbox(t *testing.T) {
+	db := ddblocal.Client(t)
+	dead := s3.New(s3.Options{Region: "us-east-1", BaseEndpoint: aws.String(deadEndpoint()), UsePathStyle: true,
+		Credentials: aws.AnonymousCredentials{}, RetryMaxAttempts: 1})
+	sw := &switchS3{up: fakes3.New(t).Client(), dead: dead}
+	c := storetest.NewClock()
+	s, err := dynamo.New(dynamo.Config{Table: ddblocal.Table(t, db), DB: db, S3: sw, Bucket: "b", Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RaiseLifetimeMark(ctx, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{"MBXMARKERdel", "MBXMARKERget", "MBXMARKERret"}
+	blobs := map[string]string{}
+	for _, id := range ids {
+		if _, _, err := s.Register(ctx, id, k(1)); err != nil {
+			t.Fatal(err)
+		}
+		b, err := s.PutBlob(ctx, store.BlobPut{Mailbox: id, Size: 4, TTL: 3 * time.Hour,
+			Limits: store.Limits{TokenJTI: "b-" + id, TokenIssuedAt: c.Now(), TokenExpires: c.Now().Add(time.Hour)}}, bytes.NewReader([]byte("blob")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		blobs[id] = b.ID
+	}
+	if err := s.Rotate(ctx, "MBXMARKERret", "MBXMARKERnew", k(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	sw.down.Store(true)
+	clean := func(what string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: no error with the blob store down", what)
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "MBXMARKER") || strings.Contains(msg, "blobs/") {
+			t.Fatalf("%s: the error names what was asked for: %q", what, msg)
+		}
+		for _, id := range blobs {
+			if strings.Contains(msg, id) {
+				t.Fatalf("%s: the error names a blob: %q", what, msg)
+			}
+		}
+		if !strings.Contains(msg, "s3 ") {
+			t.Fatalf("%s: not the scrubbed S3 error: %q", what, msg)
+		}
+	}
+	// The SDK's own text does carry the key: what the scrub is for.
+	if _, err := dead.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String("b"), Key: aws.String("blobs/MBXMARKERraw/x")}); err == nil || !strings.Contains(err.Error(), "MBXMARKERraw") {
+		t.Fatalf("the raw SDK error: %v", err)
+	}
+	_, err = s.DeleteMailbox(ctx, "MBXMARKERdel", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour))
+	clean("delete", err)
+	_, _, err = s.OpenBlob(ctx, "MBXMARKERget", blobs["MBXMARKERget"])
+	clean("open blob", err)
+	c.Add(time.Hour + 11*time.Minute)
+	_, err = s.Sweep(ctx)
+	clean("sweep", err)
+
+	// DynamoDB: a transport failure names nothing either.
+	deadDB := dynamodb.New(dynamodb.Options{Region: "us-east-1", BaseEndpoint: aws.String(deadEndpoint()),
+		Credentials: aws.AnonymousCredentials{}, RetryMaxAttempts: 1})
+	s2, err := dynamo.New(dynamo.Config{Table: "t", DB: deadDB, Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = s2.Register(ctx, "MBXMARKERddb", k(1))
+	if err == nil || strings.Contains(err.Error(), "MBXMARKER") || !strings.Contains(err.Error(), "dynamodb PutItem: transport") {
+		t.Fatalf("a DynamoDB transport failure: %v", err)
+	}
+}
+
+// A rotation whose transaction keeps conflicting gives up as busy (the
+// API's 429), not as a plain error.
+func TestRotateConflictsAreBusy(t *testing.T) {
+	s, c, f := newFlaky(t)
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	f.txConflicts = 1000
+	err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+	f.txConflicts = 0
+	if !errors.Is(err, store.ErrBusy) {
+		t.Fatalf("a rotation that kept conflicting: %v, want ErrBusy", err)
+	}
+}
+
+// A rotation cancelled again and again for another reason (a bug, not
+// contention) gives up as a plain error (500), not as busy.
+func TestRotateOtherCancellationsAreNotBusy(t *testing.T) {
+	s, c, f := newFlaky(t)
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	f.txConflicts, f.txCode = 1000, "ValidationError"
+	err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+	f.txConflicts = 0
+	if err == nil || errors.Is(err, store.ErrBusy) {
+		t.Fatalf("a rotation that kept failing validation: %v, want a plain error", err)
 	}
 }
