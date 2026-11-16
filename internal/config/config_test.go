@@ -121,7 +121,8 @@ func TestTokenLifetimeBound(t *testing.T) {
 		}
 		for _, v := range []string{"34560001", "72000h"} {
 			_, err := Load(env(map[string]string{key: v}))
-			if err == nil || !strings.Contains(err.Error(), key+" is ") || !strings.Contains(err.Error(), "RELAY_ALLOW_LONG_TOKEN_LIFETIME=true") || !strings.Contains(err.Error(), "9600h0m0s") {
+			if err == nil || !strings.Contains(err.Error(), key+" is ") || !strings.Contains(err.Error(), "RELAY_ALLOW_LONG_TOKEN_LIFETIME=true") || !strings.Contains(err.Error(), "9600h0m0s") ||
+				!strings.Contains(err.Error(), map[string]string{"34560001": "9600h0m1s", "72000h": "72000h0m0s"}[v]) {
 				t.Errorf("%s=%s: %v", key, v, err)
 			}
 			for _, allow := range []string{"true", "1"} {

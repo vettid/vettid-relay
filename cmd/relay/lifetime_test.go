@@ -83,23 +83,57 @@ func TestApplyLifetimeMarkFailsClosed(t *testing.T) {
 }
 
 // A limit over the bound, allowed by RELAY_ALLOW_LONG_TOKEN_LIFETIME, is
-// logged at WARN; one at the bound isn't.
+// logged at WARN, and so is a stored mark over it; at the bound, neither.
 func TestWarnLongLifetime(t *testing.T) {
+	b := config.MaxTokenLifetimeBound
 	for _, c := range []struct {
-		max, open time.Duration
-		warn      bool
+		max, open, mark time.Duration
+		want            []string
 	}{
-		{config.MaxTokenLifetimeBound, config.MaxTokenLifetimeBound, false},
-		{config.MaxTokenLifetimeBound + time.Second, time.Minute, true},
-		{time.Hour, config.MaxTokenLifetimeBound + time.Second, true},
+		{b, b, b, nil},
+		{b + time.Second, time.Minute, b + time.Second, []string{"token lifetime limit over 400 days"}},
+		{time.Hour, b + time.Second, b + time.Second, []string{"token lifetime limit over 400 days"}},
+		{time.Hour, time.Minute, b + time.Second, []string{"stored lifetime mark over 400 days"}},
 	} {
 		var buf bytes.Buffer
 		cfg := config.Defaults()
-		cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime, cfg.AllowLongTokenLifetime = c.max, c.open, true
-		warnLongLifetime(context.Background(), slog.New(slog.NewJSONHandler(&buf, nil)), cfg)
-		got := buf.String()
-		if warned := strings.Contains(got, `"level":"WARN"`) && strings.Contains(got, "RELAY_ALLOW_LONG_TOKEN_LIFETIME"); warned != c.warn {
-			t.Errorf("max %s, open %s: warned %v: %q", c.max, c.open, warned, got)
+		cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime, cfg.RetentionLifetime, cfg.AllowLongTokenLifetime = c.max, c.open, c.mark, true
+		warnLongLifetime(slog.New(slog.NewJSONHandler(&buf, nil)), cfg)
+		lines := strings.Count(buf.String(), `"level":"WARN"`)
+		if lines != len(c.want) {
+			t.Errorf("max %s, open %s, mark %s: %d warnings: %q", c.max, c.open, c.mark, lines, buf.String())
 		}
+		for _, w := range c.want {
+			if !strings.Contains(buf.String(), w) {
+				t.Errorf("max %s, open %s, mark %s: no %q: %q", c.max, c.open, c.mark, w, buf.String())
+			}
+		}
+	}
+	if config.MaxTokenLifetimeLimit != store.MaxLifetimeMark {
+		t.Fatalf("the config's limit %s and the stores' %s differ", config.MaxTokenLifetimeLimit, store.MaxLifetimeMark)
+	}
+}
+
+// A mark stored over the limit stops the start, pointing to its reset.
+func TestOpenStoreRefusesMarkOutOfRange(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "relay.db")
+	cfg := config.Defaults()
+	cfg.DBPath = path
+	st, err := openStore(ctx, &cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = st.(store.LifetimeMarker).RaiseLifetimeMark(ctx, store.MaxLifetimeMark+time.Hour)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg = config.Defaults()
+	cfg.DBPath = path
+	if st, err := openStore(ctx, &cfg); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
+		if st != nil {
+			st.Close()
+		}
+		t.Fatalf("started with the mark out of range: %v", err)
 	}
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -117,6 +118,25 @@ type LifetimeMarker interface {
 	// SetTombstones replaces the tombstone policy (before the store is in
 	// use: openStore calls it once the mark is known).
 	SetTombstones(p TombstonePolicy)
+}
+
+// MaxLifetimeMark is the largest lifetime mark a store reads as valid: 100
+// years, the largest token lifetime limit the relay accepts
+// (config.MaxTokenLifetimeLimit). Retention adds margins to the mark, and
+// a larger one (stored before that limit existed, or edited by hand) could
+// overflow into a negative retention: revocations and tombstones would
+// expire at once.
+const MaxLifetimeMark = 100 * 365 * 24 * time.Hour
+
+// MarkFromMillis is the lifetime mark stored as ms. One below zero or over
+// MaxLifetimeMark is an error, so whoever reads it fails closed: the relay
+// doesn't start, and deletions and revocations are refused, until the mark
+// is reset (README, "Resetting the mark").
+func MarkFromMillis(ms int64) (time.Duration, error) {
+	if ms < 0 || ms > MaxLifetimeMark.Milliseconds() {
+		return 0, fmt.Errorf("store: the stored lifetime mark (%d ms) is outside 0 to %s: reset it (README, \"Resetting the mark\")", ms, MaxLifetimeMark)
+	}
+	return time.Duration(ms) * time.Millisecond, nil
 }
 
 // WithMark returns p with its retention at least what the lifetime mark

@@ -126,14 +126,21 @@ func newLogger(cfg config.Config) *slog.Logger {
 	return slog.New(logbudget.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}), cfg.LogInfoPerSec, cfg.LogInfoBurst))
 }
 
-// warnLongLifetime logs at WARN a token lifetime limit above
-// config.MaxTokenLifetimeBound, which config.Load accepts only with
-// RELAY_ALLOW_LONG_TOKEN_LIFETIME: the stored lifetime mark is raised to
-// it and never lowered.
-func warnLongLifetime(ctx context.Context, log *slog.Logger, cfg config.Config) {
-	if limits := max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime); limits > config.MaxTokenLifetimeBound {
-		log.WarnContext(ctx, "token lifetime limit over 400 days, allowed by RELAY_ALLOW_LONG_TOKEN_LIFETIME: tombstones and denylist entries are kept that long, and the stored lifetime mark is never lowered",
+// warnLongLifetime logs at WARN, once the store is open, a token lifetime
+// limit above config.MaxTokenLifetimeBound (config.Load accepts one only
+// with RELAY_ALLOW_LONG_TOKEN_LIFETIME), and a stored lifetime mark above
+// it and above the limits now (one raised before, with the override then):
+// tombstones and denylist entries are kept that long, and the mark is
+// never lowered.
+func warnLongLifetime(log *slog.Logger, cfg config.Config) {
+	limits := max(cfg.MaxTokenLifetime, cfg.OpenTokenMaxLifetime)
+	if limits > config.MaxTokenLifetimeBound {
+		log.WarnContext(lifecycle, "token lifetime limit over 400 days, allowed by RELAY_ALLOW_LONG_TOKEN_LIFETIME: tombstones and denylist entries are kept that long, and the stored lifetime mark is never lowered",
 			"limits", limits.String(), "bound", config.MaxTokenLifetimeBound.String())
+	}
+	if cfg.RetentionLifetime > max(limits, config.MaxTokenLifetimeBound) {
+		log.WarnContext(lifecycle, "stored lifetime mark over 400 days: tombstones and denylist entries are kept that long (README, \"Resetting the mark\")",
+			"mark", cfg.RetentionLifetime.String(), "bound", config.MaxTokenLifetimeBound.String())
 	}
 }
 
@@ -142,7 +149,11 @@ func warnLongLifetime(ctx context.Context, log *slog.Logger, cfg config.Config) 
 // closed once both listeners are accepting.
 func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- struct{}) error {
 
-	warnLongLifetime(ctx, log, cfg)
+	// FromEnv validated cfg; again here, so no caller can raise the stored
+	// lifetime mark with a limit the configuration refuses.
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("configuration: %w", err)
+	}
 	reg := metrics.New()
 	openCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -156,6 +167,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 		log.WarnContext(lifecycle, "token lifetimes lowered: tombstones and denylist entries are kept for the larger limit advertised before",
 			"limits", limits.String(), "retention_lifetime", cfg.RetentionLifetime.String())
 	}
+	warnLongLifetime(log, cfg)
 	defer func() {
 		if err := st.Close(); err != nil {
 			log.ErrorContext(lifecycle, "close store", "err", err)

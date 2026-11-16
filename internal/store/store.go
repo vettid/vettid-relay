@@ -85,7 +85,7 @@ func (s *Store) RaiseLifetimeMark(ctx context.Context, d time.Duration) (time.Du
 	if err != nil {
 		return 0, err
 	}
-	return time.Duration(v) * time.Millisecond, nil
+	return MarkFromMillis(v)
 }
 
 // LifetimeMark implements LifetimeMarker.
@@ -94,7 +94,7 @@ func (s *Store) LifetimeMark(ctx context.Context) (time.Duration, error) {
 	if err := s.r.QueryRowContext(ctx, `SELECT lifetime_ms FROM lifetime_mark WHERE id = 1`).Scan(&v); err != nil {
 		return 0, fmt.Errorf("store: lifetime mark: %w", err)
 	}
-	return time.Duration(v) * time.Millisecond, nil
+	return MarkFromMillis(v)
 }
 
 // WithClock overrides the clock (tests).
@@ -385,8 +385,12 @@ func (s *Store) tombstoneRotated(ctx context.Context, tx *sql.Tx, now time.Time,
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(lifetime_ms), 0) FROM lifetime_mark`).Scan(&mark); err != nil {
 		return err
 	}
-	nb, keep := s.tomb.WithMark(time.Duration(mark) * time.Millisecond).Times(now)
-	_, err := tx.ExecContext(ctx,
+	d, err := MarkFromMillis(mark)
+	if err != nil {
+		return err
+	}
+	nb, keep := s.tomb.WithMark(d).Times(now)
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO tombstones(mailbox_id, not_before, expires_at)
 		 SELECT mailbox_id, ?, ? FROM mailboxes WHERE `+where+`
 		 ON CONFLICT(mailbox_id) DO UPDATE SET not_before=MAX(not_before, excluded.not_before),

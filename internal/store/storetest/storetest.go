@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -122,6 +123,7 @@ func Run(t *testing.T, h Harness) {
 		{"RotateOntoReRegisteredKeepsTombstone", testRotateOntoReRegisteredKeeps},
 		{"RotateOntoSameKeyPastGrace", testRotateOntoSameKeyPastGrace},
 		{"LifetimeMark", testLifetimeMark},
+		{"LifetimeMarkOutOfRange", testLifetimeMarkOutOfRange},
 		{"ReviveOnlyRaisesNotBefore", testReviveOnlyRaisesNB},
 		{"RotatedTombstoneUsesStoredMark", testRotatedTombstoneUsesMark},
 		{"RegisterAfterRotationGrace", testRegisterAfterGrace},
@@ -1675,6 +1677,37 @@ func testLifetimeMark(t *testing.T, h Harness) {
 		if got, err := b.(store.LifetimeMarker).RaiseLifetimeMark(ctx, day); err != nil || got != 50*day {
 			t.Fatalf("the other process: %s %v", got, err)
 		}
+	}
+}
+
+// A stored mark over store.MaxLifetimeMark (one stored before the limit
+// existed, or edited by hand) is an error wherever it is read, so the
+// relay fails closed: no start, no removal with a retention that would
+// overflow. Up to the limit it reads as stored.
+func testLifetimeMarkOutOfRange(t *testing.T, h Harness) {
+	s, c := h.open(t)
+	m := s.(store.LifetimeMarker)
+	if got, err := m.RaiseLifetimeMark(ctx, store.MaxLifetimeMark); err != nil || got != store.MaxLifetimeMark {
+		t.Fatalf("at the limit: %s %v", got, err)
+	}
+	mustRegister(t, s, "a", 1)
+	if err := s.Rotate(ctx, "a", "b", key(2), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	over := store.MaxLifetimeMark + time.Millisecond
+	if _, err := m.RaiseLifetimeMark(ctx, over); err == nil || !strings.Contains(err.Error(), "Resetting the mark") {
+		t.Fatalf("raised over the limit: %v", err)
+	}
+	if got, err := m.LifetimeMark(ctx); err == nil {
+		t.Fatalf("read over the limit: %s", got)
+	}
+	if got, err := m.RaiseLifetimeMark(ctx, time.Hour); err == nil {
+		t.Fatalf("a later start read %s", got)
+	}
+	// The rotated mailbox's removal needs the mark: it fails.
+	c.Add(time.Hour + h.SweepGrace + time.Minute)
+	if _, err := s.Sweep(ctx); err == nil {
+		t.Fatal("swept with a mark out of range")
 	}
 }
 

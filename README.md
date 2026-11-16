@@ -668,7 +668,12 @@ implementation chooses as follows:
   repeated deletion never shortens a tombstone. So that a mistyped limit
   can't raise the mark, a limit over 400 days is refused at start unless
   `RELAY_ALLOW_LONG_TOKEN_LIFETIME` is `true`, and one over 100 years
-  always is (the retention arithmetic would overflow).
+  always is (the retention arithmetic would overflow). A stored mark over
+  100 years (one raised before this check, or edited by hand) is refused
+  wherever it is read: the relay doesn't start, and deletions,
+  revocations and the removal of rotated mailboxes fail, until it is
+  reset. A stored mark over 400 days and over the limits configured now
+  is logged at WARN at start.
   - **Resetting the mark** (after a mistaken huge limit): set the
     `lifetime_mark` row (SQLite) or the `META`/`LIFETIME` item's `life_ms`
     (DynamoDB) to the configured limit, in milliseconds, but only once every
