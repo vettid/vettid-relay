@@ -581,7 +581,7 @@ func TestRotateRetriesExhausted(t *testing.T) {
 	dynamo.SetBeforeRotate(s, func() { g += 1000; dynamo.SetAccountN(s, "b", map[string]int64{"gsk": g}) })
 	err := s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
 	dynamo.SetBeforeRotate(s, nil)
-	if err == nil || !strings.Contains(err.Error(), "dynamo: rotate:") || strings.Contains(err.Error(), "%!") {
+	if !errors.Is(err, store.ErrBusy) || !strings.Contains(err.Error(), "dynamo: rotate:") || strings.Contains(err.Error(), "%!") {
 		t.Fatalf("rotate: %v", err)
 	}
 }
@@ -760,11 +760,11 @@ func TestNoReviveDuringPurge(t *testing.T) {
 	dynamo.SetDuringPurge(s, func() {
 		if once {
 			once = false
-			if _, _, err := s.Register(ctx, "a", k(1)); err == nil {
-				t.Error("a registration revived the mailbox the sweep is purging")
+			if _, _, err := s.Register(ctx, "a", k(1)); !errors.Is(err, store.ErrBusy) {
+				t.Errorf("a registration during the sweep's purge: %v, want ErrBusy", err)
 			}
-			if err := s.Rotate(ctx, "x", "a", k(1), c.Now().Add(time.Hour)); err == nil {
-				t.Error("a rotation revived the mailbox the sweep is purging")
+			if err := s.Rotate(ctx, "x", "a", k(1), c.Now().Add(time.Hour)); !errors.Is(err, store.ErrBusy) {
+				t.Errorf("a rotation during the sweep's purge: %v, want ErrBusy", err)
 			}
 		}
 	})
@@ -1049,8 +1049,8 @@ func TestDeletionWaitsForFence(t *testing.T) {
 	dynamo.SetBeforeMark(s, func() { dynamo.SetFence(s, "a", c.Now()) })
 	_, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour))
 	dynamo.SetBeforeMark(s, nil)
-	if err == nil {
-		t.Fatalf("the deletion answered with %d items left behind", dynamo.ContentN(s, "a"))
+	if !errors.Is(err, store.ErrBusy) {
+		t.Fatalf("the deletion under another's fence: %v, want ErrBusy (%d items left)", err, dynamo.ContentN(s, "a"))
 	}
 	if !dynamo.AccountHas(s, "a", "deleted") {
 		t.Fatal("the deletion didn't tombstone the mailbox first")
@@ -1419,5 +1419,236 @@ func TestLargePurge(t *testing.T) {
 	}
 	if n := dynamo.ContentN(s, "a"); n != 0 {
 		t.Fatalf("%d items left", n)
+	}
+}
+
+// flakyDB wraps the DynamoDB client to inject what DynamoDB Local doesn't
+// produce: a single-item write refused for a transaction in flight, and a
+// fence write that applied but whose answer was lost.
+type flakyDB struct {
+	dynamo.DB
+	mu             sync.Mutex
+	putConflicts   int  // PutItem: TransactionConflictException this many times
+	fenceConflicts int  // the fence's UpdateItem: the same
+	lostFence      bool // the next fence write applies, then errors
+}
+
+func (f *flakyDB) take(n *int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if *n > 0 {
+		*n--
+		return true
+	}
+	return false
+}
+
+func conflict() error {
+	return &types.TransactionConflictException{Message: aws.String("transaction in progress")}
+}
+
+func (f *flakyDB) PutItem(ctx context.Context, in *dynamodb.PutItemInput, o ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
+	if f.take(&f.putConflicts) {
+		return nil, conflict()
+	}
+	return f.DB.PutItem(ctx, in, o...)
+}
+
+func (f *flakyDB) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, o ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	isFence := in.UpdateExpression != nil && strings.HasPrefix(*in.UpdateExpression, "SET purging")
+	if isFence && f.take(&f.fenceConflicts) {
+		return nil, conflict()
+	}
+	out, err := f.DB.UpdateItem(ctx, in, o...)
+	f.mu.Lock()
+	lost := isFence && err == nil && f.lostFence
+	if lost {
+		f.lostFence = false
+	}
+	f.mu.Unlock()
+	if lost {
+		return nil, errors.New("connection reset (the write applied)")
+	}
+	return out, err
+}
+
+// newFlaky is newMarked over a flakyDB.
+func newFlaky(t *testing.T) (*dynamo.Store, *storetest.Clock, *flakyDB) {
+	t.Helper()
+	db := ddblocal.Client(t)
+	f := &flakyDB{DB: db}
+	c := storetest.NewClock()
+	s, err := dynamo.New(dynamo.Config{Table: ddblocal.Table(t, db), DB: f, S3: fakes3.New(t).Client(), Bucket: "b", Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RaiseLifetimeMark(ctx, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	return s, c, f
+}
+
+// A single-item write that meets a purge's transaction on the account
+// item (TransactionConflictException) is retried, not an error: the
+// registration's put, and the fence.
+func TestTxConflictIsRetried(t *testing.T) {
+	s, c, f := newFlaky(t)
+	f.putConflicts = 2
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatalf("a registration meeting a transaction: %v", err)
+	}
+	if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(2 * time.Minute)
+	f.fenceConflicts = 2
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatalf("a revive whose fence met a transaction: %v", err)
+	}
+}
+
+// A fence write that applied but whose answer was lost is given back: the
+// key isn't kept waiting for the lease.
+func TestLostFenceWriteUnfenced(t *testing.T) {
+	s, c, f := newFlaky(t)
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.Add(2 * time.Minute)
+	f.lostFence = true
+	if _, _, err := s.Register(ctx, "a", k(1)); err == nil {
+		t.Fatal("the lost answer wasn't reported")
+	}
+	if dynamo.AccountHas(s, "a", "purge_by") {
+		t.Fatal("the fence was left behind")
+	}
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatalf("the next registration: %v", err)
+	}
+}
+
+// A deletion whose purge loses its fence (during the purge, or before
+// its counters reset) to another purge that keeps it doesn't answer done:
+// it waits, then answers ErrBusy.
+func TestDeletionLostFenceNotDone(t *testing.T) {
+	for _, during := range []bool{true, false} {
+		s, c := newMarked(t)
+		if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+			t.Fatal(err)
+		}
+		take := func() { dynamo.SetFence(s, "a", c.Now()) }
+		if during {
+			dynamo.SetDuringPurge(s, take)
+		} else {
+			dynamo.SetAfterPurge(s, take)
+		}
+		ids, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour))
+		dynamo.SetDuringPurge(s, nil)
+		dynamo.SetAfterPurge(s, nil)
+		if !errors.Is(err, store.ErrBusy) || len(ids) != 1 {
+			t.Fatalf("during %v: a deletion whose fence was taken: %v %v, want [a] and ErrBusy", during, ids, err)
+		}
+	}
+}
+
+// The counters reset doesn't make a counters item the sweep removed.
+func TestCountersResetKeepsRemovedItem(t *testing.T) {
+	s, c := newMarked(t)
+	if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+		t.Fatal(err)
+	}
+	dynamo.SetAfterPurge(s, func() { dynamo.DeleteStats(s, "a") })
+	_, err := s.DeleteMailbox(ctx, "a", k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour))
+	dynamo.SetAfterPurge(s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dynamo.StatsExists(s, "a") {
+		t.Fatal("the counters reset made the removed counters item again")
+	}
+}
+
+// A revive or a rotation whose purge lost its fence mid-way (b, rotated
+// away and past its grace, still holds a message to delete) reads again,
+// waits for the other purge, and goes through once it lets go.
+func TestReReadAfterFenceLost(t *testing.T) {
+	for _, rotate := range []bool{false, true} {
+		s, c := newMarked(t)
+		if _, _, err := s.Register(ctx, "b", k(2)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Deposit(ctx, "b", "s", []byte("x"), 3*time.Hour, store.Limits{TokenJTI: "m0", TokenIssuedAt: c.Now(), TokenExpires: c.Now().Add(time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Rotate(ctx, "b", "x", k(3), c.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		c.Add(time.Hour + time.Minute) // b past its grace, not swept
+		if _, _, err := s.Register(ctx, "a", k(1)); err != nil {
+			t.Fatal(err)
+		}
+		once := true
+		dynamo.SetDuringPurge(s, func() {
+			if once {
+				once = false
+				dynamo.SetFence(s, "b", c.Now())
+			}
+		})
+		n := 0
+		release := func() {
+			if n++; n == 3 {
+				dynamo.ClearFence(s, "b")
+			}
+		}
+		var err error
+		if rotate {
+			dynamo.SetBeforeRotate(s, release)
+			err = s.Rotate(ctx, "a", "b", k(2), c.Now().Add(time.Hour))
+		} else {
+			dynamo.SetBeforeRevive(s, release)
+			_, _, err = s.Register(ctx, "b", k(2))
+		}
+		dynamo.SetDuringPurge(s, nil)
+		dynamo.SetBeforeRotate(s, nil)
+		dynamo.SetBeforeRevive(s, nil)
+		if err != nil || once || n < 3 {
+			t.Fatalf("rotate %v: %v after %d tries (fence taken: %v)", rotate, err, n, !once)
+		}
+	}
+}
+
+// One due mailbox's failed purge doesn't stop the sweep: the other is
+// purged, and the error counts the failures without naming a mailbox.
+func TestSweepGoesOnPastAFailure(t *testing.T) {
+	s, c := newMarked(t)
+	for _, id := range []string{"mbx-one", "mbx-two"} {
+		if _, _, err := s.Register(ctx, id, k(1)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.DeleteMailbox(ctx, id, k(1), c.Now().Add(90*time.Second), c.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Add(time.Hour + 11*time.Minute)
+	n := 0
+	dynamo.SetBeforePurge(s, func() {
+		n++
+		if n == 1 {
+			dynamo.SetPurgeBudget(s, time.Nanosecond)
+		} else {
+			dynamo.SetPurgeBudget(s, 0)
+		}
+	})
+	st, err := s.Sweep(ctx)
+	dynamo.SetBeforePurge(s, nil)
+	dynamo.SetPurgeBudget(s, 0)
+	if err == nil || st.Mailboxes != 1 || n != 2 {
+		t.Fatalf("sweep: %+v %v after %d purges", st, err, n)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "1 of 2") || strings.Contains(msg, "mbx-") {
+		t.Fatalf("the sweep's error: %q", msg)
 	}
 }

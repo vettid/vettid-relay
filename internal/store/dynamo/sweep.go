@@ -46,8 +46,10 @@ func (s *Store) Sweep(ctx context.Context) (store.SweepStats, error) {
 				return st, err
 			}
 			// One mailbox's failure (a purge past its budget, say) doesn't
-			// hold up the others; the next sweep comes back to it.
-			errs = append(errs, fmt.Errorf("mailbox %s: %w", mb, err))
+			// hold up the others; the next sweep comes back to it. The
+			// error names no mailbox (RELAY-PROTOCOL §8: logs carry no
+			// mailbox ids).
+			errs = append(errs, err)
 			continue
 		}
 		st.Messages += n
@@ -55,7 +57,23 @@ func (s *Store) Sweep(ctx context.Context) (store.SweepStats, error) {
 			st.Mailboxes++
 		}
 	}
-	return st, errors.Join(errs...)
+	if len(errs) > 0 {
+		return st, fmt.Errorf("dynamo: sweep: %d of %d due mailboxes failed: %w", len(errs), len(due), joinDistinct(errs))
+	}
+	return st, nil
+}
+
+// joinDistinct joins errors with distinct texts, at most three.
+func joinDistinct(errs []error) error {
+	seen := map[string]bool{}
+	var out []error
+	for _, e := range errs {
+		if t := e.Error(); !seen[t] && len(out) < 3 {
+			seen[t] = true
+			out = append(out, e)
+		}
+	}
+	return errors.Join(out...)
 }
 
 // purge removes a due mailbox. A rotated-away one is emptied and turned

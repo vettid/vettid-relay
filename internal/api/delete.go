@@ -17,8 +17,11 @@ import (
 const wsStatusMailboxUnknown = websocket.StatusCode(4404)
 
 // deleteTimeout bounds one deletion. It runs detached from the request:
-// a client that disconnects mid-way must not leave it half done.
-const deleteTimeout = time.Minute
+// a client that disconnects mid-way must not leave it half done. It is
+// longer than a purge's budget in the DynamoDB store (2 min), so a large
+// mailbox's purge isn't cut short by it; a long chain of predecessors may
+// still need a repeat (which reaches them through the tombstone's preds).
+const deleteTimeout = 3 * time.Minute
 
 // DELETE /v1/mailbox (spec §6.10, 0.5.0). Owner-signed and bodiless; the
 // mailbox is the signer's. Idempotent: 204 whether or not the mailbox

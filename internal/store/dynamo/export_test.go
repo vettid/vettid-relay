@@ -37,6 +37,15 @@ func SetAfterMark(s *Store, f func()) { s.afterMark = f }
 // SetPurgeBudget overrides a purge's budget (tests only).
 func SetPurgeBudget(s *Store, d time.Duration) { s.purgeBudget = d }
 
+// DeleteStats removes a mailbox's counters item (tests only).
+func DeleteStats(s *Store, id string) {
+	if _, err := s.cfg.DB.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
+		TableName: &s.cfg.Table, Key: key(mbPK(id), skStats),
+	}); err != nil {
+		panic(err)
+	}
+}
+
 // ClearFence removes any purge fence from id's account item (tests only).
 func ClearFence(s *Store, id string) {
 	if _, err := s.cfg.DB.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{

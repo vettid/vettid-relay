@@ -81,6 +81,9 @@ func (s *Store) fence(ctx context.Context, id, cond string, vals item) (tok stri
 	if isCCF(err) {
 		return "", false, nil
 	}
+	if isTxConflict(err) {
+		return "", false, nil // a purge's batch in flight: busy; nothing was written
+	}
 	if err != nil {
 		// The write may have applied (a lost response, a cancelled
 		// request): give it back rather than block the key for a lease.
@@ -95,13 +98,18 @@ func (s *Store) fence(ctx context.Context, id, cond string, vals item) (tok stri
 func (s *Store) unfence(ctx context.Context, id, tok string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	_, _ = s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:                 &s.cfg.Table,
-		Key:                       key(mbPK(id), skAccount),
-		UpdateExpression:          aws.String("REMOVE purging, purge_by"),
-		ConditionExpression:       aws.String("purge_by = :fby"),
-		ExpressionAttributeValues: item{":fby": avS(tok)},
-	})
+	for attempt := 0; attempt < 5; attempt++ {
+		_, err := s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                 &s.cfg.Table,
+			Key:                       key(mbPK(id), skAccount),
+			UpdateExpression:          aws.String("REMOVE purging, purge_by"),
+			ConditionExpression:       aws.String("purge_by = :fby"),
+			ExpressionAttributeValues: item{":fby": avS(tok)},
+		})
+		if !isTxConflict(err) || backoff(ctx, attempt) != nil {
+			return
+		}
+	}
 }
 
 // fenceCheck is the transaction action that requires tok to hold id's

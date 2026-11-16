@@ -337,6 +337,14 @@ func isCCF(err error) bool {
 	return errors.As(err, &e)
 }
 
+// isTxConflict is a single-item write refused because a transaction on
+// the item was in flight (a purge's batch checks the account item); the
+// SDK doesn't retry it. Nothing was written: try again.
+func isTxConflict(err error) bool {
+	var e *types.TransactionConflictException
+	return errors.As(err, &e)
+}
+
 // txReasons returns the per-item cancellation codes of a cancelled
 // transaction (nil if err is something else).
 func txReasons(err error) []types.CancellationReason {
@@ -469,6 +477,12 @@ func (s *Store) Register(ctx context.Context, id string, pub []byte) (bool, time
 		if err == nil {
 			s.forget(id)
 			return true, time.Time{}, nil
+		}
+		if isTxConflict(err) { // a purge's batch in flight on the item
+			if err := backoff(ctx, attempt); err != nil {
+				return false, time.Time{}, err
+			}
+			continue
 		}
 		if !isCCF(err) {
 			return false, time.Time{}, err
@@ -805,7 +819,7 @@ func (s *Store) Rotate(ctx context.Context, oldID, newID string, newPub []byte, 
 				return fmt.Errorf("store: mailbox id collision")
 			}
 			if attempt >= maxTxAttempts {
-				return fmt.Errorf("dynamo: rotate: %w", err)
+				return fmt.Errorf("dynamo: rotate: the successor kept changing: %w (%w)", store.ErrBusy, err)
 			}
 			if err := backoff(ctx, attempt); err != nil {
 				return err
