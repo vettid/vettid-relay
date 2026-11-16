@@ -130,7 +130,7 @@ start, not wrapped.
 | `RELAY_SERVES_VAULTS` | `true` | The relay serves VettID vaults, so the rules RELAY-PROTOCOL sets for such a relay are checked at start: `RELAY_ROTATION_GRACE` exactly 14 days and `RELAY_MESSAGE_TTL` at most 14 days. Set `false` only for a relay that never serves vaults. |
 | `RELAY_MAX_TOKEN_LIFETIME` | `720h` (30 d) | `max_token_lifetime_seconds` (§5.2). Sender-bound tokens with `exp − iat` above this are `token_invalid`. Denylist and tombstone retention use the largest value ever advertised (the stored lifetime mark, §5.5, §6.10). At most `9600h` (400 d), for example for long-lived, low-quota reconnect tokens; a larger value is refused at start unless `RELAY_ALLOW_LONG_TOKEN_LIFETIME` is `true`, since the retention it sets can't be lowered again (see "Lowering the token lifetime limits"). |
 | `RELAY_OPEN_TOKEN_MAX_LIFETIME` | `600s` | `open_token_max_lifetime_seconds` (§5.6). This is the cap on `exp − iat` for one-shot open tokens. Up to 7 days is recommended for remote invitations. At most `9600h` (400 d) unless `RELAY_ALLOW_LONG_TOKEN_LIFETIME` is `true`, as for `RELAY_MAX_TOKEN_LIFETIME`. |
-| `RELAY_ALLOW_LONG_TOKEN_LIFETIME` | `false` | `true` accepts `RELAY_MAX_TOKEN_LIFETIME` or `RELAY_OPEN_TOKEN_MAX_LIFETIME` above 400 days. Without it such a value is refused at start: tombstones and denylist entries are kept for the largest limit ever advertised, and the stored lifetime mark is never lowered, so a mistyped limit would hold them for years until the store is edited by hand. |
+| `RELAY_ALLOW_LONG_TOKEN_LIFETIME` | `false` | `true` accepts `RELAY_MAX_TOKEN_LIFETIME` or `RELAY_OPEN_TOKEN_MAX_LIFETIME` above 400 days, up to 100 years. Without it such a value is refused at start: tombstones and denylist entries are kept for the largest limit ever advertised, and the stored lifetime mark is never lowered, so a mistyped limit would hold them for years until the store is edited by hand. |
 | `RELAY_MAX_CLAIM_BYTES` | `16384` | `max_claim_bytes` (§6.9). This is the maximum claim body. |
 | `RELAY_CLAIM_TTL` | `900s` | `claim_ttl_seconds` (§6.9). It's the longest TTL a creator may request with `PUT /v1/claim/ttl/<seconds>`. Up to 7 days is recommended. A bare `PUT /v1/claim` gets min(900 s, this). |
 | `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `100` / `300` | Flood guard on `/v1/*` per client network (the IPv4 address or the IPv6 /64), applied before any parsing. One address may carry a whole vault host: see [Rate limiting](#rate-limiting) for when to raise it. |
@@ -665,7 +665,10 @@ implementation chooses as follows:
   ones. A deletion or revocation reads the stored mark when it is made,
   so a process started before another raised the limits still uses the
   larger retention; so does DynamoDB's removal of a rotated mailbox. A
-  repeated deletion never shortens a tombstone.
+  repeated deletion never shortens a tombstone. So that a mistyped limit
+  can't raise the mark, a limit over 400 days is refused at start unless
+  `RELAY_ALLOW_LONG_TOKEN_LIFETIME` is `true`, and one over 100 years
+  always is (the retention arithmetic would overflow).
   - **Resetting the mark** (after a mistaken huge limit): set the
     `lifetime_mark` row (SQLite) or the `META`/`LIFETIME` item's `life_ms`
     (DynamoDB) to the configured limit, in milliseconds, but only once every

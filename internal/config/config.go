@@ -182,6 +182,13 @@ const VaultRotationGrace = 14 * 24 * time.Hour
 // would undo it. The relay doesn't start rather than raise the mark.
 const MaxTokenLifetimeBound = 400 * 24 * time.Hour
 
+// MaxTokenLifetimeLimit is the largest token lifetime limit accepted even
+// with RELAY_ALLOW_LONG_TOKEN_LIFETIME: 100 years. Retention adds margins
+// to the limit, and a time.Duration holds about 292 years, so a larger
+// one could overflow into a negative retention, and revocations and
+// tombstones would expire at once.
+const MaxTokenLifetimeLimit = 100 * 365 * 24 * time.Hour
+
 // VaultMaxMessageTTL bounds message_ttl_seconds for a relay serving
 // VettID vaults (RELAY-PROTOCOL 0.11.1 §6.1): a vault's dedupe of
 // re-deposits after a rotation assumes no message outlives it.
@@ -539,14 +546,15 @@ func (c Config) Validate() error {
 	if c.MaxTokenLifetime < time.Second || c.OpenTokenMaxLifetime < time.Second || c.ClaimTTL < time.Second {
 		errs = append(errs, errors.New("token lifetimes and claim TTL must be at least 1s"))
 	}
-	if !c.AllowLongTokenLifetime {
-		for _, l := range []struct {
-			key string
-			d   time.Duration
-		}{{"RELAY_MAX_TOKEN_LIFETIME", c.MaxTokenLifetime}, {"RELAY_OPEN_TOKEN_MAX_LIFETIME", c.OpenTokenMaxLifetime}} {
-			if l.d > MaxTokenLifetimeBound {
-				errs = append(errs, fmt.Errorf("%s is %s, over %s (400 days): tombstones and denylist entries would be kept that long, and the stored lifetime mark is never lowered; fix the value, or set RELAY_ALLOW_LONG_TOKEN_LIFETIME=true if it is meant", l.key, l.d, MaxTokenLifetimeBound))
-			}
+	for _, l := range []struct {
+		key string
+		d   time.Duration
+	}{{"RELAY_MAX_TOKEN_LIFETIME", c.MaxTokenLifetime}, {"RELAY_OPEN_TOKEN_MAX_LIFETIME", c.OpenTokenMaxLifetime}} {
+		switch {
+		case l.d > MaxTokenLifetimeLimit:
+			errs = append(errs, fmt.Errorf("%s is %s, over %s (100 years), the most even RELAY_ALLOW_LONG_TOKEN_LIFETIME allows", l.key, l.d, MaxTokenLifetimeLimit))
+		case l.d > MaxTokenLifetimeBound && !c.AllowLongTokenLifetime:
+			errs = append(errs, fmt.Errorf("%s is %s, over %s (400 days): tombstones and denylist entries would be kept that long, and the stored lifetime mark is never lowered; fix the value, or set RELAY_ALLOW_LONG_TOKEN_LIFETIME=true if it is meant", l.key, l.d, MaxTokenLifetimeBound))
 		}
 	}
 	if c.RotationGrace <= 0 {
