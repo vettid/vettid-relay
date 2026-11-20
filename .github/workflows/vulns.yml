@@ -43,9 +43,12 @@ jobs:
           go-version-file: go.mod
       - name: govulncheck v1.9.0
         env:
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -show verbose ./...
+          ARCH: ${{ matrix.goarch }}
+        run: |
+          # Built for the runner, then run with GOOS/GOARCH set for the scan
+          # (they set which files it loads, not what it runs on).
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          GOOS=linux GOARCH="$ARCH" "$(go env GOPATH)/bin/govulncheck" -show verbose ./...
 
   issue:
     # One issue for all findings: opened, or commented on while open; a
