@@ -1,0 +1,81 @@
+name: vulns
+
+# Vulnerability scan. It reports; it never changes a dependency.
+#
+# govulncheck v1.9.0 over the module (the repository is one Go module),
+# with the Go of go.mod: it fails only on a vulnerability the code reaches;
+# -show verbose also names those in imported packages and required modules
+# that the code doesn't call. What ships is the relay image (cmd/relay; linux/amd64 and linux/arm64): the module is scanned
+# for linux/amd64 and linux/arm64.
+#
+# On pull requests, on pushes to main, weekly and on demand. On main, a
+# weekly or on-demand run with a finding opens one issue labeled security,
+# or comments on the one already open; a clean run closes it.
+#
+# Actions are pinned by commit SHA (tag in the comment).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '47 5 * * 1' # Mondays, 05:47 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    name: govulncheck (linux/${{ matrix.goarch }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: govulncheck v1.9.0
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -show verbose ./...
+
+  issue:
+    # One issue for all findings: opened, or commented on while open; a
+    # clean run closes it.
+    if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    needs: [govulncheck]
+    runs-on: ubuntu-26.04
+    permissions:
+      issues: write
+    steps:
+      - name: open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GOVULN: ${{ needs.govulncheck.result }}
+        run: |
+          title="security: vulnerability scan findings"
+          n=$(gh issue list --state open --search "in:title \"$title\"" --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          if [ "$GOVULN" != success ]; then
+            what="
+          - govulncheck: a vulnerability the code reaches, or the scan could not run (the job log names it and the architecture)."
+            if [ -n "$n" ]; then
+              gh issue comment "$n" --body "Found again: $RUN$what"
+            else
+              gh label create security --color B60205 --description "Security findings" 2>/dev/null || true
+              gh issue create --title "$title" --label security --body "The vulnerability scan on main (.github/workflows/vulns.yml) found:$what
+
+          See $RUN."
+            fi
+          elif [ -n "$n" ]; then
+            gh issue close "$n" --comment "Clean on main: $RUN"
+          fi
