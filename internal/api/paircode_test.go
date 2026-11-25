@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -22,6 +23,57 @@ import (
 // Code claims (§6.9.1).
 
 var testPairKey = bytes.Repeat([]byte{0x5a}, 32)
+
+// withPairKey gives c the test key and the least open-token limit with
+// which config.Load keeps a key, so the fixtures run a config that can
+// occur.
+func withPairKey(c *config.Config) {
+	c.PairCodeKey = config.NewSecret(testPairKey)
+	c.OpenTokenMaxLifetime = config.PairCodeOpenTokenMin
+}
+
+// A key set aside for a short open-token limit is said at WARN, not
+// DEBUG: the operator meant codes on.
+func TestPairCodesOffForShortLifetimeWarns(t *testing.T) {
+	b64 := base64.StdEncoding.EncodeToString(testPairKey)
+	cfg, err := config.Load(func(k string) (string, bool) {
+		switch k {
+		case "RELAY_PAIR_CODE_KEY":
+			return b64, true
+		case "RELAY_BASE_URL":
+			return "https://relay.example", true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	if pc := newPairCodes(cfg, slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))); pc != nil {
+		t.Fatal("pair codes on with the default open-token limit")
+	}
+	want := `level=WARN msg="pair codes are off" reason="RELAY_OPEN_TOKEN_MAX_LIFETIME is 600s, under the 660s a code pairing's open token needs"`
+	if out := logs.String(); !strings.Contains(out, want) || strings.Count(out, "\n") != 1 {
+		t.Fatalf("log: %s", out)
+	}
+
+	// A Config built in code, key and short limit: the same, from newPairCodes.
+	c := config.Defaults()
+	c.BaseURL = "https://relay.example"
+	c.PairCodeKey = config.NewSecret(testPairKey)
+	c.OpenTokenMaxLifetime = config.PairCodeOpenTokenMin - time.Second
+	logs.Reset()
+	if pc := newPairCodes(c, slog.New(slog.NewTextHandler(&logs, nil))); pc != nil {
+		t.Fatal("pair codes on with a Config built in code and a 659 s limit")
+	}
+	if out := logs.String(); !strings.Contains(out, `reason="RELAY_OPEN_TOKEN_MAX_LIFETIME is 659s, under the 660s a code pairing's open token needs"`) || strings.Count(out, "\n") != 1 {
+		t.Fatalf("log: %s", out)
+	}
+	c.OpenTokenMaxLifetime = config.PairCodeOpenTokenMin
+	if newPairCodes(c, slog.New(slog.NewTextHandler(io.Discard, nil))) == nil {
+		t.Fatal("pair codes off at 660 s")
+	}
+}
 
 // pcHour is a fixed hour for the tests: 2026-03-31T12:00:00Z (epoch 493044).
 var pcHour = time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
@@ -38,7 +90,7 @@ func pairCodeFixture(t *testing.T, mut func(*config.Config), realLimits ...bool)
 // last).
 func pairCodeFixtureWith(t *testing.T, mut func(*config.Config), realLimits bool, extra ...Option) *fixture {
 	f := newFixtureWith(t, func(c *config.Config) {
-		c.PairCodeKey = config.NewSecret(testPairKey)
+		withPairKey(c)
 		if mut != nil {
 			mut(c)
 		}
@@ -99,7 +151,7 @@ func TestPairCodesOff(t *testing.T) {
 	for _, mut := range []func(*config.Config){
 		nil,
 		func(c *config.Config) {
-			c.PairCodeKey = config.NewSecret(testPairKey)
+			withPairKey(c)
 			c.BaseURL = "http://localhost:8080"
 		},
 	} {
@@ -389,7 +441,7 @@ func TestPairCodeRelayclient(t *testing.T) {
 // Tags, code_macs, salts, blobs, claim ids and k_pc are never logged.
 func TestPairCodeLogsCarryNoSecrets(t *testing.T) {
 	var logs syncBuf
-	f := newFixtureFull(t, func(c *config.Config) { c.PairCodeKey = config.NewSecret(testPairKey) }, &logs,
+	f := newFixtureFull(t, func(c *config.Config) { withPairKey(c) }, &logs,
 		func(*fixture) []Option { return []Option{WithPairCodeHold(pcHold)} })
 	a, b := newPrincipal(1), newPrincipal(2)
 	f.register(a)
@@ -445,7 +497,7 @@ func TestPairCodeDefaults(t *testing.T) {
 		codeRedeemIPv4 != 20 || codeRedeem64 != 10 || codeRedeem48 != 200 || codeRedeem32 != 1000 {
 		t.Fatal("the pair-code defaults changed")
 	}
-	f := newFixture(t, func(c *config.Config) { c.PairCodeKey = config.NewSecret(testPairKey) })
+	f := newFixture(t, func(c *config.Config) { withPairKey(c) })
 	if f.s.pc.hold != codeHold {
 		t.Fatalf("hold %v", f.s.pc.hold)
 	}
