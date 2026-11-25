@@ -200,6 +200,10 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 				// store is the same however many processes run.
 				Bytes:     vc.ByteLimiter("bytes", cfg.RateIPBytesPerSec, cfg.RateIPBytesBurst),
 				BlobBytes: vc.ByteLimiter("blob_bytes", cfg.RateBlobBytesPerSec, cfg.RateBlobBytesBurst),
+				// Limit 14 (code redeems) is relay-wide too.
+				CodeRedeem: func(name string, perSec float64, burst int) api.ByteLimiter {
+					return vc.ByteLimiter(name, perSec, burst)
+				},
 			}),
 			api.WithWakeBus(bus),
 		)

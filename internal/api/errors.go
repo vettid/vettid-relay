@@ -26,6 +26,8 @@ const (
 	CodeNotFound         = "not_found"
 	CodeTokenUsed        = "token_used"    // 0.3.0 §5.6
 	CodeClaimUnknown     = "claim_unknown" // 0.3.0 §6.9
+	CodeCodeUnknown      = "code_unknown"  // 0.14.0 §6.9.1
+	CodeCodeTaken        = "code_taken"    // 0.14.0 §6.9.1
 )
 
 // allCodes is the closed set used for metric labels.
@@ -34,6 +36,7 @@ var allCodes = []string{
 	CodeBlobUnknown, CodePayloadTooLarge, CodeQuotaExceeded, CodeRateLimited,
 	CodeSignatureInvalid, CodeTimestampStale, CodeReplayDetected, CodeInternal,
 	CodeBadRequest, CodeNotFound, CodeTokenUsed, CodeClaimUnknown,
+	CodeCodeUnknown, CodeCodeTaken,
 }
 
 // statusFor maps codes to HTTP status exactly as the spec §7.1 table does.
@@ -43,9 +46,9 @@ func statusFor(code string) int {
 		return http.StatusUnauthorized
 	case CodeTokenRevoked:
 		return http.StatusForbidden
-	case CodeMailboxUnknown, CodeBlobUnknown, CodeClaimUnknown, CodeNotFound:
+	case CodeMailboxUnknown, CodeBlobUnknown, CodeClaimUnknown, CodeCodeUnknown, CodeNotFound:
 		return http.StatusNotFound
-	case CodeTokenUsed:
+	case CodeTokenUsed, CodeCodeTaken:
 		return http.StatusConflict
 	case CodePayloadTooLarge:
 		return http.StatusRequestEntityTooLarge
@@ -75,6 +78,8 @@ var defaultMessages = map[string]string{
 	CodeNotFound:         "not found",
 	CodeTokenUsed:        "one-shot token already used",
 	CodeClaimUnknown:     "claim unknown",
+	CodeCodeUnknown:      "no such code",
+	CodeCodeTaken:        "code taken",
 }
 
 type errorBody struct {

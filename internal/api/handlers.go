@@ -105,6 +105,9 @@ type limitsBody struct {
 	MaxSenderBlobs      *int64 `json:"max_sender_blobs,omitempty"`
 	// 0.12.0 (§6.1): registration answers report tombstones.
 	ReportsTombstones bool `json:"reports_tombstones"`
+	// 0.14.0 (§6.1, §6.9.1): the relay offers code claims (present only
+	// when it does).
+	PairCodes bool `json:"pair_codes,omitempty"`
 }
 
 type registerResponse struct {
@@ -146,6 +149,7 @@ func (s *Server) limits() limitsBody {
 		MaxClaimBytes:               s.cfg.MaxClaimBytes,
 		ClaimTTLSeconds:             int64(s.cfg.ClaimTTL / time.Second),
 		ReportsTombstones:           true,
+		PairCodes:                   s.pc != nil,
 	}
 	if s.cfg.BlobsEnabled {
 		mb, ttl := s.cfg.MaxBlobBytes, int64(s.cfg.BlobTTL/time.Second)

@@ -22,6 +22,7 @@ const ProtocolVersion = "0.13.0"
 
 // Server is the relay API.
 type Server struct {
+	pc    *pairCodes // code claims (§6.9.1); nil when the relay offers none
 	cfg   config.Config
 	st    store.Backend
 	blobs store.BlobStore
@@ -178,6 +179,7 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		panic("relay web documents: " + err.Error()) // the embedded page is malformed: a build defect
 	}
 	s.web = web
+	s.pc = newPairCodes(cfg, log)
 	s.drainCtx, s.drainCancel = context.WithCancel(context.Background())
 	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
 	for _, o := range opts {
@@ -203,7 +205,11 @@ func New(cfg config.Config, st store.Backend, log *slog.Logger, reg *metrics.Reg
 		if c, ok := s.replay.(interface{ Sweep(time.Time) }); ok {
 			c.Sweep(now)
 		}
-		for _, l := range []any{s.ipLimit, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit, s.byteLimit, s.blobByteLimit, s.blobKeyLimit, s.keyByteLimit} {
+		ls := []any{s.ipLimit, s.keyLimit, s.subLimit, s.regLimit, s.claimLimit, s.webLimit, s.byteLimit, s.blobByteLimit, s.blobKeyLimit, s.keyByteLimit}
+		if s.pc != nil {
+			ls = append(ls, s.pc.lim4, s.pc.lim64, s.pc.lim48, s.pc.lim32)
+		}
+		for _, l := range ls {
 			if p, ok := l.(interface{ Prune(time.Time) }); ok {
 				p.Prune(now)
 			}
@@ -228,6 +234,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /v1/claim/ttl/{ttl_seconds}", s.handleClaimPut)
 	s.mux.HandleFunc("GET /v1/claim/{claim_id}", s.handleClaimGet)
 	s.mux.HandleFunc("DELETE /v1/claim/{claim_id}", s.handleClaimDelete)
+	if s.pc != nil {
+		s.mux.HandleFunc("GET /v1/pair-code/salts", s.handlePairCodeSalts)
+		s.mux.HandleFunc("PUT /v1/pair-code/{claim_id}", s.handlePairCodePut)
+		s.mux.HandleFunc("POST /v1/pair-code/redeem", s.handlePairCodeRedeem)
+		s.mux.HandleFunc("DELETE /v1/pair-code/{claim_id}", s.handlePairCodeDelete)
+	}
 	if s.cfg.BlobsEnabled {
 		s.mux.HandleFunc("PUT /v1/blob/{mailbox_id}", s.handleBlobPut)
 		s.mux.HandleFunc("GET /v1/blob/{blob_id}", s.handleBlobGet)
