@@ -1,0 +1,617 @@
+{
+  "description": "VAULT-MESSAGING 0.94.0 §6.7.2 short pairing codes, RELAY-PROTOCOL 0.14.0 §6.9.1. Argon2id v0x13 t=3 m=262144 KiB p=1 32 bytes; pw is passed as bytes with its length (it holds 0x00 bytes). The blob seals the agent bundle of the vault of keys.json under k_w with aad; each not_open case changes one input, and the blob must not open.",
+  "argon2id": {
+    "version": 19,
+    "t": 3,
+    "m_kib": 262144,
+    "p": 1,
+    "len": 32
+  },
+  "code": "K7QM4XPZ",
+  "display": "K7QM-4XPZ",
+  "purpose": "a",
+  "r": "https://relay.vettid.org",
+  "epoch": 493044,
+  "nonce_b64": "oKCgoKCgoKCgoKCgoKCgoA==",
+  "s_r_hex": "a12213d160583f24f7918c9897504fb2",
+  "salt_id": "a12213d1",
+  "pw_lookup_hex": "7665747469642f706169722d636f64652f312f6c6f6f6b757000610068747470733a2f2f72656c61792e7665747469642e6f7267004b37514d3458505a",
+  "tag_b64": "vNUtAmVdoKE5UpRJHRYcVpv0QmVPGmaCM6/4Tt71YVo=",
+  "tag_desktop_b64": "nCx+6F0CTr13Y/TofV2gNRO78fOKFYBXHRTRWWKYKXM=",
+  "s_c_b64": "oaGhoaGhoaGhoaGhoaGhoQ==",
+  "pw_key_hex": "7665747469642f706169722d636f64652f312f6b657900610068747470733a2f2f72656c61792e7665747469642e6f7267004b37514d3458505a",
+  "x_hex": "adb75b78460f7830214b2a562316dd9b967fea5a16cc8450164628cd2a1de7de",
+  "k_w_hex": "e3811ae1cce58045ee291eccf681a1c06bbefa5e0245ecedcd195b508d903c0c",
+  "claim_id": "q4f7m2xk5n3p6r7t2v4w6y7z3a",
+  "aad_hex": "7665747469642f706169722d636f64652f312f62756e646c6500610068747470733a2f2f72656c61792e7665747469642e6f726700713466376d32786b356e337036723774327634773679377a336100a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "created": "2026-03-31T12:17:00Z",
+  "bundle_json": "{\"v\":1,\"suite\":2,\"kind\":\"agent\",\"invite_id\":\"01JB2Z6V9K3M4N5P6Q7R8S9TA0\",\"remote\":false,\"vault\":{\"ik\":\"ypOsFwUYcHHWe4PH/w7+gQjo7EUwV113JoeTM9vavnw=\",\"kem\":\"Mzk0RqdsLAG0TaVpbYRSspq3uReHdlNmvBoVsUl5JCeET/aHU/lXGHwQLQlAxJi2czKn+cu4L9O+yZFOBalVA1Ni3HRiBxwZ4iWslsEvo0ouhuCoSgxjPgRLPZOWlwWDOlOkJXt/TBUVzqqK+et/U8p8tAKkq6EcnTIG+CCcQ2vD6gSHxFanniQPxPWCnkl3gXqsnemgz2zCgTG+ksKm7GcryhqLN1gJL4uHoRVlwDEugpOfj9GAJKcbuYqIXGq5kpnNQ6YgjSGYpFvNvsWQFXN1wWpFYye71EARtjXNH2eCdzR6padltyCKyqQxbqUj9ZoGcVlOVhIWVPNYHoggcjlpMtouLqAr9UieVGxFK3xvYOikxhEvbMx+OnpEdIqhMIgHoIwV14ouGaJ1CpFrjEaESyV8JmOoiVs9+MQJYOa5EmI8ipLJ+0NdIObNqftFblXB3ZCl9kpawsYSUEYXV1GqdClx8XKDKMNT9Kegj/Frj5eK5BckSUxDZHFQXiwXupWK3nsq+/nMJmVRiUl1X9W7ixWsm4C3j6YVqRjEqZVJw3xq0AF8UcOWPjQIsRhI3dSv6WtnzWbHboF9TBUN5SpyBQW5pLCQCCQ8D7Be8AS5wsIj+SMNxXsd09GHNFeEK0fFm5prOde2F4e0KlAMn1cRTsc3v3xFMDuKP6eLPGSc+9Fmxgw33qieLfcc5MYF/kWryvOmBPVI7lAw/fSa1BKblFFqIqi3KBEr/SCeWltWXiCo3Ol3SKeQY3kL7JO8iRA8MkGbutwf/GeeSBOaDIhWPxcNFlcp49cQNlxATfyH18Me/SR4WpJl5VxKYkMV20AFAZgYoefANnpw+9FgmOJ6ZAsPPdlRXYK+BjdQb/FxxqMe30U7QKYWL+t8NUNQa8EQXOGW5GCX23SbSFgI3MO0IhRwrCGIC8I8fvSzFfQN9AgC9zJJV7RQAywxBPhxJQWQpMmilofHDgK0Y1B4Grx8KyVsVLvJbrILiRh3w6Zz9nwYGXoOPWVxltVnPvsZ6/mz5JaRYSg0y2YtKCiTixrBpFiBueUceGwaMhgUqMOWQht/MTzC5ER+boeXHhZg2UqtXxOya/SfpJmCKxlZ9IqojfpRAfRj1bvIyiG50IV/0uQtXBx6kZJ2WjAT7vVMqeQ/qZq/2AU+kFllC5ZNauqMJsE63AptkSCPLeoNpNV6Oopr6RVqQGUFjPll2hBYawlFwwllv4pDaqoRWrFwBxwwgPXHI8ENBZY6FiYiQ4aC/uG2GcKxDCB619OKsep+2gkk2atrRDOGr3sH/ia4/GkReJZmvBRhmjgeunlm4LSrDlKAg4BvRkVvl+WSdtWmEZt2axhH06GtPEAizQYWu8NI1OBy99aCcmF7A7ybJfVp0LEdq4xafuEe5sdh7mhGJTIsbNyBXuHArNKajhyCbPifJZRFkzNmQ6Rkg9ysqeG66aGW9pKsBTLNkRE9XZdJY6Ukv3CMROGY3SEt/PaSE6QuMua3yGAUjtOMUQArg7DEuXm1KnU78sM4HAJ2I7ioJR5g9VUktWuVmhTYRjcIahVWdxfb2nr/n9YdCViayMCICPeGnmMxpWid7GF9fOK41edsMH1rFeHjywfJxRpPQg==\",\"relay\":{\"url\":\"https://relay.vettid.org\",\"mailbox\":\"ph5tr32bj27nk7zphjn2qf4z5v\",\"pk\":\"XJxt8mHJy4QEdXdqrvzZRLQFMo+rKPmzqV70BJDT3oQ=\"}},\"token\":\"v4.public.VEVTVC1QQUlSQ09ERS1vcGVu\",\"exp\":\"2026-03-31T12:27:00Z\"}",
+  "blob_nonce_b64": "oqKioqKioqKioqKioqKioqKioqKioqKi",
+  "blob_b64": "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",
+  "put_body": {
+    "salt_id": "a12213d1",
+    "tag": "vNUtAmVdoKE5UpRJHRYcVpv0QmVPGmaCM6/4Tt71YVo=",
+    "salt": "oaGhoaGhoaGhoaGhoaGhoQ==",
+    "blob": "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"
+  },
+  "not_open": [
+    {
+      "name": "another claim id",
+      "claim_id": "q4f7m2xk5n3p6r7t2v4w6y7z3e"
+    },
+    {
+      "name": "another s_c",
+      "salt_b64": "oaGhoaGhoaGhoaGhoaGhoA=="
+    },
+    {
+      "name": "another relay",
+      "r": "https://relay.vettid.org:8443"
+    },
+    {
+      "name": "the desktop purpose",
+      "purpose": "d"
+    },
+    {
+      "name": "another code",
+      "code": "K7QM4XP2"
+    },
+    {
+      "name": "a changed blob",
+      "blob_b64": "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"
+    }
+  ],
+  "desktop": {
+    "purpose": "d",
+    "x_hex": "52c186f911a12aaa0a3714b6f95d7c142fde1af7fc016c8fea7e2987c3f3ba2b",
+    "k_w_hex": "730a7ebd16a7d2587556bdaedcf3d4dfe48fc25ee6404584799efab882de44f1",
+    "aad_hex": "7665747469642f706169722d636f64652f312f62756e646c6500640068747470733a2f2f72656c61792e7665747469642e6f726700713466376d32786b356e337036723774327634773679377a336100a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "bundle_json": "{\"v\":1,\"suite\":2,\"kind\":\"desktop\",\"invite_id\":\"01JB2Z6V9K3M4N5P6Q7R8S9TA0\",\"remote\":false,\"vault\":{\"ik\":\"ypOsFwUYcHHWe4PH/w7+gQjo7EUwV113JoeTM9vavnw=\",\"kem\":\"Mzk0RqdsLAG0TaVpbYRSspq3uReHdlNmvBoVsUl5JCeET/aHU/lXGHwQLQlAxJi2czKn+cu4L9O+yZFOBalVA1Ni3HRiBxwZ4iWslsEvo0ouhuCoSgxjPgRLPZOWlwWDOlOkJXt/TBUVzqqK+et/U8p8tAKkq6EcnTIG+CCcQ2vD6gSHxFanniQPxPWCnkl3gXqsnemgz2zCgTG+ksKm7GcryhqLN1gJL4uHoRVlwDEugpOfj9GAJKcbuYqIXGq5kpnNQ6YgjSGYpFvNvsWQFXN1wWpFYye71EARtjXNH2eCdzR6padltyCKyqQxbqUj9ZoGcVlOVhIWVPNYHoggcjlpMtouLqAr9UieVGxFK3xvYOikxhEvbMx+OnpEdIqhMIgHoIwV14ouGaJ1CpFrjEaESyV8JmOoiVs9+MQJYOa5EmI8ipLJ+0NdIObNqftFblXB3ZCl9kpawsYSUEYXV1GqdClx8XKDKMNT9Kegj/Frj5eK5BckSUxDZHFQXiwXupWK3nsq+/nMJmVRiUl1X9W7ixWsm4C3j6YVqRjEqZVJw3xq0AF8UcOWPjQIsRhI3dSv6WtnzWbHboF9TBUN5SpyBQW5pLCQCCQ8D7Be8AS5wsIj+SMNxXsd09GHNFeEK0fFm5prOde2F4e0KlAMn1cRTsc3v3xFMDuKP6eLPGSc+9Fmxgw33qieLfcc5MYF/kWryvOmBPVI7lAw/fSa1BKblFFqIqi3KBEr/SCeWltWXiCo3Ol3SKeQY3kL7JO8iRA8MkGbutwf/GeeSBOaDIhWPxcNFlcp49cQNlxATfyH18Me/SR4WpJl5VxKYkMV20AFAZgYoefANnpw+9FgmOJ6ZAsPPdlRXYK+BjdQb/FxxqMe30U7QKYWL+t8NUNQa8EQXOGW5GCX23SbSFgI3MO0IhRwrCGIC8I8fvSzFfQN9AgC9zJJV7RQAywxBPhxJQWQpMmilofHDgK0Y1B4Grx8KyVsVLvJbrILiRh3w6Zz9nwYGXoOPWVxltVnPvsZ6/mz5JaRYSg0y2YtKCiTixrBpFiBueUceGwaMhgUqMOWQht/MTzC5ER+boeXHhZg2UqtXxOya/SfpJmCKxlZ9IqojfpRAfRj1bvIyiG50IV/0uQtXBx6kZJ2WjAT7vVMqeQ/qZq/2AU+kFllC5ZNauqMJsE63AptkSCPLeoNpNV6Oopr6RVqQGUFjPll2hBYawlFwwllv4pDaqoRWrFwBxwwgPXHI8ENBZY6FiYiQ4aC/uG2GcKxDCB619OKsep+2gkk2atrRDOGr3sH/ia4/GkReJZmvBRhmjgeunlm4LSrDlKAg4BvRkVvl+WSdtWmEZt2axhH06GtPEAizQYWu8NI1OBy99aCcmF7A7ybJfVp0LEdq4xafuEe5sdh7mhGJTIsbNyBXuHArNKajhyCbPifJZRFkzNmQ6Rkg9ysqeG66aGW9pKsBTLNkRE9XZdJY6Ukv3CMROGY3SEt/PaSE6QuMua3yGAUjtOMUQArg7DEuXm1KnU78sM4HAJ2I7ioJR5g9VUktWuVmhTYRjcIahVWdxfb2nr/n9YdCViayMCICPeGnmMxpWid7GF9fOK41edsMH1rFeHjywfJxRpPQg==\",\"relay\":{\"url\":\"https://relay.vettid.org\",\"mailbox\":\"ph5tr32bj27nk7zphjn2qf4z5v\",\"pk\":\"XJxt8mHJy4QEdXdqrvzZRLQFMo+rKPmzqV70BJDT3oQ=\"}},\"token\":\"v4.public.VEVTVC1QQUlSQ09ERS1vcGVu\",\"exp\":\"2026-03-31T12:27:00Z\"}",
+    "blob_b64": "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"
+  },
+  "with_port": {
+    "r": "https://relay.example.org:8443",
+    "s_r_hex": "7e89bd40d8f6f57a0a29741a13cea7c7",
+    "salt_id": "7e89bd40",
+    "pw_lookup_hex": "7665747469642f706169722d636f64652f312f6c6f6f6b757000610068747470733a2f2f72656c61792e6578616d706c652e6f72673a38343433004b37514d3458505a",
+    "tag_b64": "TyIpEvEjUc+W/aXpcMe4E8Mu9yIr09L8mbn8euBVPRE="
+  },
+  "for_put": [
+    {
+      "name": "mid-hour, one entry",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T12:30:00Z",
+      "epochs": [
+        493044
+      ]
+    },
+    {
+      "name": "hh:58:00, the next listed",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        },
+        {
+          "salt_id": "8ea99cba",
+          "epoch": 493045,
+          "nonce": "o6Ojo6Ojo6Ojo6Ojo6Ojow=="
+        }
+      ],
+      "now": "2026-03-31T12:58:00Z",
+      "epochs": [
+        493044,
+        493045
+      ]
+    },
+    {
+      "name": "hh:57:59, the next listed",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        },
+        {
+          "salt_id": "8ea99cba",
+          "epoch": 493045,
+          "nonce": "o6Ojo6Ojo6Ojo6Ojo6Ojow=="
+        }
+      ],
+      "now": "2026-03-31T12:57:59Z",
+      "epochs": [
+        493044
+      ]
+    },
+    {
+      "name": "hh:01:59, the previous listed",
+      "salts": [
+        {
+          "salt_id": "484da0c4",
+          "epoch": 493043,
+          "nonce": "paWlpaWlpaWlpaWlpaWlpQ=="
+        },
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T12:01:59Z",
+      "epochs": [
+        493044,
+        493043
+      ]
+    },
+    {
+      "name": "hh:02:00, the previous listed",
+      "salts": [
+        {
+          "salt_id": "484da0c4",
+          "epoch": 493043,
+          "nonce": "paWlpaWlpaWlpaWlpaWlpQ=="
+        },
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T12:02:00Z",
+      "epochs": [
+        493044
+      ]
+    },
+    {
+      "name": "hh:01:00, the clock ahead of the list",
+      "salts": [
+        {
+          "salt_id": "484da0c4",
+          "epoch": 493043,
+          "nonce": "paWlpaWlpaWlpaWlpaWlpQ=="
+        }
+      ],
+      "now": "2026-03-31T12:01:00Z",
+      "epochs": [
+        493043
+      ]
+    },
+    {
+      "name": "hh:03:00, no entry current",
+      "salts": [
+        {
+          "salt_id": "484da0c4",
+          "epoch": 493043,
+          "nonce": "paWlpaWlpaWlpaWlpaWlpQ=="
+        }
+      ],
+      "now": "2026-03-31T12:03:00Z",
+      "epochs": []
+    }
+  ],
+  "normalize": [
+    {
+      "input": "K7QM-4XPZ",
+      "code": "K7QM4XPZ"
+    },
+    {
+      "input": "k7qm 4xpz",
+      "code": "K7QM4XPZ"
+    },
+    {
+      "input": " K7QM4XPZ ",
+      "code": "K7QM4XPZ"
+    },
+    {
+      "input": "k-7-q-m-4-x-p-z",
+      "code": "K7QM4XPZ"
+    },
+    {
+      "input": "K7QM-4XP0",
+      "error": "bad_symbol"
+    },
+    {
+      "input": "K7QM-4XP1",
+      "error": "bad_symbol"
+    },
+    {
+      "input": "k7qm-4xpi",
+      "error": "bad_symbol"
+    },
+    {
+      "input": "k7qm-4xpl",
+      "error": "bad_symbol"
+    },
+    {
+      "input": "k7qm-4xpo",
+      "error": "bad_symbol"
+    },
+    {
+      "input": "K7QM-4XP\u00c9",
+      "error": "bad_symbol"
+    },
+    {
+      "input": "K7QM-4XP\u017f",
+      "error": "bad_symbol"
+    },
+    {
+      "input": "K7QM-4XP\u00df",
+      "error": "bad_symbol"
+    },
+    {
+      "input": "K7QM-4XP\u212a",
+      "error": "bad_symbol"
+    },
+    {
+      "input": "K7QM-4XP",
+      "error": "not_a_code"
+    },
+    {
+      "input": "K7QM-4XPZ2",
+      "error": "not_a_code"
+    },
+    {
+      "input": "https://relay.vettid.org",
+      "error": "not_a_code"
+    }
+  ],
+  "relay_forms": [
+    {
+      "input": "https://relay.vettid.org",
+      "r": "https://relay.vettid.org"
+    },
+    {
+      "input": "relay.vettid.org",
+      "r": "https://relay.vettid.org"
+    },
+    {
+      "input": "HTTPS://Relay.VettID.org/",
+      "r": "https://relay.vettid.org"
+    },
+    {
+      "input": "https://relay.vettid.org:443",
+      "r": "https://relay.vettid.org"
+    },
+    {
+      "input": "relay.example.org:8443",
+      "r": "https://relay.example.org:8443"
+    },
+    {
+      "input": "xn--bcher-kva.example",
+      "r": "https://xn--bcher-kva.example"
+    },
+    {
+      "input": "http://relay.vettid.org",
+      "refused": true
+    },
+    {
+      "input": "https://relay.vettid.org/v1",
+      "refused": true
+    },
+    {
+      "input": "https://relay.vettid.org?x=1",
+      "refused": true
+    },
+    {
+      "input": "https://relay.vettid.org#x",
+      "refused": true
+    },
+    {
+      "input": "https://user@relay.vettid.org",
+      "refused": true
+    },
+    {
+      "input": "https://192.0.2.1",
+      "refused": true
+    },
+    {
+      "input": "https://[2001:db8::1]:8443",
+      "refused": true
+    },
+    {
+      "input": "https://bücher.example",
+      "refused": true
+    },
+    {
+      "input": "https://relay.vettid.org:0443",
+      "refused": true
+    },
+    {
+      "input": "XN--BCHER-KVA.example",
+      "r": "https://xn--bcher-kva.example"
+    },
+    {
+      "input": "https://relay.vettid.org:443/",
+      "r": "https://relay.vettid.org"
+    },
+    {
+      "input": "localhost:8443",
+      "r": "https://localhost:8443"
+    },
+    {
+      "input": "relay.vettid.org.",
+      "refused": true
+    },
+    {
+      "input": "https://relay.vettid.org:",
+      "refused": true
+    },
+    {
+      "input": "https://1.2.3.4.",
+      "refused": true
+    },
+    {
+      "input": "https://0177.0.0.1",
+      "refused": true
+    },
+    {
+      "input": "https://[fe80::1%25eth0]",
+      "refused": true
+    },
+    {
+      "input": "https://relay.vettid.org/?",
+      "refused": true
+    },
+    {
+      "input": "https://relay.vettid.org#",
+      "refused": true
+    },
+    {
+      "input": "https://rel%61y.org",
+      "refused": true
+    },
+    {
+      "input": "https://0x",
+      "refused": true
+    },
+    {
+      "input": "https://1.0x",
+      "refused": true
+    },
+    {
+      "input": "https://0x.0x",
+      "refused": true
+    },
+    {
+      "input": "https://relay.99999999999999999999999",
+      "refused": true
+    },
+    {
+      "input": "https://relay.vettid.org:65536",
+      "refused": true
+    },
+    {
+      "input": "https://relay.vettid.org//",
+      "refused": true
+    }
+  ],
+  "salt_lists": [
+    {
+      "name": "one entry, mid-hour",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T12:30:00Z",
+      "valid": true
+    },
+    {
+      "name": "two entries near the hour",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        },
+        {
+          "salt_id": "8ea99cba",
+          "epoch": 493045,
+          "nonce": "o6Ojo6Ojo6Ojo6Ojo6Ojow=="
+        }
+      ],
+      "now": "2026-03-31T12:59:00Z",
+      "valid": true
+    },
+    {
+      "name": "the window's first second",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T11:56:00Z",
+      "valid": true
+    },
+    {
+      "name": "the window's last second",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T13:12:00Z",
+      "valid": true
+    },
+    {
+      "name": "before the window",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T11:55:59Z",
+      "valid": false,
+      "reason": "clock"
+    },
+    {
+      "name": "after the window",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T13:12:01Z",
+      "valid": false,
+      "reason": "clock"
+    },
+    {
+      "name": "no entries",
+      "salts": [],
+      "now": "2026-03-31T12:30:00Z",
+      "valid": false,
+      "reason": "count"
+    },
+    {
+      "name": "three entries",
+      "salts": [
+        {
+          "salt_id": "484da0c4",
+          "epoch": 493043,
+          "nonce": "paWlpaWlpaWlpaWlpaWlpQ=="
+        },
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        },
+        {
+          "salt_id": "8ea99cba",
+          "epoch": 493045,
+          "nonce": "o6Ojo6Ojo6Ojo6Ojo6Ojow=="
+        }
+      ],
+      "now": "2026-03-31T12:30:00Z",
+      "valid": false,
+      "reason": "count"
+    },
+    {
+      "name": "a 15-byte nonce",
+      "salts": [
+        {
+          "salt_id": "77033a6a",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCg"
+        }
+      ],
+      "now": "2026-03-31T12:30:00Z",
+      "valid": false,
+      "reason": "nonce_size"
+    },
+    {
+      "name": "a 17-byte nonce",
+      "salts": [
+        {
+          "salt_id": "12cef352",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoKA="
+        }
+      ],
+      "now": "2026-03-31T12:30:00Z",
+      "valid": false,
+      "reason": "nonce_size"
+    },
+    {
+      "name": "one epoch twice",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        },
+        {
+          "salt_id": "f8ee4089",
+          "epoch": 493044,
+          "nonce": "o6Ojo6Ojo6Ojo6Ojo6Ojow=="
+        }
+      ],
+      "now": "2026-03-31T12:30:00Z",
+      "valid": false,
+      "reason": "epoch_twice"
+    },
+    {
+      "name": "a salt_id that does not recompute",
+      "salts": [
+        {
+          "salt_id": "00000000",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T12:30:00Z",
+      "valid": false,
+      "reason": "salt_id"
+    },
+    {
+      "name": "a seen epoch with the same nonce",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T12:30:00Z",
+      "seen": [
+        {
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "valid": true
+    },
+    {
+      "name": "one of two entries outside its window",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        },
+        {
+          "salt_id": "264bd8cb",
+          "epoch": 493049,
+          "nonce": "o6Ojo6Ojo6Ojo6Ojo6Ojow=="
+        }
+      ],
+      "now": "2026-03-31T12:30:00Z",
+      "valid": false,
+      "reason": "clock"
+    },
+    {
+      "name": "a seen epoch with another nonce",
+      "salts": [
+        {
+          "salt_id": "a12213d1",
+          "epoch": 493044,
+          "nonce": "oKCgoKCgoKCgoKCgoKCgoA=="
+        }
+      ],
+      "now": "2026-03-31T12:30:00Z",
+      "seen": [
+        {
+          "epoch": 493044,
+          "nonce": "pqampqampqampqampqampg=="
+        }
+      ],
+      "valid": false,
+      "reason": "nonce_changed"
+    }
+  ]
+}
