@@ -1,6 +1,7 @@
 package paircode
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -114,7 +115,7 @@ func TestMACAndKeyID(t *testing.T) {
 	if len(MAC(k, tag)) != MACSize || string(MAC(k, tag)) == string(MAC(k2, tag)) {
 		t.Fatal("mac")
 	}
-	if len(KeyID(k)) != 16 || KeyID(k) == KeyID(k2) || KeyID(k) != KeyID(k) {
+	if id := KeyID(k); len(id) != 16 || id == KeyID(k2) || id != KeyID(bytes.Clone(k)) {
 		t.Fatal("key id")
 	}
 }

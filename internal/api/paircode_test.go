@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -347,5 +349,46 @@ func TestPairCodeRelayclient(t *testing.T) {
 	}
 	if err := c.DeletePairCode(ctx, pcID1); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Tags, code_macs, salts, blobs, claim ids and k_pc are never logged.
+func TestPairCodeLogsCarryNoSecrets(t *testing.T) {
+	var logs syncBuf
+	f := newFixtureFull(t, func(c *config.Config) { c.PairCodeKey = config.NewSecret(testPairKey) }, &logs,
+		func(*fixture) []Option { return []Option{WithPairCodeHold(pcHold)} })
+	a, b := newPrincipal(1), newPrincipal(2)
+	f.register(a)
+	f.register(b)
+	salt := f.salts()[0].SaltID
+	tag, tag2 := bytes.Repeat([]byte{0xc3}, 32), bytes.Repeat([]byte{0xd4}, 32)
+	blob := "CODE-BUNDLE-MARKER"
+	f.do(req{method: "PUT", path: "/v1/pair-code/" + pcID1, body: putBody(salt, tag, blob), signer: &a})
+	f.redeem(redeemBody(tagEntry(salt, tag2)))
+	f.redeem([]byte("{not json " + blob))
+	f.redeem(redeemBody(tagEntry(salt, tag)))
+	f.do(req{method: "PUT", path: "/v1/pair-code/" + pcID2, body: putBody(salt, tag2, blob), signer: &a})
+	f.do(req{method: "PUT", path: "/v1/pair-code/" + pcID1, body: putBody(salt, tag2, blob), signer: &b})
+	f.do(req{method: "DELETE", path: "/v1/pair-code/" + pcID2, signer: &a})
+	out := logs.String()
+	if !strings.Contains(out, "/v1/pair-code/redeem") {
+		t.Fatalf("no access log lines:\n%s", out)
+	}
+	for name, secret := range map[string]string{
+		"tag b64":      base64.StdEncoding.EncodeToString(tag),
+		"tag hex":      hex.EncodeToString(tag),
+		"tag2 b64":     base64.StdEncoding.EncodeToString(tag2),
+		"code_mac hex": hex.EncodeToString(paircode.MAC(testPairKey, tag)),
+		"blob":         blob,
+		"blob b64":     base64.StdEncoding.EncodeToString([]byte(blob)),
+		"salt b64":     base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 16)),
+		"claim id":     pcID1,
+		"claim id 2":   pcID2,
+		"k_pc b64":     base64.StdEncoding.EncodeToString(testPairKey),
+		"k_pc hex":     hex.EncodeToString(testPairKey),
+	} {
+		if strings.Contains(out, secret) {
+			t.Errorf("logs contain the %s", name)
+		}
 	}
 }

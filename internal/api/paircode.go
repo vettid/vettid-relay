@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -71,7 +72,13 @@ type pairCodes struct {
 func newPairCodes(cfg config.Config, log *slog.Logger) *pairCodes {
 	k := cfg.PairCodeKey.Bytes()
 	if len(k) != paircode.KeySize {
-		log.Info("pair codes are off", "reason", cfg.PairCodeKeyProblem)
+		// A key that was given but can't be used is worth a warning; no
+		// key at all is the default.
+		if cfg.PairCodeKeyProblem != "" && !strings.HasPrefix(cfg.PairCodeKeyProblem, "no ") {
+			log.Warn("pair codes are off", "reason", cfg.PairCodeKeyProblem)
+		} else {
+			log.Debug("pair codes are off", "reason", cfg.PairCodeKeyProblem)
+		}
 		return nil
 	}
 	r, err := paircode.CanonicalRelay(cfg.BaseURL)

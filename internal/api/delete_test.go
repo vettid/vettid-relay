@@ -161,7 +161,7 @@ func TestHealthzProtocolVersion(t *testing.T) {
 	code, b := f.do(req{method: "GET", path: "/healthz"})
 	var h map[string]string
 	json.Unmarshal(b, &h)
-	if code != 200 || h["protocol"] != "0.13.0" {
+	if code != 200 || h["protocol"] != "0.14.1" {
 		t.Fatalf("healthz %d %s", code, b)
 	}
 }

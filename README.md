@@ -7,7 +7,7 @@ keys to payload content: a compromised relay can drop or delay messages, but
 can't read or forge them.
 
 - **Protocol:** [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md)
-  (**v0.13.0**, reported by `relay -version` and `/healthz`). This repository
+  (**v0.14.1**, reported by `relay -version` and `/healthz`). This repository
   implements all of it:
   - registration
   - deposit tokens (PASETO v4.public, sender-bound), plus one-shot open
@@ -18,6 +18,8 @@ can't read or forge them.
   - owner-signed mailbox deletion with re-registration tombstones (§6.10)
   - the optional blob transfer (§6.8)
   - single-fetch claims for bootstrap bundles (§6.9)
+  - code claims, found by a short pairing code the relay never receives
+    (§6.9.1), when it holds a pair-code key
 
   Every test vector in §9 is reproduced byte-for-byte in the tests.
 - **Client guide:** [`docs/CLIENT-NOTES.md`](docs/CLIENT-NOTES.md).
@@ -131,7 +133,9 @@ start, not wrapped.
 | `RELAY_MAX_TOKEN_LIFETIME` | `720h` (30 d) | `max_token_lifetime_seconds` (§5.2). Sender-bound tokens with `exp − iat` above this are `token_invalid`. Denylist and tombstone retention use the largest value ever advertised (the stored lifetime mark, §5.5, §6.10). At most `9600h` (400 d), for example for long-lived, low-quota reconnect tokens; a larger value is refused at start unless `RELAY_ALLOW_LONG_TOKEN_LIFETIME` is `true`, since the retention it sets can't be lowered again (see "Lowering the token lifetime limits"). |
 | `RELAY_OPEN_TOKEN_MAX_LIFETIME` | `600s` | `open_token_max_lifetime_seconds` (§5.6). This is the cap on `exp − iat` for one-shot open tokens. Up to 7 days is recommended for remote invitations. At most `9600h` (400 d) unless `RELAY_ALLOW_LONG_TOKEN_LIFETIME` is `true`, as for `RELAY_MAX_TOKEN_LIFETIME`. |
 | `RELAY_ALLOW_LONG_TOKEN_LIFETIME` | `false` | `true` accepts `RELAY_MAX_TOKEN_LIFETIME` or `RELAY_OPEN_TOKEN_MAX_LIFETIME` above 400 days, up to 100 years. Without it such a value is refused at start: tombstones and denylist entries are kept for the largest limit ever advertised, and the stored lifetime mark is never lowered, so a mistyped limit would hold them for years until the store is edited by hand. |
-| `RELAY_MAX_CLAIM_BYTES` | `16384` | `max_claim_bytes` (§6.9). This is the maximum claim body. |
+| `RELAY_MAX_CLAIM_BYTES` | `16384` | `max_claim_bytes` (§6.9). This is the maximum claim body, and a code claim's blob (§6.9.1). |
+| `RELAY_PAIR_CODE_KEY_FILE` | | A file holding the pair-code key `k_pc` (§6.9.1): 32 random bytes, base64. With it the relay offers code claims (`"pair_codes": true` in `limits`); without it, or with a key that isn't exactly 32 bytes, it offers none, its pair-code routes answer `404 not_found`, and one line at start says why (naming the variable, never the value). Keep the key in a secret store and give it to the relay as a file (a mounted or injected secret); every relay process of a shared store needs the same one. The key is never logged, and a config printed in full shows `[secret]`. `RELAY_BASE_URL` must then have a canonical `https` form (§6.9.1 `r`). See "Pair-code key" below. |
+| `RELAY_PAIR_CODE_KEY` | | The key itself, base64, for local runs only. `RELAY_PAIR_CODE_KEY_FILE` wins if both are set. |
 | `RELAY_CLAIM_TTL` | `900s` | `claim_ttl_seconds` (§6.9). It's the longest TTL a creator may request with `PUT /v1/claim/ttl/<seconds>`. Up to 7 days is recommended. A bare `PUT /v1/claim` gets min(900 s, this). |
 | `RELAY_RATE_IP_RPS` / `RELAY_RATE_IP_BURST` | `100` / `300` | Flood guard on `/v1/*` per client network (the IPv4 address or the IPv6 /64), applied before any parsing. One address may carry a whole vault host: see [Rate limiting](#rate-limiting) for when to raise it. |
 | `RELAY_RATE_KEY_RPS` / `RELAY_RATE_KEY_BURST` | `20` / `100` | Per-key bucket, applied once a request is authenticated: owner routes, registration and mailbox deletion. Keyed by the signing key. |
@@ -182,6 +186,13 @@ version does not protect against. In short:
   process. Nothing else keyed on a network can refuse a request
   that is properly signed by a key with a mailbox. There is no penalty
   state.
+- **Code redeems** (limits 14 and 15, §6.9.1), with a pair-code key: 20 per
+  10 minutes per IPv4 address, 10 per IPv6 /64, with ceilings of 200 per
+  /48 and 1,000 per /32, charged together and relay-wide (Valkey). A
+  refused redeem is answered as a miss, `404 code_unknown` at the same
+  250 ms hold, never `429`, and touches no code claim. A live code claim
+  is cancelled after 32 redeems in its bucket that match nothing. These
+  numbers are fixed (chosen; not in the card).
 - A vault host of 900 vaults, at three messages a minute each of 4 KB
   (base64 makes 4 KB about 5.5 KB), each crossing the host about twice
   (to the peer's vault, and from a vault to its phone), stores about
@@ -448,7 +459,8 @@ other process sees, refuses or is woken by.
   definition). Every operation that SQLite does in one transaction is a
   DynamoDB transaction or a single conditional write: deposit + quotas +
   open-token consumption + ULID order; leasing on collect; claim single
-  fetch; rotation. Decisions use strongly consistent reads. Expiry is
+  fetch; a code claim's put (with the mailbox's previous one and the
+  collision check) and its redeem; rotation. Decisions use strongly consistent reads. Expiry is
   checked on every read; TTL only reclaims space. A message is one item
   (the payload as binary), so `RELAY_MAX_PAYLOAD_BYTES` is capped at
   380,000 with this store.
@@ -543,6 +555,10 @@ other process sees, refuses or is woken by.
 | `PUT /v1/claim` | signed by a registered mailbox key | `201 {claim_id, expires_at}` |
 | `GET /v1/claim/{claim_id}` | none (rate-limited) | `200 application/octet-stream`. Single fetch: the claim is deleted. |
 | `DELETE /v1/claim/{claim_id}` | the creating key | `204` (idempotent) |
+| `GET /v1/pair-code/salts` | none | `200 {salts:[{salt_id, epoch, nonce}]}`: the hourly lookup salts listed now, 1 or 2 (§6.9.1). Only with a pair-code key, like the three routes below |
+| `PUT /v1/pair-code/{claim_id}` | signed by a registered mailbox key; body `{salt_id, tag, salt, blob}` | `201 {expires_at}` (600 s), or `409 code_taken` (the tag matched a live code claim: both are deleted). The mailbox's previous code claim is deleted first, whatever follows |
+| `POST /v1/pair-code/redeem` | none (limit 14); body `{tags:[{salt_id, tag}]}` | `200 {claim_id, salt, blob, expires_at}`, single fetch; every failure `404 code_unknown` with the same bytes. Every answer is sent 250 ms after receipt |
+| `DELETE /v1/pair-code/{claim_id}` | the creating key | `204` (idempotent) |
 | `GET /healthz` | none | `200` when the DB is reachable and not draining, else `503`. The DB is asked at most once every 2 s per process; requests in between get the last answer |
 | `GET /connect` | none (web bucket) | `200 text/html`: the invitation landing page (§6.11). Invitation URLs are `<relay>/connect#<link>`; the fragment never reaches the relay. |
 | `GET /.well-known/assetlinks.json` | none (web bucket) | `200 application/json`: Android App Links statement for the VettID app |
@@ -566,6 +582,30 @@ keep them in step:
 | 413 | `payload_too_large` |
 | 429 | `quota_exceeded`; `rate_limited` (with `Retry-After`) |
 | 500 | `internal` |
+
+## Pair-code key
+
+Code claims (§6.9.1) are stored under `code_mac = HMAC-SHA-256(k_pc, tag)`,
+never the tag or the code. Make the key with `head -c 32 /dev/urandom |
+base64`, keep it in the secret store, and give it to every relay process
+as the file `RELAY_PAIR_CODE_KEY_FILE`. It never goes into the claim store.
+
+- **Rotating** (only when it may be exposed): give every process the new
+  key and restart them. Each code claim is filed under the key id of the
+  key that made it (the first 8 bytes of `HMAC-SHA-256(k_pc,
+  "vettid/pair-code/1/key-id")`, logged at start), and a redeem looks only
+  under the current one, so every live code claim is unredeemable at once.
+  They are deleted by their mailbox's next code claim, or at expiry (600 s)
+  by DynamoDB's TTL or the SQLite sweep. Their members see their codes
+  fail and get new ones. (Chosen; the spec's "deletes all live code claims"
+  is being corrected to this.)
+- **Removing** it turns code claims off; the routes answer `404
+  not_found` and the vaults fall back to the link.
+
+The hourly lookup salt's nonce is random, stored in the store the first
+time its hour is listed (2 minutes before it starts), and never derived
+from `k_pc`, so the key alone doesn't tell anyone a future salt
+(§8 item 11).
 
 ## Security notes (spec §8)
 
