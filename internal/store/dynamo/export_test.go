@@ -15,6 +15,10 @@ import (
 // cleanup of its id and marker (tests only).
 func SetBeforeCodeCleanup(s *Store, f func()) { s.beforeCodeCleanup = f }
 
+// SetBeforeCodeDrop sets a hook before dropCode deletes a code claim
+// (tests only).
+func SetBeforeCodeDrop(s *Store, f func()) { s.beforeCodeDrop = f }
+
 // SetBeforeRevive sets a hook that runs between Register's read of a dead
 // mailbox and its revive (tests only).
 func SetBeforeRevive(s *Store, f func()) { s.beforeRevive = f }

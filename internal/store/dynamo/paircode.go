@@ -82,6 +82,9 @@ func (s *Store) dropCode(ctx context.Context, mailbox, cid, cpk, csk string, exp
 	at := item{":mb": avS(mailbox), ":cpk": avS(cpk), ":csk": avS(csk), ":exp": avN(exp)}
 	ptr := item{":cid": avS(cid), ":cpk": avS(cpk), ":csk": avS(csk), ":exp": avN(exp)}
 	if !claimGone {
+		if s.beforeCodeDrop != nil {
+			s.beforeCodeDrop()
+		}
 		if err := s.retryConflicts(ctx, func() error {
 			_, err := s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 				TableName: &s.cfg.Table, Key: key(cpk, csk),
@@ -156,7 +159,7 @@ func (s *Store) PutCode(ctx context.Context, c store.CodePut, maxStored int64) (
 		return time.Time{}, store.ErrQuotaMailboxBlobs
 	}
 	cpk, csk := codeBucketPK(c.KeyID, c.SaltID, c.CodeMAC), codeSK(c.CodeMAC)
-	skipOld := "" // the old claim id whose keys name another claim now
+	skipOld := "" // the old claim (id and exp) whose keys name another claim now
 	for attempt := 0; ; attempt++ {
 		if attempt > codeAttempts() {
 			return time.Time{}, fmt.Errorf("dynamo: code claim put kept conflicting")
@@ -193,13 +196,16 @@ func (s *Store) PutCode(ctx context.Context, c store.CodePut, maxStored int64) (
 		}
 		delta := size
 		if old != nil {
-			ptr.ConditionExpression = aws.String("cid = :ocid")
-			ptr.ExpressionAttributeValues = item{":ocid": avS(getS(old, "cid"))}
+			// The marker read, and no other: a same-id re-PUT between the
+			// read and this transaction moves its exp, and this one starts
+			// again from it.
+			ptr.ConditionExpression = aws.String("cid = :ocid AND exp = :oexp")
+			ptr.ExpressionAttributeValues = item{":ocid": avS(getS(old, "cid")), ":oexp": avN(getN0(old, "exp"))}
 			delta -= getN0(old, "sz")
 		}
 		extra = append(extra, types.TransactWriteItem{Put: ptr})
 		checks = append(checks, extraCheck{idx: 2, err: errCodePtrMoved})
-		if old != nil && getS(old, "cid") != skipOld {
+		if old != nil && oldKey(old) != skipOld {
 			ocid, ocpk, ocsk, oexp := getS(old, "cid"), getS(old, "cpk"), getS(old, "csk"), getN0(old, "exp")
 			if ocpk != cpk || ocsk != csk {
 				extra = append(extra, types.TransactWriteItem{Delete: &types.Delete{
@@ -227,7 +233,7 @@ func (s *Store) PutCode(ctx context.Context, c store.CodePut, maxStored int64) (
 		case errors.Is(err, errCodeOldGone):
 			// The old claim's keys name another claim now: leave them,
 			// for that old claim only.
-			skipOld = getS(old, "cid")
+			skipOld = oldKey(old)
 			continue
 		case errors.Is(err, errCodeCollision):
 			done, err := s.collide(ctx, cpk, csk, now)
@@ -274,6 +280,18 @@ func (s *Store) collide(ctx context.Context, cpk, csk string, now time.Time) (bo
 	}})
 	if r := txReasons(err); r != nil && (reasonCode(r, 0) == "ConditionalCheckFailed" || isConflict(r)) {
 		return false, nil // gone or moving meanwhile: the put tries again
+	} else if r != nil && (reasonCode(r, 1) == "ConditionalCheckFailed" || reasonCode(r, 2) == "ConditionalCheckFailed") {
+		// The victim's id or marker names a newer claim of its mailbox:
+		// only the claim met goes (its marker and charge stay with the
+		// newer one, or expire).
+		_, err := s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+			TableName: &s.cfg.Table, Key: key(cpk, csk),
+			ConditionExpression: aws.String("cid = :cid AND exp = :exp"), ExpressionAttributeValues: vals,
+		})
+		if isCCF(err) {
+			return false, nil
+		}
+		return err == nil, err
 	}
 	if err != nil {
 		return false, err
@@ -447,4 +465,9 @@ func redeemToken() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// oldKey names a marker's claim by id and exp, for PutCode's skipOld.
+func oldKey(old item) string {
+	return getS(old, "cid") + "#" + strconv.FormatInt(getN0(old, "exp"), 10)
 }

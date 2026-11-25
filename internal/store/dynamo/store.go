@@ -151,6 +151,9 @@ type Store struct {
 	// beforeCodeCleanup runs between a code claim's delete and the
 	// cleanup of its id and marker (tests only).
 	beforeCodeCleanup func()
+	// beforeCodeDrop runs before a code claim's delete by dropCode
+	// (tests only).
+	beforeCodeDrop func()
 }
 
 type cachedMailbox struct {

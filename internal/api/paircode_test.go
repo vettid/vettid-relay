@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -458,5 +459,58 @@ func TestPairCodePutBodyAndDelete(t *testing.T) {
 	}
 	if code, _, _ := f.redeem(redeemBody(tagEntry(salt, tagOf(1)))); code != http.StatusOK {
 		t.Fatalf("another mailbox's DELETE removed the claim: %d", code)
+	}
+}
+
+// A code PUT is charged to limit 11 (the key's stored bytes), and a PUT
+// that isn't stored gets its charge back.
+func TestPairCodePutChargesStoredBytes(t *testing.T) {
+	f := pairCodeFixture(t, func(c *config.Config) {
+		c.RateKeyBytesPerSec, c.RateKeyBytesBurst = 1e-9, 100
+	})
+	a, b := newPrincipal(1), newPrincipal(2)
+	f.register(a)
+	f.register(b)
+	salt := f.salts()[0].SaltID
+	put := func(p principal, id string, tag byte, n int) int {
+		code, _ := f.do(req{method: "PUT", path: "/v1/pair-code/" + id, body: putBody(salt, tagOf(tag), strings.Repeat("x", n)), signer: &p})
+		return code
+	}
+	if c := put(a, pcID1, 1, 60); c != http.StatusCreated {
+		t.Fatal(c)
+	}
+	// Not stored (the id is a's): refunded, so b's budget is whole.
+	if c := put(b, pcID1, 2, 90); c != http.StatusBadRequest {
+		t.Fatal(c)
+	}
+	if c := put(b, pcID2, 3, 100); c != http.StatusCreated {
+		t.Fatalf("b's budget after a refunded PUT: %d", c)
+	}
+	// a has 40 left.
+	if c := put(a, pcID1, 4, 41); c != http.StatusTooManyRequests {
+		t.Fatalf("over the key's budget: %d", c)
+	}
+}
+
+// The hold is counted from receipt: a body that arrives slowly is
+// answered at the next step after receipt, not a hold after the work.
+func TestPairCodeHoldCountsFromReceipt(t *testing.T) {
+	f := pairCodeFixture(t, nil)
+	salt := f.salts()[0].SaltID
+	body := redeemBody(tagEntry(salt, tagOf(9)))
+	pr, pw := io.Pipe()
+	hr := f.build(req{method: "POST", path: "/v1/pair-code/redeem", body: body})
+	hr.Body, hr.ContentLength = pr, int64(len(body))
+	go func() {
+		time.Sleep(pcHold * 3 / 2) // the work ends at 1.5 holds
+		pw.Write(body)
+		pw.Close()
+	}()
+	start := time.Now()
+	code, _, _ := f.send(hr)
+	d := time.Since(start)
+	// From receipt: the step at 2 holds. After the work: 2.5 holds.
+	if code != http.StatusNotFound || d < 2*pcHold || d >= 2*pcHold+pcHold/2 {
+		t.Fatalf("%d after %v, want [%v, %v)", code, d, 2*pcHold, 2*pcHold+pcHold/2)
 	}
 }
