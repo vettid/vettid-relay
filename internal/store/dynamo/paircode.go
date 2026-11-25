@@ -19,9 +19,13 @@ import (
 // Code claims (spec §6.9.1). Items:
 //
 //	pk                                   sk            what
-//	PCB#<key id>#<salt_id>#<bucket hex>  <code_mac hex> the code claim: cid, mb, salt, body, sz, exp, miss
-//	PCI#<claim id>                       PCI           its id: mb, cpk, csk, exp (the id namespace; DELETE)
-//	MB#<mailbox>                         P#            the mailbox's one live code claim: cid, cpk, csk, sz, exp
+//	PCB#<key id>#<salt_id>#<bucket hex>  <code_mac hex> the code claim: cid, ver, mb, salt, body, sz, exp, miss
+//	PCI#<claim id>                       PCI           its id: mb, cpk, csk, ver, exp (the id namespace; DELETE)
+//	MB#<mailbox>                         P#            the mailbox's one live code claim: cid, cpk, csk, ver, sz, exp
+//
+// ver is a random token each put writes into its three items: every
+// write that must touch one put's items and no other's (a later PUT of the
+// same id, even in the same millisecond) is conditional on it.
 //	META                                 PCN#<epoch>   an hour's lookup salt nonce: nonce
 //
 // A redeem is a GetItem and a conditional delete in its claim's bucket
@@ -68,19 +72,19 @@ func (s *Store) DeleteMailboxCode(ctx context.Context, mailbox string) error {
 	if err != nil || p == nil {
 		return err
 	}
-	return s.dropCode(ctx, mailbox, getS(p, "cid"), getS(p, "cpk"), getS(p, "csk"), getN0(p, "exp"), false)
+	return s.dropCode(ctx, mailbox, getS(p, "cid"), getS(p, "cpk"), getS(p, "csk"), getS(p, "ver"), false)
 }
 
-// dropCode deletes code claim cid of mailbox, the one that expires at exp:
+// dropCode deletes code claim cid of mailbox, the one put with token ver:
 // the claim first unless claimGone (it is unredeemable from then on), then
 // its id and the mailbox's marker, whose charge is given back. Each delete
-// is conditional on naming cid, its slot and exp, so nothing of a later
+// is conditional on naming cid, its slot and ver, so nothing of a later
 // claim goes, not even one PUT again with the same id and tag (a PUT
-// retried after a lost 201, §6.9.1 step 1), which has a later exp.
-func (s *Store) dropCode(ctx context.Context, mailbox, cid, cpk, csk string, exp int64, claimGone bool) error {
-	vals := item{":cid": avS(cid), ":exp": avN(exp)}
-	at := item{":mb": avS(mailbox), ":cpk": avS(cpk), ":csk": avS(csk), ":exp": avN(exp)}
-	ptr := item{":cid": avS(cid), ":cpk": avS(cpk), ":csk": avS(csk), ":exp": avN(exp)}
+// retried after a lost 201, §6.9.1 step 1), which has its own ver.
+func (s *Store) dropCode(ctx context.Context, mailbox, cid, cpk, csk, ver string, claimGone bool) error {
+	vals := item{":cid": avS(cid), ":ver": avS(ver)}
+	at := item{":mb": avS(mailbox), ":cpk": avS(cpk), ":csk": avS(csk), ":ver": avS(ver)}
+	ptr := item{":cid": avS(cid), ":cpk": avS(cpk), ":csk": avS(csk), ":ver": avS(ver)}
 	if !claimGone {
 		if s.beforeCodeDrop != nil {
 			s.beforeCodeDrop()
@@ -88,7 +92,7 @@ func (s *Store) dropCode(ctx context.Context, mailbox, cid, cpk, csk string, exp
 		if err := s.retryConflicts(ctx, func() error {
 			_, err := s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 				TableName: &s.cfg.Table, Key: key(cpk, csk),
-				ConditionExpression: aws.String("cid = :cid AND exp = :exp"), ExpressionAttributeValues: vals,
+				ConditionExpression: aws.String("cid = :cid AND ver = :ver"), ExpressionAttributeValues: vals,
 			})
 			return err
 		}); err != nil && !isCCF(err) {
@@ -101,7 +105,7 @@ func (s *Store) dropCode(ctx context.Context, mailbox, cid, cpk, csk string, exp
 	if err := s.retryConflicts(ctx, func() error {
 		_, err := s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: &s.cfg.Table, Key: key(codeIDPK(cid), "PCI"),
-			ConditionExpression: aws.String("mb = :mb AND cpk = :cpk AND csk = :csk AND exp = :exp"), ExpressionAttributeValues: at,
+			ConditionExpression: aws.String("mb = :mb AND cpk = :cpk AND csk = :csk AND ver = :ver"), ExpressionAttributeValues: at,
 		})
 		return err
 	}); err != nil && !isCCF(err) {
@@ -112,7 +116,7 @@ func (s *Store) dropCode(ctx context.Context, mailbox, cid, cpk, csk string, exp
 		var err error
 		out, err = s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: &s.cfg.Table, Key: key(mbPK(mailbox), skCodePtr),
-			ConditionExpression: aws.String("cid = :cid AND cpk = :cpk AND csk = :csk AND exp = :exp"), ExpressionAttributeValues: ptr,
+			ConditionExpression: aws.String("cid = :cid AND cpk = :cpk AND csk = :csk AND ver = :ver"), ExpressionAttributeValues: ptr,
 			ReturnValues: types.ReturnValueAllOld,
 		})
 		return err
@@ -159,13 +163,14 @@ func (s *Store) PutCode(ctx context.Context, c store.CodePut, maxStored int64) (
 		return time.Time{}, store.ErrQuotaMailboxBlobs
 	}
 	cpk, csk := codeBucketPK(c.KeyID, c.SaltID, c.CodeMAC), codeSK(c.CodeMAC)
-	skipOld := "" // the old claim (id and exp) whose keys name another claim now
+	skipOld := "" // the old claim (id and ver) whose keys name another claim now
 	for attempt := 0; ; attempt++ {
 		if attempt > codeAttempts() {
 			return time.Time{}, fmt.Errorf("dynamo: code claim put kept conflicting")
 		}
 		now := s.now()
 		exp := now.Add(store.CodeTTL).UTC()
+		ver := redeemToken()
 		old, err := s.codePtr(ctx, c.Mailbox)
 		if err != nil {
 			return time.Time{}, err
@@ -175,7 +180,7 @@ func (s *Store) PutCode(ctx context.Context, c store.CodePut, maxStored int64) (
 		var checks []extraCheck
 		extra = append(extra, types.TransactWriteItem{Put: &types.Put{
 			TableName: &s.cfg.Table,
-			Item: item{"pk": avS(cpk), "sk": avS(csk), "cid": avS(c.ClaimID), "mb": avS(c.Mailbox),
+			Item: item{"pk": avS(cpk), "sk": avS(csk), "cid": avS(c.ClaimID), "ver": avS(ver), "mb": avS(c.Mailbox),
 				"salt": avB(c.Salt), "body": avB(c.Blob), "sz": avN(size), "exp": avN(ms(exp)),
 				"ttl_s": avN(ttlSec(exp)), "miss": avN(0)},
 			ConditionExpression: aws.String(liveCond()), ExpressionAttributeValues: vals,
@@ -183,7 +188,7 @@ func (s *Store) PutCode(ctx context.Context, c store.CodePut, maxStored int64) (
 		extra = append(extra, types.TransactWriteItem{Put: &types.Put{
 			TableName: &s.cfg.Table,
 			Item: item{"pk": avS(codeIDPK(c.ClaimID)), "sk": avS("PCI"), "mb": avS(c.Mailbox),
-				"cpk": avS(cpk), "csk": avS(csk), "exp": avN(ms(exp)), "ttl_s": avN(ttlSec(exp))},
+				"cpk": avS(cpk), "csk": avS(csk), "ver": avS(ver), "exp": avN(ms(exp)), "ttl_s": avN(ttlSec(exp))},
 			ConditionExpression: aws.String(liveCond()), ExpressionAttributeValues: vals,
 		}})
 		// The claim id first, then the collision (§6.9.1 steps 2 and 4).
@@ -191,35 +196,35 @@ func (s *Store) PutCode(ctx context.Context, c store.CodePut, maxStored int64) (
 		ptr := &types.Put{
 			TableName: &s.cfg.Table,
 			Item: item{"pk": avS(mbPK(c.Mailbox)), "sk": avS(skCodePtr), "cid": avS(c.ClaimID),
-				"cpk": avS(cpk), "csk": avS(csk), "sz": avN(size), "exp": avN(ms(exp)), "ttl_s": avN(ttlSec(exp))},
+				"cpk": avS(cpk), "csk": avS(csk), "ver": avS(ver), "sz": avN(size), "exp": avN(ms(exp)), "ttl_s": avN(ttlSec(exp))},
 			ConditionExpression: aws.String("attribute_not_exists(sk)"),
 		}
 		delta := size
 		if old != nil {
 			// The marker read, and no other: a same-id re-PUT between the
-			// read and this transaction moves its exp, and this one starts
-			// again from it.
-			ptr.ConditionExpression = aws.String("cid = :ocid AND exp = :oexp")
-			ptr.ExpressionAttributeValues = item{":ocid": avS(getS(old, "cid")), ":oexp": avN(getN0(old, "exp"))}
+			// read and this transaction writes its own ver, and this one
+			// starts again from it.
+			ptr.ConditionExpression = aws.String("cid = :ocid AND ver = :over")
+			ptr.ExpressionAttributeValues = item{":ocid": avS(getS(old, "cid")), ":over": avS(getS(old, "ver"))}
 			delta -= getN0(old, "sz")
 		}
 		extra = append(extra, types.TransactWriteItem{Put: ptr})
 		checks = append(checks, extraCheck{idx: 2, err: errCodePtrMoved})
 		if old != nil && oldKey(old) != skipOld {
-			ocid, ocpk, ocsk, oexp := getS(old, "cid"), getS(old, "cpk"), getS(old, "csk"), getN0(old, "exp")
+			ocid, ocpk, ocsk, over := getS(old, "cid"), getS(old, "cpk"), getS(old, "csk"), getS(old, "ver")
 			if ocpk != cpk || ocsk != csk {
 				extra = append(extra, types.TransactWriteItem{Delete: &types.Delete{
 					TableName: &s.cfg.Table, Key: key(ocpk, ocsk),
-					ConditionExpression:       aws.String("attribute_not_exists(pk) OR (cid = :ocid AND exp = :oexp)"),
-					ExpressionAttributeValues: item{":ocid": avS(ocid), ":oexp": avN(oexp)},
+					ConditionExpression:       aws.String("attribute_not_exists(pk) OR (cid = :ocid AND ver = :over)"),
+					ExpressionAttributeValues: item{":ocid": avS(ocid), ":over": avS(over)},
 				}})
 				checks = append(checks, extraCheck{idx: len(extra) - 1, err: errCodeOldGone})
 			}
 			if ocid != c.ClaimID {
 				extra = append(extra, types.TransactWriteItem{Delete: &types.Delete{
 					TableName: &s.cfg.Table, Key: key(codeIDPK(ocid), "PCI"),
-					ConditionExpression:       aws.String("attribute_not_exists(pk) OR (mb = :mb AND exp = :oexp)"),
-					ExpressionAttributeValues: item{":mb": avS(c.Mailbox), ":oexp": avN(oexp)},
+					ConditionExpression:       aws.String("attribute_not_exists(pk) OR (mb = :mb AND ver = :over)"),
+					ExpressionAttributeValues: item{":mb": avS(c.Mailbox), ":over": avS(over)},
 				}})
 				checks = append(checks, extraCheck{idx: len(extra) - 1, err: errCodeOldGone})
 			}
@@ -268,15 +273,15 @@ func (s *Store) collide(ctx context.Context, cpk, csk string, now time.Time) (bo
 	if !live(out.Item, ms(now)) {
 		return false, nil
 	}
-	cid, mb, sz, exp := getS(out.Item, "cid"), getS(out.Item, "mb"), getN0(out.Item, "sz"), getN0(out.Item, "exp")
-	vals := item{":cid": avS(cid), ":exp": avN(exp)}
+	cid, mb, sz, ver := getS(out.Item, "cid"), getS(out.Item, "mb"), getN0(out.Item, "sz"), getS(out.Item, "ver")
+	vals := item{":cid": avS(cid), ":ver": avS(ver)}
 	_, err = s.cfg.DB.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Delete: &types.Delete{TableName: &s.cfg.Table, Key: key(cpk, csk),
-			ConditionExpression: aws.String("cid = :cid AND exp = :exp"), ExpressionAttributeValues: vals}},
+			ConditionExpression: aws.String("cid = :cid AND ver = :ver"), ExpressionAttributeValues: vals}},
 		{Delete: &types.Delete{TableName: &s.cfg.Table, Key: key(codeIDPK(cid), "PCI"),
-			ConditionExpression: aws.String("attribute_not_exists(pk) OR exp = :exp"), ExpressionAttributeValues: item{":exp": avN(exp)}}},
+			ConditionExpression: aws.String("attribute_not_exists(pk) OR ver = :ver"), ExpressionAttributeValues: item{":ver": avS(ver)}}},
 		{Delete: &types.Delete{TableName: &s.cfg.Table, Key: key(mbPK(mb), skCodePtr),
-			ConditionExpression: aws.String("attribute_not_exists(pk) OR (cid = :cid AND exp = :exp)"), ExpressionAttributeValues: vals}},
+			ConditionExpression: aws.String("attribute_not_exists(pk) OR (cid = :cid AND ver = :ver)"), ExpressionAttributeValues: vals}},
 	}})
 	if r := txReasons(err); r != nil && (reasonCode(r, 0) == "ConditionalCheckFailed" || isConflict(r)) {
 		return false, nil // gone or moving meanwhile: the put tries again
@@ -286,7 +291,7 @@ func (s *Store) collide(ctx context.Context, cpk, csk string, now time.Time) (bo
 		// newer one, or expire).
 		_, err := s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: &s.cfg.Table, Key: key(cpk, csk),
-			ConditionExpression: aws.String("cid = :cid AND exp = :exp"), ExpressionAttributeValues: vals,
+			ConditionExpression: aws.String("cid = :cid AND ver = :ver"), ExpressionAttributeValues: vals,
 		})
 		if isCCF(err) {
 			return false, nil
@@ -318,8 +323,8 @@ func (s *Store) RedeemCode(ctx context.Context, keyID string, lookups []store.Co
 		cid, a := getS(out.Item, "cid"), out.Item
 		// The delete is a one-item transaction with a request token, so
 		// an SDK retry after a lost answer is idempotent: a commit is
-		// never reported as a lost race. exp pins the item read (a PUT
-		// retried by its mailbox rewrites the slot with a new exp), and a
+		// never reported as a lost race. ver pins the item read (a PUT
+		// again by its mailbox rewrites the slot with its own ver), and a
 		// claim its misses cancel can't be redeemed (limit 15). It runs
 		// to its end even if the request goes: a commit must reach the
 		// 200 it was made for.
@@ -329,8 +334,8 @@ func (s *Store) RedeemCode(ctx context.Context, keyID string, lookups []store.Co
 				ClientRequestToken: aws.String(redeemToken()),
 				TransactItems: []types.TransactWriteItem{{Delete: &types.Delete{
 					TableName: &s.cfg.Table, Key: key(cpk, csk),
-					ConditionExpression: aws.String("cid = :cid AND exp = :exp AND exp > :now AND miss < :max"),
-					ExpressionAttributeValues: item{":cid": avS(cid), ":exp": avN(getN0(a, "exp")), ":now": avN(now),
+					ConditionExpression: aws.String("cid = :cid AND ver = :ver AND exp > :now AND miss < :max"),
+					ExpressionAttributeValues: item{":cid": avS(cid), ":ver": avS(getS(a, "ver")), ":now": avN(now),
 						":max": avN(store.CodeMaxMisses)},
 				}}},
 			})
@@ -345,7 +350,7 @@ func (s *Store) RedeemCode(ctx context.Context, keyID string, lookups []store.Co
 		c := store.CodeClaim{ClaimID: cid, Salt: getB(a, "salt"), Blob: getB(a, "body"), ExpiresAt: fromMS(getN0(a, "exp"))}
 		// Best effort, as for a claim (releaseClaim): the claim is gone,
 		// and a left-over id or marker expires with it.
-		_ = s.dropCode(dctx, getS(a, "mb"), cid, cpk, csk, getN0(a, "exp"), true)
+		_ = s.dropCode(dctx, getS(a, "mb"), cid, cpk, csk, getS(a, "ver"), true)
 		return c, nil
 	}
 	if matched {
@@ -368,7 +373,7 @@ func (s *Store) codeMisses(ctx context.Context, cpk string, now int64, dry bool)
 	err := s.queryAll(ctx, &dynamodb.QueryInput{
 		KeyConditionExpression:    aws.String("pk = :pk"),
 		ExpressionAttributeValues: item{":pk": avS(cpk)},
-		ProjectionExpression:      aws.String("pk, sk, cid, mb, exp"),
+		ProjectionExpression:      aws.String("pk, sk, cid, ver, mb, exp"),
 		ConsistentRead:            aws.Bool(true),
 	}, func(it item) error {
 		if n, _ := getN(it, "exp"); n > now {
@@ -380,15 +385,15 @@ func (s *Store) codeMisses(ctx context.Context, cpk string, now int64, dry bool)
 		return err
 	}
 	for _, it := range live {
-		cid, csk, exp := getS(it, "cid"), getS(it, "sk"), getN0(it, "exp")
+		cid, csk, ver := getS(it, "cid"), getS(it, "sk"), getS(it, "ver")
 		var out *dynamodb.UpdateItemOutput
 		err := s.retryConflicts(ctx, func() error {
 			var err error
 			out, err = s.cfg.DB.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 				TableName: &s.cfg.Table, Key: key(cpk, csk),
 				UpdateExpression:          aws.String("ADD miss :one"),
-				ConditionExpression:       aws.String("cid = :cid AND exp = :exp AND exp > :now"),
-				ExpressionAttributeValues: item{":one": avN(1), ":cid": avS(cid), ":exp": avN(exp), ":now": avN(now)},
+				ConditionExpression:       aws.String("cid = :cid AND ver = :ver AND exp > :now"),
+				ExpressionAttributeValues: item{":one": avN(1), ":cid": avS(cid), ":ver": avS(ver), ":now": avN(now)},
 				ReturnValues:              types.ReturnValueUpdatedNew,
 			})
 			return err
@@ -405,8 +410,8 @@ func (s *Store) codeMisses(ctx context.Context, cpk string, now int64, dry bool)
 		err = s.retryConflicts(ctx, func() error {
 			_, err := s.cfg.DB.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 				TableName: &s.cfg.Table, Key: key(cpk, csk),
-				ConditionExpression:       aws.String("cid = :cid AND exp = :exp AND miss >= :max"),
-				ExpressionAttributeValues: item{":cid": avS(cid), ":exp": avN(exp), ":max": avN(store.CodeMaxMisses)},
+				ConditionExpression:       aws.String("cid = :cid AND ver = :ver AND miss >= :max"),
+				ExpressionAttributeValues: item{":cid": avS(cid), ":ver": avS(ver), ":max": avN(store.CodeMaxMisses)},
 			})
 			return err
 		})
@@ -416,7 +421,7 @@ func (s *Store) codeMisses(ctx context.Context, cpk string, now int64, dry bool)
 		if err != nil {
 			return err
 		}
-		if err := s.dropCode(ctx, getS(it, "mb"), cid, cpk, csk, exp, true); err != nil {
+		if err := s.dropCode(ctx, getS(it, "mb"), cid, cpk, csk, ver, true); err != nil {
 			return err
 		}
 	}
@@ -431,7 +436,7 @@ func (s *Store) DeleteCode(ctx context.Context, mailbox, claimID string) error {
 	if err != nil || out.Item == nil || getS(out.Item, "mb") != mailbox {
 		return err
 	}
-	return s.dropCode(ctx, mailbox, claimID, getS(out.Item, "cpk"), getS(out.Item, "csk"), getN0(out.Item, "exp"), false)
+	return s.dropCode(ctx, mailbox, claimID, getS(out.Item, "cpk"), getS(out.Item, "csk"), getS(out.Item, "ver"), false)
 }
 
 // PairCodeNonce implements store.CodeBackend.
@@ -467,7 +472,5 @@ func redeemToken() string {
 	return hex.EncodeToString(b)
 }
 
-// oldKey names a marker's claim by id and exp, for PutCode's skipOld.
-func oldKey(old item) string {
-	return getS(old, "cid") + "#" + strconv.FormatInt(getN0(old, "exp"), 10)
-}
+// oldKey names a marker's claim by id and ver, for PutCode's skipOld.
+func oldKey(old item) string { return getS(old, "cid") + "#" + getS(old, "ver") }

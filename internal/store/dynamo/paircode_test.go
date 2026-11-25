@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/vettid/vettid-relay/internal/store"
 	"github.com/vettid/vettid-relay/internal/store/dynamo"
@@ -62,7 +61,9 @@ func TestCodeCleanupLeavesARePut(t *testing.T) {
 					return
 				}
 				once = true
-				c.Add(time.Second) // a later exp
+				// The same millisecond (no clock step): the same exp, so
+				// only the put's ver tells the two claims apart.
+				_ = c
 				if _, err := s.PutCode(ctx, codePut(codeID1, m), 0); err != nil {
 					t.Error(err)
 				}

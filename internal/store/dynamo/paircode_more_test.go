@@ -119,26 +119,35 @@ func blobBytes(t *testing.T, e codeEnv, mb string) int64 {
 // a re-PUT of the old tag lands between the other's read of the marker and
 // its transaction. One live claim is left, the later one.
 func TestCodePutRacesASameIDRePut(t *testing.T) {
-	e := newCodeEnv(t)
-	t1, t2 := codeMAC(1), codeMAC(2)
-	if _, err := e.s.PutCode(ctx, codePut(codeID1, t1), 0); err != nil {
-		t.Fatal(err)
-	}
-	e.hook.match = putsMarker
-	e.hook.before = func() {
-		e.c.Add(time.Second)
-		if _, err := e.s.PutCode(ctx, codePut(codeID1, t1), 0); err != nil {
-			t.Error(err)
-		}
-	}
-	if _, err := e.s.PutCode(ctx, codePut(codeID1, t2), 0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.s.RedeemCode(ctx, "k1", codeLook(t1), false); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("the replaced claim is live: %v", err)
-	}
-	if got, err := e.s.RedeemCode(ctx, "k1", codeLook(t2), false); err != nil || got.ClaimID != codeID1 {
-		t.Fatalf("the later claim: %+v %v", got, err)
+	for _, again := range []struct {
+		name string
+		tag  byte
+	}{{"the old tag", 1}, {"another tag", 3}} {
+		t.Run(again.name, func(t *testing.T) {
+			e := newCodeEnv(t)
+			t1, t2, t3 := codeMAC(1), codeMAC(2), codeMAC(again.tag)
+			if _, err := e.s.PutCode(ctx, codePut(codeID1, t1), 0); err != nil {
+				t.Fatal(err)
+			}
+			e.hook.match = putsMarker
+			e.hook.before = func() {
+				// The same millisecond: only the ver tells the claims apart.
+				if _, err := e.s.PutCode(ctx, codePut(codeID1, t3), 0); err != nil {
+					t.Error(err)
+				}
+			}
+			if _, err := e.s.PutCode(ctx, codePut(codeID1, t2), 0); err != nil {
+				t.Fatal(err)
+			}
+			for _, gone := range [][]byte{t1, t3} {
+				if _, err := e.s.RedeemCode(ctx, "k1", codeLook(gone), false); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("a replaced claim is live: %v", err)
+				}
+			}
+			if got, err := e.s.RedeemCode(ctx, "k1", codeLook(t2), false); err != nil || got.ClaimID != codeID1 {
+				t.Fatalf("the later claim: %+v %v", got, err)
+			}
+		})
 	}
 }
 
@@ -152,7 +161,7 @@ func TestCodeRedeemPinnedToTheClaimRead(t *testing.T) {
 	}
 	e.hook.match = deletesCode
 	e.hook.before = func() {
-		e.c.Add(time.Second)
+		// The same millisecond: only the ver tells the claims apart.
 		if _, err := e.s.PutCode(ctx, codePut(codeID1, m), 0); err != nil {
 			t.Error(err)
 		}
@@ -180,7 +189,7 @@ func TestCodeDeletePinnedToTheClaimRead(t *testing.T) {
 			return
 		}
 		once = true
-		e.c.Add(time.Second)
+		// The same millisecond: only the ver tells the claims apart.
 		if _, err := e.s.PutCode(ctx, codePut(codeID1, m), 0); err != nil {
 			t.Error(err)
 		}
@@ -335,4 +344,124 @@ func slotItems(t *testing.T, e codeEnv, pk string) int {
 		t.Fatal(err)
 	}
 	return len(out.Items)
+}
+
+func itemExists(t *testing.T, e codeEnv, pk, sk string) bool {
+	t.Helper()
+	out, err := e.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &e.table, ConsistentRead: aws.Bool(true),
+		Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: pk}, "sk": &types.AttributeValueMemberS{Value: sk}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out.Item != nil
+}
+
+// A collision deletes the victim's id and marker, not just its charge.
+func TestCodeCollisionDeletesTheVictimsItems(t *testing.T) {
+	e := newCodeEnv(t)
+	m := codeMAC(10)
+	if _, err := e.s.PutCode(ctx, codePut(codeID1, m), 0); err != nil {
+		t.Fatal(err)
+	}
+	q := codePut(codeID2, m)
+	q.Mailbox = "b"
+	if _, err := e.s.PutCode(ctx, q, 0); !errors.Is(err, store.ErrCodeTaken) {
+		t.Fatalf("collision: %v", err)
+	}
+	if itemExists(t, e, "PCI#"+codeID1, "PCI") || itemExists(t, e, "MB#a", "P#") {
+		t.Fatal("the victim's id or marker is left")
+	}
+}
+
+// A victim whose marker names a newer claim (here, its ver changed under
+// it) loses just the claim met: the collision still deletes it.
+func TestCodeCollisionWithANewerMarkerDeletesJustTheClaim(t *testing.T) {
+	e := newCodeEnv(t)
+	m := codeMAC(11)
+	if _, err := e.s.PutCode(ctx, codePut(codeID1, m), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: &e.table,
+		Key:                       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "MB#a"}, "sk": &types.AttributeValueMemberS{Value: "P#"}},
+		UpdateExpression:          aws.String("SET ver = :v"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":v": &types.AttributeValueMemberS{Value: "newer"}}}); err != nil {
+		t.Fatal(err)
+	}
+	q := codePut(codeID2, m)
+	q.Mailbox = "b"
+	if _, err := e.s.PutCode(ctx, q, 0); !errors.Is(err, store.ErrCodeTaken) {
+		t.Fatalf("collision: %v", err)
+	}
+	if _, err := e.s.RedeemCode(ctx, "k1", codeLook(m), false); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the claim met survived: %v", err)
+	}
+	if !itemExists(t, e, "MB#a", "P#") {
+		t.Fatal("the newer marker went with it")
+	}
+}
+
+// A redeem that loses its claim to another redeem between its read and
+// its delete answers not found, and adds no misses.
+func TestCodeRedeemLostRaceAddsNoMisses(t *testing.T) {
+	e := newCodeEnv(t)
+	m := codeMAC(12)
+	if _, err := e.s.PutCode(ctx, codePut(codeID1, m), 0); err != nil {
+		t.Fatal(err)
+	}
+	other := codeMAC(12)
+	other[31] = 7 // the same bucket
+	q := codePut(codeID2, other)
+	q.Mailbox = "b"
+	if _, err := e.s.PutCode(ctx, q, 0); err != nil {
+		t.Fatal(err)
+	}
+	e.hook.match = deletesCode
+	e.hook.before = func() {
+		if _, err := e.s.RedeemCode(ctx, "k1", codeLook(m), false); err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := e.s.RedeemCode(ctx, "k1", codeLook(m), false); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the loser: %v", err)
+	}
+	out, err := e.db.Query(ctx, &dynamodb.QueryInput{TableName: &e.table, ConsistentRead: aws.Bool(true),
+		KeyConditionExpression:    aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: "PCB#k1#a12213d1#0c0c"}}})
+	if err != nil || len(out.Items) != 1 {
+		t.Fatalf("bucket: %v %d", err, len(out.Items))
+	}
+	if miss := out.Items[0]["miss"].(*types.AttributeValueMemberN).Value; miss != "0" {
+		t.Fatalf("a lost race added misses: %s", miss)
+	}
+}
+
+// Match against cancel: the claim reaches its misses between a redeem's
+// read and its delete; the redeem loses.
+func TestCodeRedeemLosesToACancel(t *testing.T) {
+	e := newCodeEnv(t)
+	m := codeMAC(13)
+	if _, err := e.s.PutCode(ctx, codePut(codeID1, m), 0); err != nil {
+		t.Fatal(err)
+	}
+	e.hook.match = deletesCode
+	e.hook.before = func() {
+		if _, err := e.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: &e.table,
+			Key:                       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "PCB#k1#a12213d1#0d0d"}, "sk": &types.AttributeValueMemberS{Value: hexOf(m)}},
+			UpdateExpression:          aws.String("SET miss = :m"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":m": &types.AttributeValueMemberN{Value: "32"}}}); err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := e.s.RedeemCode(ctx, "k1", codeLook(m), false); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("redeemed a claim its misses cancel: %v", err)
+	}
+}
+
+func hexOf(b []byte) string {
+	const d = "0123456789abcdef"
+	out := make([]byte, 0, 2*len(b))
+	for _, c := range b {
+		out = append(out, d[c>>4], d[c&15])
+	}
+	return string(out)
 }

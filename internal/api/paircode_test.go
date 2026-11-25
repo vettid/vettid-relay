@@ -31,18 +31,24 @@ const pcHold = 40 * time.Millisecond
 // pairCodeFixture runs a relay with a pair-code key and a short hold.
 // Limit 14 is out of the way (large budgets) unless realLimits.
 func pairCodeFixture(t *testing.T, mut func(*config.Config), realLimits ...bool) *fixture {
+	return pairCodeFixtureWith(t, mut, len(realLimits) > 0)
+}
+
+// pairCodeFixtureWith is pairCodeFixture with extra server options (applied
+// last).
+func pairCodeFixtureWith(t *testing.T, mut func(*config.Config), realLimits bool, extra ...Option) *fixture {
 	f := newFixtureWith(t, func(c *config.Config) {
 		c.PairCodeKey = config.NewSecret(testPairKey)
 		if mut != nil {
 			mut(c)
 		}
 	}, func(*fixture) []Option {
-		return []Option{WithPairCodeHold(pcHold), func(s *Server) {
+		return append([]Option{WithPairCodeHold(pcHold), func(s *Server) {
 			s.pc.syncRefunds = true
-			if len(realLimits) == 0 {
+			if !realLimits {
 				s.pc.limiters(func(string, float64, int) ByteLimiter { return ratelimit.New(1000, 100_000, 1000) })
 			}
-		}}
+		}}, extra...)
 	})
 	f.clk.set(pcHour.Add(30 * time.Minute))
 	return f
@@ -258,6 +264,15 @@ func TestPairCodePutEpochs(t *testing.T) {
 	}
 	f.expectCode(req{method: "PUT", path: "/v1/pair-code/" + pcID1, body: putBody(l[0].SaltID, tagOf(2), "x"), signer: &a}, http.StatusBadRequest, CodeBadRequest)
 	f.expectCode(req{method: "PUT", path: "/v1/pair-code/" + pcID1, body: putBody(l2[1].SaltID, tagOf(2), "x"), signer: &a}, http.StatusCreated, "")
+	// Two tags for one salt, with two listed (so "too many" doesn't catch
+	// it): refused even with the right tag, and the claim stays.
+	f.expectCode(req{method: "PUT", path: "/v1/pair-code/" + pcID1, body: putBody(l2[1].SaltID, tagOf(4), "x"), signer: &a}, http.StatusCreated, "")
+	if code, _, _ := f.redeem(redeemBody(tagEntry(l2[1].SaltID, tagOf(4)), tagEntry(l2[1].SaltID, tagOf(4)))); code != http.StatusNotFound {
+		t.Fatalf("two tags for one salt: %d", code)
+	}
+	if code, _, _ := f.redeem(redeemBody(tagEntry(l2[1].SaltID, tagOf(4)))); code != http.StatusOK {
+		t.Fatalf("the claim after a refused redeem: %d", code)
+	}
 	// A redeem may name the previous salt while it is listed.
 	f.expectCode(req{method: "PUT", path: "/v1/pair-code/" + pcID1, body: putBody(l2[1].SaltID, tagOf(3), "x"), signer: &a}, http.StatusCreated, "")
 	if code, _, _ := f.redeem(redeemBody(tagEntry(l2[0].SaltID, tagOf(9)), tagEntry(l2[1].SaltID, tagOf(3)))); code != http.StatusOK {
@@ -414,11 +429,12 @@ func TestPairCodeLogsCarryNoSecrets(t *testing.T) {
 
 // The answer leaves within [hold, 2 x hold) of receipt.
 func TestPairCodeHoldUpperBound(t *testing.T) {
-	f := pairCodeFixture(t, nil)
+	const hold = 100 * time.Millisecond
+	f := pairCodeFixtureWith(t, nil, false, WithPairCodeHold(hold))
 	salt := f.salts()[0].SaltID
 	for range 5 {
-		if _, _, d := f.redeem(redeemBody(tagEntry(salt, tagOf(9)))); d < pcHold || d >= 2*pcHold {
-			t.Fatalf("answered after %v, want [%v, %v)", d, pcHold, 2*pcHold)
+		if _, _, d := f.redeem(redeemBody(tagEntry(salt, tagOf(9)))); d < hold || d >= 2*hold {
+			t.Fatalf("answered after %v, want [%v, %v)", d, hold, 2*hold)
 		}
 	}
 }
@@ -495,14 +511,15 @@ func TestPairCodePutChargesStoredBytes(t *testing.T) {
 // The hold is counted from receipt: a body that arrives slowly is
 // answered at the next step after receipt, not a hold after the work.
 func TestPairCodeHoldCountsFromReceipt(t *testing.T) {
-	f := pairCodeFixture(t, nil)
+	const hold = 100 * time.Millisecond
+	f := pairCodeFixtureWith(t, nil, false, WithPairCodeHold(hold))
 	salt := f.salts()[0].SaltID
 	body := redeemBody(tagEntry(salt, tagOf(9)))
 	pr, pw := io.Pipe()
 	hr := f.build(req{method: "POST", path: "/v1/pair-code/redeem", body: body})
 	hr.Body, hr.ContentLength = pr, int64(len(body))
 	go func() {
-		time.Sleep(pcHold * 3 / 2) // the work ends at 1.5 holds
+		time.Sleep(hold * 3 / 2) // the work ends at 1.5 holds
 		pw.Write(body)
 		pw.Close()
 	}()
@@ -510,7 +527,34 @@ func TestPairCodeHoldCountsFromReceipt(t *testing.T) {
 	code, _, _ := f.send(hr)
 	d := time.Since(start)
 	// From receipt: the step at 2 holds. After the work: 2.5 holds.
-	if code != http.StatusNotFound || d < 2*pcHold || d >= 2*pcHold+pcHold/2 {
-		t.Fatalf("%d after %v, want [%v, %v)", code, d, 2*pcHold, 2*pcHold+pcHold/2)
+	if code != http.StatusNotFound || d < 2*hold || d >= 2*hold+hold/2 {
+		t.Fatalf("%d after %v, want [%v, %v)", code, d, 2*hold, 2*hold+hold/2)
+	}
+}
+
+// A redeem body that doesn't arrive in time gets the same answer as any
+// failure, at a hold step after the read deadline; it doesn't hang.
+func TestPairCodeRedeemBodyDeadline(t *testing.T) {
+	const hold = 50 * time.Millisecond
+	f := pairCodeFixtureWith(t, nil, false, WithPairCodeHold(hold), WithSmallBodyTimeout(200*time.Millisecond))
+	salt := f.salts()[0].SaltID
+	body := redeemBody(tagEntry(salt, tagOf(9)))
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	hr := f.build(req{method: "POST", path: "/v1/pair-code/redeem", body: body})
+	hr.Body, hr.ContentLength = pr, int64(len(body))
+	done := make(chan int, 1)
+	go func() {
+		code, _, _ := f.send(hr)
+		done <- code
+	}()
+	go pw.Write(body[:5]) // and then nothing
+	select {
+	case code := <-done:
+		if code != http.StatusNotFound {
+			t.Fatalf("a slow body: %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a slow body held the redeem past its deadline")
 	}
 }

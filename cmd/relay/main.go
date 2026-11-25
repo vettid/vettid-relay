@@ -189,22 +189,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 		bus = vc.NewWakeBus(reg)
 		opts = append(opts,
 			api.WithReplayGuard(vc.ReplayGuard()),
-			api.WithRateLimiters(api.Limiters{
-				Address:  vc.Limiter("address", cfg.RateIPPerSec, cfg.RateIPBurst),
-				Key:      vc.Limiter("key", cfg.RateKeyPerSec, cfg.RateKeyBurst),
-				Sender:   vc.Limiter("sender", cfg.RateSenderPerSec, cfg.RateSenderBurst),
-				Register: vc.Limiter("register", cfg.RateRegisterPerSec, cfg.RateRegisterBurst),
-				Claim:    vc.Limiter("claim", cfg.RateClaimPerSec, cfg.RateClaimBurst),
-				// The network ceilings of the byte budgets (11, 12) are
-				// relay-wide: one network's budget against the shared
-				// store is the same however many processes run.
-				Bytes:     vc.ByteLimiter("bytes", cfg.RateIPBytesPerSec, cfg.RateIPBytesBurst),
-				BlobBytes: vc.ByteLimiter("blob_bytes", cfg.RateBlobBytesPerSec, cfg.RateBlobBytesBurst),
-				// Limit 14 (code redeems) is relay-wide too.
-				CodeRedeem: func(name string, perSec float64, burst int) api.ByteLimiter {
-					return vc.ByteLimiter(name, perSec, burst)
-				},
-			}),
+			api.WithRateLimiters(sharedLimiters(vc, cfg)),
 			api.WithWakeBus(bus),
 		)
 		if cfg.EmptyHints {
@@ -287,4 +272,27 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, ready chan<- 
 	}
 	log.InfoContext(lifecycle, "relay stopped")
 	return runErr
+}
+
+// sharedLimiters are the rate limits every relay process shares through
+// Valkey: the flood guard and the other per-network and per-key limits,
+// the network ceilings of the byte budgets (limits 11, 12) and limit 14
+// (code redeems).
+func sharedLimiters(vc *coord.Client, cfg config.Config) api.Limiters {
+	return api.Limiters{
+		Address:  vc.Limiter("address", cfg.RateIPPerSec, cfg.RateIPBurst),
+		Key:      vc.Limiter("key", cfg.RateKeyPerSec, cfg.RateKeyBurst),
+		Sender:   vc.Limiter("sender", cfg.RateSenderPerSec, cfg.RateSenderBurst),
+		Register: vc.Limiter("register", cfg.RateRegisterPerSec, cfg.RateRegisterBurst),
+		Claim:    vc.Limiter("claim", cfg.RateClaimPerSec, cfg.RateClaimBurst),
+		// The network ceilings of the byte budgets (11, 12) are
+		// relay-wide: one network's budget against the shared
+		// store is the same however many processes run.
+		Bytes:     vc.ByteLimiter("bytes", cfg.RateIPBytesPerSec, cfg.RateIPBytesBurst),
+		BlobBytes: vc.ByteLimiter("blob_bytes", cfg.RateBlobBytesPerSec, cfg.RateBlobBytesBurst),
+		// Limit 14 (code redeems) is relay-wide too.
+		CodeRedeem: func(name string, perSec float64, burst int) api.ByteLimiter {
+			return vc.ByteLimiter(name, perSec, burst)
+		},
+	}
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -41,6 +42,11 @@ const (
 // in the card): an answer is sent this long after receipt, or at the next
 // multiple of it if the work took longer.
 const codeHold = 250 * time.Millisecond
+
+// redeemWork bounds a redeem's store work, which runs to its end even if
+// the request's context ends (a slow body), so every failure answers the
+// same.
+const redeemWork = 10 * time.Second
 
 // codeRedeemMax bounds a redeem's body: two tags and their salt ids.
 const codeRedeemMax = 1024
@@ -390,7 +396,11 @@ func (s *Server) redeem(r *http.Request) func(http.ResponseWriter) {
 			lookups = append(lookups, store.CodeLookup{SaltID: "00000000", CodeMAC: paircode.MAC(s.pc.key, s.pc.dummyTags[i])})
 		}
 	}
-	c, err := s.st.RedeemCode(r.Context(), s.pc.keyID, lookups, dry)
+	// The same work whatever became of the request (a body that didn't
+	// arrive in time ends its context): bounded, but not by the client.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), redeemWork)
+	defer cancel()
+	c, err := s.st.RedeemCode(ctx, s.pc.keyID, lookups, dry)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return func(w http.ResponseWriter) { s.writeError(w, fail(CodeCodeUnknown)) }

@@ -95,12 +95,17 @@ func testCodeClaims(t *testing.T, h Harness) {
 	if _, err := s.PutCode(ctx, codePut("b", cid1, mac(8, 2)), 0); !errors.Is(err, store.ErrClaimIDTaken) {
 		t.Fatalf("claim id taken: %v", err)
 	}
+	// A's id and A's tag: the claim id is checked first (§6.9.1 step 2
+	// before 4), so it is "in use", and A survives.
+	if _, err := s.PutCode(ctx, codePut("b", cid1, m1), 0); !errors.Is(err, store.ErrClaimIDTaken) {
+		t.Fatalf("A's id and tag: %v", err)
+	}
 	// One live code claim per mailbox.
 	if err := s.DeleteMailboxCode(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RedeemCode(ctx, "k1", look(m1), false); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("replaced claim redeemed: %v", err)
+		t.Fatalf("A's claim, deleted with its mailbox's code, redeemed: %v", err)
 	}
 	// A collision deletes both.
 	if _, err := s.PutCode(ctx, codePut("a", cid1, m1), 0); err != nil {
