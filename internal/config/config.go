@@ -185,6 +185,14 @@ type Config struct {
 // accepts more it doesn't.
 const VaultRotationGrace = 14 * 24 * time.Hour
 
+// PairCodeOpenTokenMin is the least RELAY_OPEN_TOKEN_MAX_LIFETIME with
+// which the relay offers code claims (§6.9.1): a vault mints a code
+// pairing's open token for 660 s (the code's 600 s and the token's
+// backdate, VAULT-MESSAGING §6.7.2) and makes no code pairing toward a
+// relay whose limit is lower. Under it, a key is set aside: pair codes
+// are off, with a warning, and the rest of the relay runs.
+const PairCodeOpenTokenMin = 660 * time.Second
+
 // MaxTokenLifetimeBound is the largest RELAY_MAX_TOKEN_LIFETIME and
 // RELAY_OPEN_TOKEN_MAX_LIFETIME accepted without
 // RELAY_ALLOW_LONG_TOKEN_LIFETIME: 400 days. Tombstones and denylist
@@ -505,6 +513,12 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	dur("RELAY_EMPTY_SKIP_MAX", &c.EmptySkipMax)
 
 	c.PairCodeKey, c.PairCodeKeyProblem = pairCodeKey(lookup)
+	if len(c.PairCodeKey.Bytes()) > 0 && c.OpenTokenMaxLifetime < PairCodeOpenTokenMin {
+		// Every code pairing would be refused (the vault answers
+		// claim_unavailable), so the relay offers none, and says why.
+		c.PairCodeKey = Secret{}
+		c.PairCodeKeyProblem = fmt.Sprintf("RELAY_OPEN_TOKEN_MAX_LIFETIME is %s, under the %s a code pairing's open token needs", c.OpenTokenMaxLifetime, PairCodeOpenTokenMin)
+	}
 
 	if err := c.Validate(); err != nil {
 		errs = append(errs, err)

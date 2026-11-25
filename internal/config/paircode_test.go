@@ -36,7 +36,11 @@ func TestPairCodeKey(t *testing.T) {
 		{"31 bytes", map[string]string{"RELAY_PAIR_CODE_KEY_FILE": short}, false, "RELAY_PAIR_CODE_KEY_FILE: not a base64 key of 32 bytes"},
 		{"not base64", map[string]string{"RELAY_PAIR_CODE_KEY": "not base64!"}, false, "RELAY_PAIR_CODE_KEY: not a base64 key of 32 bytes"},
 	} {
-		cfg, err := Load(env(c.env))
+		e := map[string]string{"RELAY_OPEN_TOKEN_MAX_LIFETIME": "660s"}
+		for k, v := range c.env {
+			e[k] = v
+		}
+		cfg, err := Load(env(e))
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
@@ -49,10 +53,42 @@ func TestPairCodeKey(t *testing.T) {
 	}
 }
 
+// A key with an open-token limit under 660 s is set aside: a vault makes
+// no code pairing toward such a relay, so the relay offers none, says
+// why (naming the variable, never the key), and starts.
+func TestPairCodeKeyNeedsOpenTokenLifetime(t *testing.T) {
+	b64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x6b}, 32))
+	for _, c := range []struct {
+		life string
+		ok   bool
+	}{{"", false}, {"600s", false}, {"659s", false}, {"660s", true}, {"168h", true}} {
+		e := map[string]string{"RELAY_PAIR_CODE_KEY": b64}
+		if c.life != "" {
+			e["RELAY_OPEN_TOKEN_MAX_LIFETIME"] = c.life
+		}
+		cfg, err := Load(env(e))
+		if err != nil {
+			t.Fatalf("%q: the relay doesn't start: %v", c.life, err)
+		}
+		if got := len(cfg.PairCodeKey.Bytes()) == 32; got != c.ok {
+			t.Errorf("%q: key kept %v, want %v", c.life, got, c.ok)
+		}
+		if !c.ok && !strings.HasPrefix(cfg.PairCodeKeyProblem, "RELAY_OPEN_TOKEN_MAX_LIFETIME is ") {
+			t.Errorf("%q: problem %q", c.life, cfg.PairCodeKeyProblem)
+		}
+		if c.ok && cfg.PairCodeKeyProblem != "" {
+			t.Errorf("%q: problem %q with a kept key", c.life, cfg.PairCodeKeyProblem)
+		}
+		if strings.Contains(cfg.PairCodeKeyProblem, b64) {
+			t.Errorf("%q: the problem names the key", c.life)
+		}
+	}
+}
+
 // No print of a Config shows k_pc.
 func TestPairCodeKeyNeverPrints(t *testing.T) {
 	key := bytes.Repeat([]byte{0x6b}, 32)
-	cfg, err := Load(env(map[string]string{"RELAY_PAIR_CODE_KEY": base64.StdEncoding.EncodeToString(key)}))
+	cfg, err := Load(env(map[string]string{"RELAY_PAIR_CODE_KEY": base64.StdEncoding.EncodeToString(key), "RELAY_OPEN_TOKEN_MAX_LIFETIME": "660s"}))
 	if err != nil || cfg.PairCodeKey.Bytes() == nil {
 		t.Fatal(err)
 	}
