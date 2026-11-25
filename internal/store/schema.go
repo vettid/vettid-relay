@@ -149,6 +149,7 @@ CREATE TABLE code_claims (
 CREATE INDEX idx_code_claims_bucket  ON code_claims(key_id, salt_id, bucket);
 CREATE INDEX idx_code_claims_mailbox ON code_claims(mailbox_id);
 CREATE INDEX idx_code_claims_expiry  ON code_claims(expires_at);
+CREATE INDEX idx_code_claims_misses  ON code_claims(misses);
 CREATE TABLE pair_code_nonces (
   epoch INTEGER PRIMARY KEY,
   nonce BLOB NOT NULL

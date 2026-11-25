@@ -146,7 +146,7 @@ func (s *Store) purgeFenced(ctx context.Context, id, tok string) (msgs int64, er
 	err = s.queryAll(ctx, &dynamodb.QueryInput{
 		KeyConditionExpression:    aws.String("pk = :pk"),
 		ExpressionAttributeValues: item{":pk": avS(mbPK(id))},
-		ProjectionExpression:      aws.String("pk, sk, cpk, csk, cid"),
+		ProjectionExpression:      aws.String("pk, sk, cpk, csk, cid, exp"),
 	}, func(it item) error {
 		sk := getS(it, "sk")
 		switch {
@@ -156,8 +156,10 @@ func (s *Store) purgeFenced(ctx context.Context, id, tok string) (msgs int64, er
 			msgs++
 		case strings.HasPrefix(sk, "C#"):
 			keys = append(keys, key(claimPK(sk[2:]), "CL"))
-		case sk == skCodePtr && getS(it, "cpk") != "":
-			// The code claim and its id (paircode.go).
+		case sk == skCodePtr && getS(it, "cpk") != "" && getN0(it, "exp") > ms(s.now()):
+			// The code claim and its id (paircode.go), through a live
+			// marker only: a stale one's slot and id may be another's now
+			// (its own expire by TTL).
 			keys = append(keys, key(getS(it, "cpk"), getS(it, "csk")), key(codeIDPK(getS(it, "cid")), "PCI"))
 		}
 		keys = append(keys, key(mbPK(id), sk))

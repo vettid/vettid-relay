@@ -365,6 +365,9 @@ func (s *Server) takeCodeRedeem(a netip.Addr) bool {
 // same work, and every answer leaves at the fixed hold.
 func (s *Server) handlePairCodeRedeem(w http.ResponseWriter, r *http.Request) {
 	received := time.Now()
+	// The body is small: it must arrive in time, like every small body
+	// (readBody), and a slow one gets the same answer as the rest.
+	_ = http.NewResponseController(w).SetReadDeadline(received.Add(s.smallBodyTimeout))
 	answer := s.redeem(r)
 	// Nothing is written before the hold: the answer is buffered until
 	// then.

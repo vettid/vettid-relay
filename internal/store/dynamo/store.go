@@ -147,6 +147,10 @@ type Store struct {
 	afterPurge   func()        // tests only: runs once a purge deleted everything, before its holder commits
 	afterMark    func()        // tests only: runs between a deletion's mark and its purge
 	purgeBudget  time.Duration // tests only: overrides PurgeBudget
+
+	// beforeCodeCleanup runs between a code claim's delete and the
+	// cleanup of its id and marker (tests only).
+	beforeCodeCleanup func()
 }
 
 type cachedMailbox struct {

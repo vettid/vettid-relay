@@ -410,3 +410,53 @@ func TestPairCodeLogsCarryNoSecrets(t *testing.T) {
 		}
 	}
 }
+
+// The answer leaves within [hold, 2 x hold) of receipt.
+func TestPairCodeHoldUpperBound(t *testing.T) {
+	f := pairCodeFixture(t, nil)
+	salt := f.salts()[0].SaltID
+	for range 5 {
+		if _, _, d := f.redeem(redeemBody(tagEntry(salt, tagOf(9)))); d < pcHold || d >= 2*pcHold {
+			t.Fatalf("answered after %v, want [%v, %v)", d, pcHold, 2*pcHold)
+		}
+	}
+}
+
+// The numbers the relay runs with (§6.9.1, §7.2 limit 14).
+func TestPairCodeDefaults(t *testing.T) {
+	if codeHold != 250*time.Millisecond || codeWindow != 10*time.Minute ||
+		codeRedeemIPv4 != 20 || codeRedeem64 != 10 || codeRedeem48 != 200 || codeRedeem32 != 1000 {
+		t.Fatal("the pair-code defaults changed")
+	}
+	f := newFixture(t, func(c *config.Config) { c.PairCodeKey = config.NewSecret(testPairKey) })
+	if f.s.pc.hold != codeHold {
+		t.Fatalf("hold %v", f.s.pc.hold)
+	}
+}
+
+// A PUT's body is checked: a tag of 32 bytes, a salt of 16, a blob of 1
+// to max_claim_bytes; a non-creator's DELETE leaves the claim.
+func TestPairCodePutBodyAndDelete(t *testing.T) {
+	f := pairCodeFixture(t, func(c *config.Config) { c.MaxClaimBytes = 64 })
+	a, b := newPrincipal(1), newPrincipal(2)
+	f.register(a)
+	f.register(b)
+	salt := f.salts()[0].SaltID
+	for name, body := range map[string][]byte{
+		"short tag":  putBody(salt, tagOf(1)[:31], "x"),
+		"empty blob": putBody(salt, tagOf(1), ""),
+		"big blob":   putBody(salt, tagOf(1), strings.Repeat("x", 65)),
+		"not json":   []byte("{"),
+	} {
+		if code, b := f.do(req{method: "PUT", path: "/v1/pair-code/" + pcID1, body: body, signer: &a}); code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s", name, code, b)
+		}
+	}
+	f.expectCode(req{method: "PUT", path: "/v1/pair-code/" + pcID1, body: putBody(salt, tagOf(1), strings.Repeat("x", 64)), signer: &a}, http.StatusCreated, "")
+	if code, _ := f.do(req{method: "DELETE", path: "/v1/pair-code/" + pcID1, signer: &b}); code != http.StatusNoContent {
+		t.Fatal(code)
+	}
+	if code, _, _ := f.redeem(redeemBody(tagEntry(salt, tagOf(1)))); code != http.StatusOK {
+		t.Fatalf("another mailbox's DELETE removed the claim: %d", code)
+	}
+}
