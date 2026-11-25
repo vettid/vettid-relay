@@ -7,7 +7,7 @@ import (
 )
 
 // schemaVersion is bumped with every migration appended to migrations.
-const schemaVersion = 6
+const schemaVersion = 7
 
 // migrations[i] upgrades the schema from version i to i+1.
 //
@@ -126,6 +126,33 @@ CREATE INDEX idx_blobs_list   ON blobs(mailbox_id, blob_id);
 CREATE TABLE lifetime_mark (
   id          INTEGER PRIMARY KEY CHECK (id = 1),
   lifetime_ms INTEGER NOT NULL
+);
+`,
+	// v7 (protocol 0.14.0 §6.9.1): code claims, found by a pairing code's
+	// code_mac (never the code or its tag), filed under the k_pc key id,
+	// the salt and the bucket (code_mac's first 2 bytes); and each hour's
+	// lookup salt nonce, which never changes once listed.
+	`
+CREATE TABLE code_claims (
+  claim_id   TEXT PRIMARY KEY,
+  mailbox_id TEXT NOT NULL REFERENCES mailboxes(mailbox_id) ON DELETE CASCADE,
+  key_id     TEXT NOT NULL,
+  salt_id    TEXT NOT NULL,
+  bucket     INTEGER NOT NULL,
+  code_mac   BLOB NOT NULL UNIQUE,
+  misses     INTEGER NOT NULL,
+  size       INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  salt       BLOB NOT NULL,
+  blob       BLOB NOT NULL
+);
+CREATE INDEX idx_code_claims_bucket  ON code_claims(key_id, salt_id, bucket);
+CREATE INDEX idx_code_claims_mailbox ON code_claims(mailbox_id);
+CREATE INDEX idx_code_claims_expiry  ON code_claims(expires_at);
+CREATE INDEX idx_code_claims_misses  ON code_claims(misses);
+CREATE TABLE pair_code_nonces (
+  epoch INTEGER PRIMARY KEY,
+  nonce BLOB NOT NULL
 );
 `,
 }

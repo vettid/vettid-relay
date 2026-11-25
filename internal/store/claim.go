@@ -13,12 +13,14 @@ import (
 // without a token (e.g. the bootstrap bundle behind a QR code). They count,
 // together with blobs, against the creating mailbox's storage cap.
 
-// storedBytes is the live blob + claim storage attributed to a mailbox.
+// storedBytes is the live blob + claim + code claim storage attributed to a
+// mailbox.
 func storedBytes(ctx context.Context, q querier, mailbox string, now time.Time) (int64, error) {
 	var used int64
 	err := q.QueryRowContext(ctx,
 		`SELECT (SELECT COALESCE(SUM(size),0) FROM blobs  WHERE mailbox_id=?1 AND expires_at>?2)
-		      + (SELECT COALESCE(SUM(size),0) FROM claims WHERE mailbox_id=?1 AND expires_at>?2)`,
+		      + (SELECT COALESCE(SUM(size),0) FROM claims WHERE mailbox_id=?1 AND expires_at>?2)
+		      + (SELECT COALESCE(SUM(size),0) FROM code_claims WHERE mailbox_id=?1 AND expires_at>?2)`,
 		mailbox, ms(now)).Scan(&used)
 	return used, err
 }

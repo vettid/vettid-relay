@@ -1,12 +1,16 @@
 // Package config loads relay configuration from environment variables.
 //
-// The relay holds no long-term secrets, so nothing in here is sensitive.
-// Every variable is documented in README.md; keep the two in sync.
+// The relay holds one secret: the pair-code key k_pc (RELAY-PROTOCOL
+// §6.9.1), kept in a Secret that never prints. Nothing else in here is
+// sensitive. Every variable is documented in README.md; keep the two in
+// sync.
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net"
 	"net/url"
@@ -85,6 +89,14 @@ type Config struct {
 
 	MaxClaimBytes int64         // RELAY_MAX_CLAIM_BYTES
 	ClaimTTL      time.Duration // RELAY_CLAIM_TTL (max TTL a creator may request)
+
+	// PairCodeKey is k_pc (§6.9.1): 32 bytes, base64, from the file
+	// RELAY_PAIR_CODE_KEY_FILE (a secret mounted or injected by the
+	// deployment) or, for local runs, RELAY_PAIR_CODE_KEY. Without a
+	// valid key the relay offers no code claims; PairCodeKeyProblem then
+	// says why, naming the variable and never the value.
+	PairCodeKey        Secret
+	PairCodeKeyProblem string
 
 	// Rate limits (spec §7.2). Per client network (IPv4 address / IPv6 /64)
 	// only before a request is authenticated; per key after.
@@ -492,10 +504,62 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	boolean("RELAY_ALLOW_LONG_TOKEN_LIFETIME", &c.AllowLongTokenLifetime)
 	dur("RELAY_EMPTY_SKIP_MAX", &c.EmptySkipMax)
 
+	c.PairCodeKey, c.PairCodeKeyProblem = pairCodeKey(lookup)
+
 	if err := c.Validate(); err != nil {
 		errs = append(errs, err)
 	}
 	return c, errors.Join(errs...)
+}
+
+// Secret is key material that never prints: fmt, slog and %+v of a
+// Config show "[secret]" (or "[none]").
+type Secret struct{ b []byte }
+
+// Bytes returns the key (nil if there is none).
+func (s Secret) Bytes() []byte { return s.b }
+
+func (s Secret) String() string {
+	if len(s.b) == 0 {
+		return "[none]"
+	}
+	return "[secret]"
+}
+
+// GoString keeps %#v from printing the bytes.
+func (s Secret) GoString() string { return s.String() }
+
+// Format prints s as String does, whatever the verb (%d, %x, ...).
+func (s Secret) Format(f fmt.State, _ rune) { fmt.Fprint(f, s.String()) }
+
+// LogValue keeps slog from printing the bytes.
+func (s Secret) LogValue() slog.Value { return slog.StringValue(s.String()) }
+
+// NewSecret wraps b (tests).
+func NewSecret(b []byte) Secret { return Secret{b: b} }
+
+// pairCodeKey reads k_pc: the file named by RELAY_PAIR_CODE_KEY_FILE,
+// else RELAY_PAIR_CODE_KEY. A key that is not base64 of exactly 32 bytes
+// is no key, and the problem names the variable only.
+func pairCodeKey(lookup func(string) (string, bool)) (Secret, string) {
+	var raw, name string
+	if p, ok := lookup("RELAY_PAIR_CODE_KEY_FILE"); ok && strings.TrimSpace(p) != "" {
+		name = "RELAY_PAIR_CODE_KEY_FILE"
+		b, err := os.ReadFile(strings.TrimSpace(p))
+		if err != nil {
+			return Secret{}, name + ": the file can't be read"
+		}
+		raw = string(b)
+	} else if v, ok := lookup("RELAY_PAIR_CODE_KEY"); ok && strings.TrimSpace(v) != "" {
+		name, raw = "RELAY_PAIR_CODE_KEY", v
+	} else {
+		return Secret{}, "no RELAY_PAIR_CODE_KEY_FILE or RELAY_PAIR_CODE_KEY"
+	}
+	k, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw))
+	if err != nil || len(k) != 32 {
+		return Secret{}, name + ": not a base64 key of 32 bytes"
+	}
+	return Secret{b: k}, ""
 }
 
 // Validate checks cross-field invariants.

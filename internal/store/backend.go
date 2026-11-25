@@ -20,6 +20,7 @@ import (
 // against both.
 type Backend interface {
 	BlobStore
+	CodeBackend
 
 	// Ping verifies the backend is reachable (health checks).
 	Ping(ctx context.Context) error

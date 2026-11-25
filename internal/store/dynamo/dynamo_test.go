@@ -1442,6 +1442,15 @@ type flakyDB struct {
 	unfenceConfl   int    // the unfence's UpdateItem: TransactionConflictException this many times
 	txConflicts    int    // TransactWriteItems: cancelled for a conflict this many times
 	txCode         string // the cancellation reason txConflicts uses ("": TransactionConflict)
+	delConflicts   int    // DeleteItem: TransactionConflictException this many times
+	missConflicts  int    // a code claim's miss update: the same
+}
+
+func (f *flakyDB) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, o ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
+	if f.take(&f.delConflicts) {
+		return nil, conflict()
+	}
+	return f.DB.DeleteItem(ctx, in, o...)
 }
 
 func (f *flakyDB) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, o ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
@@ -1485,6 +1494,9 @@ func (f *flakyDB) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, 
 		return nil, conflict()
 	}
 	if in.UpdateExpression != nil && *in.UpdateExpression == "REMOVE purging, purge_by" && f.take(&f.unfenceConfl) {
+		return nil, conflict()
+	}
+	if in.UpdateExpression != nil && *in.UpdateExpression == "ADD miss :one" && f.take(&f.missConflicts) {
 		return nil, conflict()
 	}
 	out, err := f.DB.UpdateItem(ctx, in, o...)

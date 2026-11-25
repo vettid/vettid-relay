@@ -82,6 +82,11 @@ type Limiters struct {
 	// keys are bounded by these ceilings.
 	Bytes     ByteLimiter // deposit and claim bytes per client network
 	BlobBytes ByteLimiter // blob upload and download bytes per client network
+
+	// CodeRedeem makes limit 14's budgets (code redeems per IPv4 address
+	// and IPv6 /64, /48 and /32, §7.2), counted in requests; the relay
+	// chooses the names and numbers.
+	CodeRedeem func(name string, perSec float64, burst int) ByteLimiter
 }
 
 // WithRateLimiters replaces in-memory limiters with shared ones.
@@ -107,6 +112,9 @@ func WithRateLimiters(l Limiters) Option {
 		}
 		if l.BlobBytes != nil {
 			s.blobByteLimit = l.BlobBytes
+		}
+		if l.CodeRedeem != nil && s.pc != nil {
+			s.pc.limiters(l.CodeRedeem)
 		}
 	}
 }
