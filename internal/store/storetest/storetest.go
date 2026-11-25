@@ -116,6 +116,7 @@ func Run(t *testing.T, h Harness) {
 		{"CodeClaimsDeletedMailbox", testCodeClaimsDeletedMailbox},
 		{"RedeemCodeConcurrent", testRedeemCodeConcurrent},
 		{"PairCodeNonce", testPairCodeNonce},
+		{"PutCodeConcurrentOneLive", testPutCodeConcurrentOneLive},
 		{"ConcurrentCollectorsNeverShareALease", testConcurrentCollect},
 		{"LargePayload", testLargePayload},
 		{"DeleteMailbox", testDeleteMailbox},

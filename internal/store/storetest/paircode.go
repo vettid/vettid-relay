@@ -119,9 +119,13 @@ func testCodeClaims(t *testing.T, h Harness) {
 	if err := s.DeleteMailboxCode(ctx, "b"); err != nil {
 		t.Fatal(err)
 	}
-	// Unknown mailbox.
+	// A deleted mailbox (one deleted while its request ran).
+	mustRegister(t, s, "zz", 3)
+	if _, err := s.DeleteMailbox(ctx, "zz", key(3), c.Now(), c.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.PutCode(ctx, codePut("zz", cid3, mac(1, 3)), 0); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("unknown mailbox: %v", err)
+		t.Fatalf("deleted mailbox: %v", err)
 	}
 }
 
@@ -282,5 +286,41 @@ func testPairCodeNonce(t *testing.T, h Harness) {
 	}
 	if got, err := b.PairCodeNonce(ctx, 493045, n2); err != nil || !bytes.Equal(got, n2) {
 		t.Fatalf("next epoch: %x %v", got, err)
+	}
+}
+
+// Concurrent PUTs from one mailbox, on two processes, leave one live code
+// claim (§6.9.1 step 1).
+func testPutCodeConcurrentOneLive(t *testing.T, h Harness) {
+	a, b, _ := h.pair(t)
+	mustRegister(t, a, "a", 1)
+	const n = 8
+	ids := []string{cid1, cid2, cid3, "d4f7m2xk5n3p6r7t2v4w6y7z3a", "e4f7m2xk5n3p6r7t2v4w6y7z3a",
+		"f4f7m2xk5n3p6r7t2v4w6y7z3a", "g4f7m2xk5n3p6r7t2v4w6y7z3a", "h4f7m2xk5n3p6r7t2v4w6y7z3a"}
+	var wg sync.WaitGroup
+	for i := range n {
+		s := a
+		if i%2 == 1 {
+			s = b
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.PutCode(ctx, codePut("a", ids[i], mac(i, byte(i+1))), 0); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	live := 0
+	for i := range n {
+		if _, err := a.RedeemCode(ctx, "k1", look(mac(i, byte(i+1))), false); err == nil {
+			live++
+		} else if !errors.Is(err, store.ErrNotFound) {
+			t.Fatal(err)
+		}
+	}
+	if live != 1 {
+		t.Fatalf("%d live code claims for one mailbox", live)
 	}
 }

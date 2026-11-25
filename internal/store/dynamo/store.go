@@ -18,6 +18,9 @@
 //	MB#<mailbox>  BS#<sender>      a sender's share of the mailbox's blobs (0.9.2): e_<ulid> = {s: size, e: exp} per blob, b (bytes), n (blobs), v; no TTL
 //	MB#<mailbox>  C#<claim id>     claim marker (counts toward the storage cap)
 //	CL#<claim id> CL               claim: mb, sz, exp, body
+//	MB#<mailbox>  P#               the mailbox's live code claim (counts toward the storage cap; paircode.go)
+//	PCB#…, PCI#…                   code claims and their ids (paircode.go)
+//	META          PCN#<epoch>      an hour's pair-code lookup salt nonce (paircode.go)
 //	META          LIFETIME         the high-water mark of the advertised token lifetimes: life_ms (§6.10)
 //
 // The sparse GSI "due" (gpk = "due", gsk = delete_after ms) lists rotated
@@ -905,7 +908,7 @@ func (s *Store) reconcile(ctx context.Context, mailbox, kind string) (bool, erro
 	case kindMsgs:
 		prefixes = []string{"M#"}
 	case kindStored:
-		prefixes = []string{"B#", "C#"}
+		prefixes = []string{"B#", "C#", skCodePtr}
 	case kindDeny:
 		prefixes = []string{"D#"}
 	}
