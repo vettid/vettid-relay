@@ -142,7 +142,6 @@ CREATE TABLE code_claims (
   code_mac   BLOB NOT NULL UNIQUE,
   misses     INTEGER NOT NULL,
   size       INTEGER NOT NULL,
-  created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
   salt       BLOB NOT NULL,
   blob       BLOB NOT NULL

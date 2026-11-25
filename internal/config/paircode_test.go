@@ -59,7 +59,7 @@ func TestPairCodeKeyNeverPrints(t *testing.T) {
 	var logs bytes.Buffer
 	slog.New(slog.NewJSONHandler(&logs, nil)).Info("config", "cfg", cfg, "key", cfg.PairCodeKey)
 	slog.New(slog.NewTextHandler(&logs, nil)).Info("config", "cfg", cfg, "key", cfg.PairCodeKey)
-	out := fmt.Sprintf("%v %+v %#v %s %v", cfg, cfg, cfg, cfg.PairCodeKey, cfg.PairCodeKey) + logs.String()
+	out := fmt.Sprintf("%v %+v %#v %s %v %d %x %q", cfg, cfg, cfg, cfg.PairCodeKey, cfg.PairCodeKey, cfg.PairCodeKey, cfg.PairCodeKey, cfg.PairCodeKey) + logs.String()
 	for _, enc := range []string{base64.StdEncoding.EncodeToString(key), hex.EncodeToString(key), string(key), fmt.Sprint(key)} {
 		if strings.Contains(out, enc) {
 			t.Fatalf("k_pc printed: %s", out)

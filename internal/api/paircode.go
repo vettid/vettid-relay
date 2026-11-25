@@ -63,6 +63,7 @@ type pairCodes struct {
 	nonces map[int64][]byte // an epoch's nonce, once stored (it never changes)
 
 	hold                      time.Duration
+	syncRefunds               bool // tests: refund limit 14 before returning
 	lim4, lim64, lim48, lim32 ByteLimiter
 	dummyTags                 [][]byte
 }
@@ -320,22 +321,43 @@ func (s *Server) takeCodeRedeem(a netip.Addr) bool {
 	default:
 		cs = []charge{{limCode4, "unknown", p.lim4}}
 	}
-	var srcs []int
+	// The takes run at once, and refunds after the answer, so a refused
+	// redeem takes as long as an allowed one even while the shared
+	// limiter is slow (§6.9.1: the same timing for every failure).
+	oks, srcs := make([]bool, len(cs)), make([]int, len(cs))
+	var wg sync.WaitGroup
 	for i, c := range cs {
-		ok, _, src := allowNFrom(c.l, c.key, 1, now)
-		if !ok {
-			for j := range i {
-				refundTo(cs[j].l, cs[j].key, 1, srcs[j])
-			}
-			s.rl.refused.With(c.name).Inc()
-			return false
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			oks[i], _, srcs[i] = allowNFrom(c.l, c.key, 1, now)
+		}()
+	}
+	wg.Wait()
+	if !slices.Contains(oks, false) {
+		for _, c := range cs {
+			s.rl.allowed.With(c.name).Inc()
 		}
-		srcs = append(srcs, src)
+		return true
 	}
-	for _, c := range cs {
-		s.rl.allowed.With(c.name).Inc()
+	for i, c := range cs {
+		if !oks[i] {
+			s.rl.refused.With(c.name).Inc()
+		}
 	}
-	return true
+	refund := func() {
+		for i, c := range cs {
+			if oks[i] {
+				refundTo(c.l, c.key, 1, srcs[i])
+			}
+		}
+	}
+	if s.pc.syncRefunds {
+		refund()
+	} else {
+		go refund()
+	}
+	return false
 }
 
 // POST /v1/pair-code/redeem — unauthenticated, single fetch. Every

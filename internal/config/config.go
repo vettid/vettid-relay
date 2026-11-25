@@ -529,6 +529,9 @@ func (s Secret) String() string {
 // GoString keeps %#v from printing the bytes.
 func (s Secret) GoString() string { return s.String() }
 
+// Format prints s as String does, whatever the verb (%d, %x, ...).
+func (s Secret) Format(f fmt.State, _ rune) { fmt.Fprint(f, s.String()) }
+
 // LogValue keeps slog from printing the bytes.
 func (s Secret) LogValue() slog.Value { return slog.StringValue(s.String()) }
 

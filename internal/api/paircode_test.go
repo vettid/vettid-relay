@@ -8,13 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/vettid/vettid-relay/internal/config"
 	"github.com/vettid/vettid-relay/internal/paircode"
+	"github.com/vettid/vettid-relay/internal/ratelimit"
 	"github.com/vettid/vettid-relay/relayclient"
 )
 
@@ -27,13 +27,22 @@ var pcHour = time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
 
 const pcHold = 40 * time.Millisecond
 
-func pairCodeFixture(t *testing.T, mut func(*config.Config)) *fixture {
+// pairCodeFixture runs a relay with a pair-code key and a short hold.
+// Limit 14 is out of the way (large budgets) unless realLimits.
+func pairCodeFixture(t *testing.T, mut func(*config.Config), realLimits ...bool) *fixture {
 	f := newFixtureWith(t, func(c *config.Config) {
 		c.PairCodeKey = config.NewSecret(testPairKey)
 		if mut != nil {
 			mut(c)
 		}
-	}, func(*fixture) []Option { return []Option{WithPairCodeHold(pcHold)} })
+	}, func(*fixture) []Option {
+		return []Option{WithPairCodeHold(pcHold), func(s *Server) {
+			s.pc.syncRefunds = true
+			if len(realLimits) == 0 {
+				s.pc.limiters(func(string, float64, int) ByteLimiter { return ratelimit.New(1000, 100_000, 1000) })
+			}
+		}}
+	})
 	f.clk.set(pcHour.Add(30 * time.Minute))
 	return f
 }
@@ -258,7 +267,7 @@ func TestPairCodePutEpochs(t *testing.T) {
 // Limit 14: 20 redeems per IPv4 address in 10 minutes; the 21st is
 // answered like a miss and doesn't spend a live code.
 func TestPairCodeRedeemLimitIPv4(t *testing.T) {
-	f := pairCodeFixture(t, nil)
+	f := pairCodeFixture(t, nil, true)
 	a := newPrincipal(1)
 	f.register(a)
 	salt := f.salts()[0].SaltID
@@ -280,47 +289,56 @@ func TestPairCodeRedeemLimitIPv4(t *testing.T) {
 }
 
 // Limit 14 for IPv6: a request is charged to its /64, /48 and /32
-// together, and refused if any is empty.
+// together, and refused if any is empty; a refusal charges none of them.
+// (Small budgets here: /64 2, /48 3, /32 4.)
 func TestPairCodeRedeemLimitIPv6(t *testing.T) {
-	f := pairCodeFixture(t, func(c *config.Config) { c.TrustProxy = true })
-	from := func(ip string) http.Header { return http.Header{"X-Forwarded-For": {ip}} }
-	refused := func(ip string) bool {
+	f := pairCodeFixture(t, func(c *config.Config) { c.TrustProxy = true }, true)
+	budget := map[string]int{limCode64: 2, limCode48: 3, limCode32: 4, limCode4: 1}
+	f.s.pc.limiters(func(name string, _ float64, _ int) ByteLimiter { return ratelimit.New(1e-9, budget[name], 1000) })
+	take := func(ip string) bool {
 		t.Helper()
-		ok := f.s.takeCodeRedeem(clientIP(f.build(req{method: "POST", path: "/", header: from(ip)}), true))
-		return !ok
+		return f.s.takeCodeRedeem(clientIP(f.build(req{method: "POST", path: "/", header: http.Header{"X-Forwarded-For": {ip}}}), true))
 	}
-	for range codeRedeem64 {
-		if refused("2001:db8:1:1::1") {
-			t.Fatal("refused within the /64's budget")
+	left := func(l ByteLimiter, key string, n int64) bool {
+		t.Helper()
+		ok, _ := l.AllowN(key, n, f.clk.now())
+		if ok {
+			l.Refund(key, n)
 		}
+		return ok
 	}
-	if !refused("2001:db8:1:1::2") {
-		t.Fatal("the /64 is not limited")
+	// The /64's own budget.
+	if !take("2001:db8:1:a::1") || !take("2001:db8:1:a::2") || take("2001:db8:1:a::3") {
+		t.Fatal("the /64's budget of 2")
 	}
-	// Other /64s of the /48 have their own budgets, up to the /48's.
-	n := codeRedeem64
-	for i := 2; n < codeRedeem48; i++ {
-		for range codeRedeem64 {
-			if n == codeRedeem48 {
-				break
-			}
-			if refused("2001:db8:1:" + itoaHex(i) + "::1") {
-				t.Fatalf("refused at %d in the /48", n)
-			}
-			n++
-		}
+	// The refused third request charged neither the /48 nor the /32.
+	if !left(f.s.pc.lim48, "2001:db8:1::/48", 1) || left(f.s.pc.lim48, "2001:db8:1::/48", 2) {
+		t.Fatal("the /48 was charged by a refusal")
 	}
-	if !refused("2001:db8:1:ffff::1") {
-		t.Fatal("the /48 is not limited")
+	if !left(f.s.pc.lim32, "2001:db8::/32", 2) || left(f.s.pc.lim32, "2001:db8::/32", 3) {
+		t.Fatal("the /32 was charged by a refusal")
 	}
-	// A refused request charged none of them: another /48 of the /32
-	// still has its budget.
-	if refused("2001:db8:2::1") {
-		t.Fatal("a refusal charged the /32")
+	// Another /64 of the /48 takes the /48's last unit; the next is
+	// refused at the /48, and its /64 is refunded.
+	if !take("2001:db8:1:b::1") || take("2001:db8:1:c::1") {
+		t.Fatal("the /48's budget of 3")
+	}
+	if !left(f.s.pc.lim64, "2001:db8:1:c::/64", 2) {
+		t.Fatal("a refusal at the /48 kept its /64's charge")
+	}
+	// Another /48 takes the /32's last unit; the next is refused at the
+	// /32, and its /64 and /48 are refunded.
+	if !take("2001:db8:2::1") || take("2001:db8:3::1") {
+		t.Fatal("the /32's budget of 4")
+	}
+	if !left(f.s.pc.lim64, "2001:db8:3::/64", 2) || !left(f.s.pc.lim48, "2001:db8:3::/48", 3) {
+		t.Fatal("a refusal at the /32 kept its /64's or /48's charge")
+	}
+	// Another /32 is untouched; IPv4 has its own.
+	if !take("2001:db9::1") || !take("192.0.2.1") || take("192.0.2.1") {
+		t.Fatal("other networks")
 	}
 }
-
-func itoaHex(i int) string { return strconv.FormatInt(int64(i), 16) }
 
 // The merged relayclient's calls work against the server.
 func TestPairCodeRelayclient(t *testing.T) {

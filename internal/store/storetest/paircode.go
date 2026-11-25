@@ -161,6 +161,7 @@ func testCodeMisses(t *testing.T, h Harness) {
 	s, _ := h.open(t)
 	mustRegister(t, s, "a", 1)
 	mustRegister(t, s, "b", 2)
+	mustRegister(t, s, "c", 3)
 	m := mac(5, 1)
 	if _, err := s.PutCode(ctx, codePut("a", cid1, m), 0); err != nil {
 		t.Fatal(err)
@@ -169,28 +170,42 @@ func testCodeMisses(t *testing.T, h Harness) {
 	if _, err := s.PutCode(ctx, codePut("b", cid2, other), 0); err != nil {
 		t.Fatal(err)
 	}
-	miss := mac(5, 9) // same bucket, no match
-	// A dry redeem and a request in which a tag matched add no misses.
+	same := mac(5, 3) // the same bucket, matched below
+	if _, err := s.PutCode(ctx, codePut("c", cid3, same), 0); err != nil {
+		t.Fatal(err)
+	}
+	miss := mac(5, 9) // the same bucket, no match
+	// None of these add misses: dry redeems, misses under another key id
+	// or salt, and a request in which a tag matched.
 	for range store.CodeMaxMisses {
 		if _, err := s.RedeemCode(ctx, "k1", look(miss), true); !errors.Is(err, store.ErrNotFound) {
 			t.Fatal(err)
 		}
+		if _, err := s.RedeemCode(ctx, "k2", look(miss), false); !errors.Is(err, store.ErrNotFound) {
+			t.Fatal(err)
+		}
+		if _, err := s.RedeemCode(ctx, "k1", []store.CodeLookup{{SaltID: "00000000", CodeMAC: miss}}, false); !errors.Is(err, store.ErrNotFound) {
+			t.Fatal(err)
+		}
 	}
+	if got, err := s.RedeemCode(ctx, "k1", []store.CodeLookup{{SaltID: "a12213d1", CodeMAC: miss}, {SaltID: "a12213d1", CodeMAC: same}}, false); err != nil || got.ClaimID != cid3 {
+		t.Fatalf("a matching request: %+v %v", got, err)
+	}
+	// 31 misses: still live.
 	for i := range store.CodeMaxMisses - 1 {
 		if _, err := s.RedeemCode(ctx, "k1", look(miss), false); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("miss %d: %v", i, err)
 		}
 	}
-	// Misses under another key id or salt don't count.
-	if _, err := s.RedeemCode(ctx, "k2", look(miss), false); !errors.Is(err, store.ErrNotFound) {
+	if got, err := s.RedeemCode(ctx, "k1", look(m), false); err != nil || got.ClaimID != cid1 {
+		t.Fatalf("after %d misses: %+v %v", store.CodeMaxMisses-1, got, err)
+	}
+	// 32 cancel it.
+	if _, err := s.PutCode(ctx, codePut("a", cid1, m), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.RedeemCode(ctx, "k1", []store.CodeLookup{{SaltID: "00000000", CodeMAC: miss}}, false); !errors.Is(err, store.ErrNotFound) {
-		t.Fatal(err)
-	}
-	// 31 misses: still live. The 32nd cancels it.
-	if _, err := s.RedeemCode(ctx, "k1", look(miss), false); !errors.Is(err, store.ErrNotFound) {
-		t.Fatal(err)
+	for range store.CodeMaxMisses {
+		s.RedeemCode(ctx, "k1", look(miss), false)
 	}
 	if _, err := s.RedeemCode(ctx, "k1", look(m), false); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("redeemed after %d misses: %v", store.CodeMaxMisses, err)
@@ -198,16 +213,6 @@ func testCodeMisses(t *testing.T, h Harness) {
 	// The other bucket's claim took no misses.
 	if got, err := s.RedeemCode(ctx, "k1", look(other), false); err != nil || got.ClaimID != cid2 {
 		t.Fatalf("other bucket: %+v %v", got, err)
-	}
-	// 31 misses, then a redeem of it: still found.
-	if _, err := s.PutCode(ctx, codePut("a", cid3, m), 0); err != nil {
-		t.Fatal(err)
-	}
-	for range store.CodeMaxMisses - 1 {
-		s.RedeemCode(ctx, "k1", look(miss), false)
-	}
-	if got, err := s.RedeemCode(ctx, "k1", look(m), false); err != nil || got.ClaimID != cid3 {
-		t.Fatalf("after 31 misses: %+v %v", got, err)
 	}
 }
 

@@ -151,9 +151,9 @@ func (s *Store) PutCode(ctx context.Context, c CodePut, maxStored int64) (time.T
 	}
 	exp := now.Add(CodeTTL).UTC()
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO code_claims(claim_id, mailbox_id, key_id, salt_id, bucket, code_mac, misses, size, created_at, expires_at, salt, blob)
-		 VALUES(?,?,?,?,?,?,0,?,?,?,?,?)`,
-		c.ClaimID, c.Mailbox, c.KeyID, c.SaltID, codeBucket(c.CodeMAC), c.CodeMAC, len(c.Blob), ms(now), ms(exp), c.Salt, c.Blob); err != nil {
+		`INSERT INTO code_claims(claim_id, mailbox_id, key_id, salt_id, bucket, code_mac, misses, size, expires_at, salt, blob)
+		 VALUES(?,?,?,?,?,?,0,?,?,?,?)`,
+		c.ClaimID, c.Mailbox, c.KeyID, c.SaltID, codeBucket(c.CodeMAC), c.CodeMAC, len(c.Blob), ms(exp), c.Salt, c.Blob); err != nil {
 		return time.Time{}, err
 	}
 	return exp, tx.Commit()
