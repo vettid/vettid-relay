@@ -588,7 +588,10 @@ keep them in step:
 Code claims (§6.9.1) are stored under `code_mac = HMAC-SHA-256(k_pc, tag)`,
 never the tag or the code. Make the key with `head -c 32 /dev/urandom |
 base64`, keep it in the secret store, and give it to every relay process
-as the file `RELAY_PAIR_CODE_KEY_FILE`. It never goes into the claim store.
+as the file `RELAY_PAIR_CODE_KEY_FILE`. It never goes into the claim store. Set
+`RELAY_OPEN_TOKEN_MAX_LIFETIME` to at least `660s` too: a vault mints a
+code pairing's open token for 660 s, and with the default `600s` the
+relay sets the key aside, offers no code claims and logs a warning.
 
 - **Rotating** (only when it may be exposed): give every process the new
   key and restart them. Each code claim is filed under the key id of the

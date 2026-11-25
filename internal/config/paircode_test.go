@@ -61,7 +61,7 @@ func TestPairCodeKeyNeedsOpenTokenLifetime(t *testing.T) {
 	for _, c := range []struct {
 		life string
 		ok   bool
-	}{{"", false}, {"600s", false}, {"659s", false}, {"660s", true}, {"168h", true}} {
+	}{{"", false}, {"600s", false}, {"659s", false}, {"660s", true}, {"660.5s", true}, {"168h", true}} {
 		e := map[string]string{"RELAY_PAIR_CODE_KEY": b64}
 		if c.life != "" {
 			e["RELAY_OPEN_TOKEN_MAX_LIFETIME"] = c.life
@@ -82,6 +82,17 @@ func TestPairCodeKeyNeedsOpenTokenLifetime(t *testing.T) {
 		if strings.Contains(cfg.PairCodeKeyProblem, b64) {
 			t.Errorf("%q: the problem names the key", c.life)
 		}
+	}
+}
+
+// A key that is no key keeps its own reason, whatever the limit.
+func TestPairCodeBadKeyReasonWins(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"RELAY_PAIR_CODE_KEY": "not base64!"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PairCodeKeyProblem != "RELAY_PAIR_CODE_KEY: not a base64 key of 32 bytes" {
+		t.Errorf("problem %q", cfg.PairCodeKeyProblem)
 	}
 }
 
