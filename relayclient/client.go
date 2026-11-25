@@ -245,6 +245,9 @@ type Limits struct {
 	// registration. Only true counts; a relay without it says nothing
 	// about tombstones (Registration.Tombstone).
 	ReportsTombstones json.RawMessage `json:"reports_tombstones,omitempty"`
+	// Protocol ≥ 0.14.0 (§6.1, §6.9.1): the relay offers code claims.
+	// Only true counts (OffersPairCodes).
+	PairCodes json.RawMessage `json:"pair_codes,omitempty"`
 }
 
 // Registration is the register response.
