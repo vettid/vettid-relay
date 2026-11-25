@@ -88,6 +88,11 @@ func newPairCodes(cfg config.Config, log *slog.Logger) *pairCodes {
 		}
 		return nil
 	}
+	// Load sets such a key aside; a Config built in code gets the same.
+	if cfg.OpenTokenMaxLifetime < config.PairCodeOpenTokenMin {
+		log.Warn("pair codes are off", "reason", config.PairCodeLifetimeProblem(cfg.OpenTokenMaxLifetime))
+		return nil
+	}
 	r, err := paircode.CanonicalRelay(cfg.BaseURL)
 	if err != nil {
 		log.Warn("pair codes are off", "reason", "RELAY_BASE_URL has no canonical https form")

@@ -52,8 +52,26 @@ func TestPairCodesOffForShortLifetimeWarns(t *testing.T) {
 	if pc := newPairCodes(cfg, slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))); pc != nil {
 		t.Fatal("pair codes on with the default open-token limit")
 	}
-	if out := logs.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "RELAY_OPEN_TOKEN_MAX_LIFETIME") || strings.Contains(out, b64) {
+	want := `level=WARN msg="pair codes are off" reason="RELAY_OPEN_TOKEN_MAX_LIFETIME is 600s, under the 660s a code pairing's open token needs"`
+	if out := logs.String(); !strings.Contains(out, want) || strings.Count(out, "\n") != 1 {
 		t.Fatalf("log: %s", out)
+	}
+
+	// A Config built in code, key and short limit: the same, from newPairCodes.
+	c := config.Defaults()
+	c.BaseURL = "https://relay.example"
+	c.PairCodeKey = config.NewSecret(testPairKey)
+	c.OpenTokenMaxLifetime = config.PairCodeOpenTokenMin - time.Second
+	logs.Reset()
+	if pc := newPairCodes(c, slog.New(slog.NewTextHandler(&logs, nil))); pc != nil {
+		t.Fatal("pair codes on with a Config built in code and a 659 s limit")
+	}
+	if out := logs.String(); !strings.Contains(out, `reason="RELAY_OPEN_TOKEN_MAX_LIFETIME is 659s, under the 660s a code pairing's open token needs"`) || strings.Count(out, "\n") != 1 {
+		t.Fatalf("log: %s", out)
+	}
+	c.OpenTokenMaxLifetime = config.PairCodeOpenTokenMin
+	if newPairCodes(c, slog.New(slog.NewTextHandler(io.Discard, nil))) == nil {
+		t.Fatal("pair codes off at 660 s")
 	}
 }
 

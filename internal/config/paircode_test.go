@@ -73,6 +73,9 @@ func TestPairCodeKeyNeedsOpenTokenLifetime(t *testing.T) {
 		if got := len(cfg.PairCodeKey.Bytes()) == 32; got != c.ok {
 			t.Errorf("%q: key kept %v, want %v", c.life, got, c.ok)
 		}
+		if c.life == "600s" && cfg.PairCodeKeyProblem != "RELAY_OPEN_TOKEN_MAX_LIFETIME is 600s, under the 660s a code pairing's open token needs" {
+			t.Errorf("reason %q", cfg.PairCodeKeyProblem)
+		}
 		if !c.ok && !strings.HasPrefix(cfg.PairCodeKeyProblem, "RELAY_OPEN_TOKEN_MAX_LIFETIME is ") {
 			t.Errorf("%q: problem %q", c.life, cfg.PairCodeKeyProblem)
 		}
