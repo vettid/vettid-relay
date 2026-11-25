@@ -82,10 +82,11 @@ func (s *Sweeper) Once(ctx context.Context) {
 	s.deleted.With("mailboxes").Add(st.Mailboxes)
 	s.deleted.With("consumed_tokens").Add(st.ConsumedTokens)
 	s.deleted.With("claims").Add(st.Claims)
+	s.deleted.With("code_claims").Add(st.CodeClaims)
 	if st != (store.SweepStats{}) {
 		s.log.Info("sweep", "messages", st.Messages, "leases", st.Leases, "denylist", st.Denylist,
 			"blobs", st.Blobs, "token_usage", st.TokenUsage, "mailboxes", st.Mailboxes,
-			"consumed_tokens", st.ConsumedTokens, "claims", st.Claims,
+			"consumed_tokens", st.ConsumedTokens, "claims", st.Claims, "code_claims", st.CodeClaims,
 			"dur", time.Since(start))
 	}
 }

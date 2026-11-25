@@ -710,7 +710,7 @@ func (s *Store) Ack(ctx context.Context, mailbox, msgID string) (bool, error) {
 
 // SweepStats counts what one sweep pass removed.
 type SweepStats struct {
-	Messages, Leases, Denylist, Blobs, TokenUsage, Mailboxes, ConsumedTokens, Claims, Tombstones int64
+	Messages, Leases, Denylist, Blobs, TokenUsage, Mailboxes, ConsumedTokens, Claims, CodeClaims, Tombstones int64
 }
 
 // Sweep deletes expired messages, blobs, denylist rows, token counters and
@@ -742,6 +742,10 @@ func (s *Store) Sweep(ctx context.Context) (SweepStats, error) {
 		{&st.TokenUsage, `DELETE FROM token_usage WHERE expires_at<=?`},
 		{&st.ConsumedTokens, `DELETE FROM consumed_tokens WHERE expires_at<=?`},
 		{&st.Claims, `DELETE FROM claims WHERE expires_at<=?`},
+		{&st.CodeClaims, `DELETE FROM code_claims WHERE expires_at<=?`},
+		// An epoch's nonce is listed at most 2 minutes before and 10
+		// minutes after its hour; a day later nothing names it.
+		{new(int64), `DELETE FROM pair_code_nonces WHERE epoch < (?/3600000) - 24`},
 		{&st.Tombstones, `DELETE FROM tombstones WHERE expires_at<=?`},
 	}
 	for _, step := range steps {
